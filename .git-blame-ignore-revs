@@ -1,0 +1,5 @@
+# Mechanical reformatting commits, skipped by `git blame` once configured:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# style: apply clang-format 22, ruff format, and file hygiene tree-wide
+3bca9538e1661448914ccd77203002623d22ceff
