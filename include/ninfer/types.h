@@ -259,6 +259,7 @@ struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    bool cache_write                      = true;
     bool capture_context_checkpoint       = false;
 };
 
@@ -413,6 +414,7 @@ struct PromptInput {
 };
 
 enum class RequestErrorKind : std::uint8_t {
+    CacheWriteConflict,
     InvalidToolSchema,
     InvalidOutputConstraint,
     ContextLengthExceeded,

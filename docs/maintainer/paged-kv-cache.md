@@ -220,7 +220,7 @@ invalidates old reads and returns their IDs to the pool. Recycled storage is not
 new owner has written and published it.
 
 One sequence state owns independent Text and optional MTP allocations plus their publication
-objects. A retained state transfers ownership rather than sharing writable pages. The current
+objects. Ordinary reuse transfers retained ownership; disposable reads copy into independent pages. The current
 product does not implement page reference counts, copy-on-write fan-out, active offload, or shared
 writable prefixes.
 
@@ -318,8 +318,9 @@ A reusable bundle includes every state component needed to continue, not just Te
 - hidden/replay/checkpoint state; and
 - fixed DFlash cyclic state when that backend is active.
 
-The optional pinned-host tier is an exclusive FIFO of completed retained bundles not currently on
-a device lane. Capture is D2H on the copy stream and keeps source pages mapped until its event
+The optional pinned-host tier is a FIFO of completed images, with exclusive restore claims.
+Ordinary restore consumes the image; a disposable restore releases its claim and retains the
+original independently of the destination device lane. Capture is D2H on the copy stream and keeps source pages mapped until its event
 completes. Restore validates fixed codec and pool/state geometry before H2D, chooses a free
 lane/mapping, writes exact physical bytes, then orders compute after the copy event immediately
 before prefill. A later payload/checkpoint parse failure is fenced before the Program falls back
@@ -591,3 +592,21 @@ Currently tunable until the real-model gate:
 
 Changing page size, code semantics, scale type, pool grouping, page-ID model, publication ownership,
 or introducing another cache representation is an architecture change, not kernel tuning.
+
+## Disposable cache reads
+
+`ExecutionOptions.cache_write=false` forks a selected prefix into independent allocations and
+complete continuation state. It never shares writable pages, mutates source checkpoints, or
+consumes a RAM/disk original. Copy all three planes in their per-plane stored layouts, including
+partial final pages; preserve logical publication frontiers and initialize GDN, hidden state,
+position/media metadata and MTP/DFlash state at the selected frontier. Reader fences protect
+source allocations and images. A pending AMD GDN fold is materialized before copying current state.
+
+An ordinary original may migrate into a full-original RAM image before its GPU bundle is
+released, bypassing closed-turn rewrite cutting while keeping existing checkpoints. A disposable
+original cannot be offloaded. Disposable completion retains only coherent current state in VRAM;
+no future-reuse checkpoint, RAM or disk capture is created. Disposable retention precedes ordinary
+retention for lane replacement and page reclamation. A later writable continuation promotes its
+own resulting state. Cancellation drains destination readers; a committed original migration
+remains cached. The concurrent architecture defines preservation-feasible admission and failure
+classification.

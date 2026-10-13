@@ -1096,7 +1096,9 @@ try_decode_tombstone(const std::vector<std::uint8_t>& bytes) {
     try {
         std::rethrow_exception(error);
     } catch (const runtime::CacheRestoreFailure&) { throw; } catch (const std::bad_alloc&) {
-        throw runtime::CacheRestoreFailure("KV disk restore worker ran out of host memory");
+        throw runtime::CacheRestoreFailure(
+            "KV disk restore worker ran out of host memory",
+            runtime::CacheRestoreFailureKind::DestinationUnavailable);
     } catch (const std::runtime_error& failure) {
         throw runtime::CacheRestoreFailure(std::string("KV disk restore worker failed: ") +
                                            failure.what());
@@ -4817,7 +4819,8 @@ KVDiskCache::load_host(std::uint64_t entry_id, std::uint64_t expected_committed_
     const IndexEntry& record = it->second;
     if (expected_committed_generation != 0 &&
         record.committed_generation != expected_committed_generation) {
-        throw runtime::CacheRestoreFailure("KV disk entry generation changed after its claim");
+        throw runtime::CacheRestoreFailure("KV disk entry generation changed after its claim",
+                                           runtime::CacheRestoreFailureKind::StalePlan);
     }
     if (record.pinned &&
         fail_next_load_host_allocation_.exchange(false, std::memory_order_acq_rel)) {
@@ -7668,7 +7671,8 @@ std::uint64_t KVDiskCache::restore_device(std::uint64_t entry_id, const DiskRest
             if (planned == entries_.end() ||
                 planned->second.committed_generation != target.committed_generation) {
                 throw runtime::CacheRestoreFailure(
-                    "KV disk entry generation changed after its claim");
+                    "KV disk entry generation changed after its claim",
+                    runtime::CacheRestoreFailureKind::StalePlan);
             }
         }
         prefetch_q_.erase(std::remove_if(prefetch_q_.begin(), prefetch_q_.end(),
@@ -7918,6 +7922,18 @@ void KVDiskCache::h2d_ready_slots(hipStream_t stream) {
         }
         slot.h2d_done = true;
     }
+    if (before_restore_completion_ != nullptr && !hold_state_completion_ &&
+        restore_h2d_main_ >= target.text_dst_pages &&
+        restore_h2d_backend_ >= target.backend_dst_pages) {
+        const auto callback = std::exchange(before_restore_completion_, nullptr);
+        void* context       = std::exchange(before_restore_completion_context_, nullptr);
+        callback(context, page_scatter_stream_);
+        for (WindowSlot& slot : window_) {
+            if (slot.assigned && slot.h2d_done && slot.h2d_event != nullptr) {
+                HIP_CHECK(hipEventRecord(slot.h2d_event, page_scatter_stream_));
+            }
+        }
+    }
     idle_cv_.notify_all();
     cv_.notify_all();
 }
@@ -7933,10 +7949,6 @@ void KVDiskCache::wait_state_arena_idle(std::unique_lock<std::mutex>& lock) {
     waiting_h2d_drain_.store(false, std::memory_order_release);
     lock.lock();
     state_arena_h2d_pending_ = false;
-}
-
-void KVDiskCache::test_gate_state_h2d(hipEvent_t gate) {
-    HIP_CHECK(hipStreamWaitEvent(state_h2d_stream_, gate, 0));
 }
 
 void KVDiskCache::start_restore_state_h2d_locked(hipStream_t stream) {
@@ -8296,6 +8308,14 @@ void KVDiskCache::record_copies_done_locked(hipStream_t stream) {
 
 void KVDiskCache::record_restore_join_locked(hipStream_t stream) {
     if (copies_join_recorded_ || !restore_kv_done_ || !restore_state_done_) { return; }
+    if (before_restore_completion_ != nullptr && hold_state_completion_) {
+        const auto callback = std::exchange(before_restore_completion_, nullptr);
+        void* context       = std::exchange(before_restore_completion_context_, nullptr);
+        callback(context, state_h2d_stream_);
+        HIP_CHECK(hipEventRecord(state_arena_idle_, state_h2d_stream_));
+        HIP_CHECK(hipStreamWaitEvent(stream, state_arena_idle_, 0));
+    }
+
     for (const WindowSlot& slot : window_) {
         if (!slot.assigned || !slot.h2d_done || slot.h2d_event == nullptr) { continue; }
         HIP_CHECK(hipStreamWaitEvent(stream, slot.h2d_event, 0));
@@ -8492,6 +8512,23 @@ void KVDiskCache::maybe_scatter_record_barrier(std::uint32_t logical_index) {
     if (!scatter_record_barrier_armed_.load(std::memory_order_acquire) ||
         logical_index != scatter_record_logical_.load(std::memory_order_acquire)) {
         return;
+    }
+    try {
+        HIP_CHECK(hipLaunchHostFunc(
+            scatter_test_gate_stream_,
+            [](void* opaque) {
+                auto* cache = static_cast<KVDiskCache*>(opaque);
+                while (cache->scatter_record_barrier_armed_.load(std::memory_order_acquire) &&
+                       !cache->scatter_record_continue_.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            },
+            this));
+        HIP_CHECK(hipEventRecord(scatter_test_gate_, scatter_test_gate_stream_));
+    } catch (...) {
+        scatter_record_continue_.store(true, std::memory_order_release);
+        scatter_record_barrier_armed_.store(false, std::memory_order_release);
+        throw;
     }
     scatter_record_entered_.store(true, std::memory_order_release);
     if (scatter_test_gate_ == nullptr || page_scatter_stream_ == nullptr) {
@@ -9834,23 +9871,6 @@ void KVDiskCache::test_arm_scatter_record_barrier(std::uint32_t logical_index) {
     scatter_record_entered_.store(false, std::memory_order_release);
     scatter_record_continue_.store(false, std::memory_order_release);
     scatter_record_barrier_armed_.store(true, std::memory_order_release);
-    try {
-        HIP_CHECK(hipLaunchHostFunc(
-            scatter_test_gate_stream_,
-            [](void* opaque) {
-                auto* cache = static_cast<KVDiskCache*>(opaque);
-                while (cache->scatter_record_barrier_armed_.load(std::memory_order_acquire) &&
-                       !cache->scatter_record_continue_.load(std::memory_order_acquire)) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
-            },
-            this));
-        HIP_CHECK(hipEventRecord(scatter_test_gate_, scatter_test_gate_stream_));
-    } catch (...) {
-        scatter_record_continue_.store(true, std::memory_order_release);
-        scatter_record_barrier_armed_.store(false, std::memory_order_release);
-        throw;
-    }
 }
 
 bool KVDiskCache::test_scatter_record_entered() const {

@@ -91,3 +91,18 @@ flock --exclusive /path/to/local/.ninfer-coordination/gpu.lock \
   env NINFER_R9700_WEIGHTS=/path/to/local/models/qwen3.8-27b-r9700-fp8lut4/qwen3.8-27b-r9700-fp8lut4.ninfer \
   ctest --test-dir build-r9700 -R '^ninfer_r9700_output_constraint_real_test$' --output-on-failure
 ```
+
+## Disposable cache-write Engine integration
+
+`ninfer_r9700_engine_cache_write_real_test` checks `cache_write=false` source-preserving
+current/checkpoint reuse and writable continuation at C1/C2, ordinary/MTP/DFlash, capacity
+rejection, original RAM migration, disposable promotion, concurrent original/fork requests,
+disk cancellation and shutdown. The native RAM qualifier independently checks exact bytes for
+all three cache planes with mixed layouts and fragmented page mappings. Run the real fixture
+with the same explicit production artifact and GPU lease as the other R9700 Engine tests:
+
+```bash
+flock --exclusive /path/to/local/.ninfer-coordination/gpu.lock \
+  env NINFER_R9700_WEIGHTS=/path/to/local/models/qwen3.8-27b-r9700-fp8lut4/qwen3.8-27b-r9700-fp8lut4.ninfer \
+  ctest --test-dir build-r9700 -R '^ninfer_r9700_engine_cache_write_real_test$' --output-on-failure
+```

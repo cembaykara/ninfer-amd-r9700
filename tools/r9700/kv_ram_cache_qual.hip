@@ -49,7 +49,6 @@ void paint_allocation(const ninfer::PagedKVPool& pool, const ninfer::PagedKVAllo
                       std::uint8_t seed, hipStream_t stream) {
     for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
         const ninfer::Tensor& plane = pool.plane(plane_index);
-        std::vector<std::uint8_t> host(plane.bytes(), 0xE1U);
         for (std::size_t logical = 0; logical < allocation.page_ids().size(); ++logical) {
             const std::int32_t physical = allocation.page_ids()[logical];
             for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
@@ -57,28 +56,27 @@ void paint_allocation(const ninfer::PagedKVPool& pool, const ninfer::PagedKVAllo
                     seed + 13U * plane_index + 3U * logical + static_cast<std::size_t>(head));
                 if (pool.plane_order(plane_index) == ninfer::PagedKVPlaneOrder::PageMajor) {
                     const std::size_t begin = static_cast<std::size_t>(physical) * plane.nb[3];
-                    std::fill_n(host.begin() + static_cast<std::ptrdiff_t>(begin),
-                                static_cast<std::size_t>(plane.nb[3]), value);
+                    HIP_CHECK(hipMemsetAsync(static_cast<std::uint8_t*>(plane.data) + begin, value,
+                                             static_cast<std::size_t>(plane.nb[3]), stream));
                     break;
                 }
                 const std::size_t begin = static_cast<std::size_t>(head) * plane.nb[3] +
                                           static_cast<std::size_t>(physical) * plane.nb[2];
-                std::fill_n(host.begin() + static_cast<std::ptrdiff_t>(begin),
-                            static_cast<std::size_t>(plane.nb[2]), value);
+                HIP_CHECK(hipMemsetAsync(static_cast<std::uint8_t*>(plane.data) + begin, value,
+                                         static_cast<std::size_t>(plane.nb[2]), stream));
             }
         }
-        HIP_CHECK(
-            hipMemcpyAsync(plane.data, host.data(), host.size(), hipMemcpyHostToDevice, stream));
     }
 }
 
 void verify_allocation(const ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocation& allocation,
-                       std::uint8_t seed, const char* label) {
+                       std::uint8_t seed, const char* label, std::size_t page_count = 0) {
     for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
         const ninfer::Tensor& plane = pool.plane(plane_index);
         std::vector<std::uint8_t> host(plane.bytes());
         HIP_CHECK(hipMemcpy(host.data(), plane.data, host.size(), hipMemcpyDeviceToHost));
-        for (std::size_t logical = 0; logical < allocation.page_ids().size(); ++logical) {
+        for (std::size_t logical = 0;
+             logical < (page_count ? page_count : allocation.page_ids().size()); ++logical) {
             const std::int32_t physical = allocation.page_ids()[logical];
             for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
                 const std::uint8_t expected = static_cast<std::uint8_t>(
@@ -113,7 +111,7 @@ bool all_bytes_equal(const ninfer::DeviceBuffer& buffer, std::uint8_t value) {
                        [value](std::uint8_t byte) { return byte == value; });
 }
 
-// Blocks a stream behind a host callback until released, so copies enqueued after it stay pending.
+// Holds the completion fence after transfer submission, leaving DMA APIs usable during checks.
 struct StreamGate {
     std::mutex mutex;
     std::condition_variable cv;
@@ -132,6 +130,14 @@ struct StreamGate {
     void launch(hipStream_t stream) {
         HIP_CHECK(hipLaunchHostFunc(stream, callback, this));
         launched = true;
+    }
+
+    void arm(q3::detail::KVRamCache& cache) {
+        cache.test_before_copy_completion(
+            [](void* state, hipStream_t stream) {
+                static_cast<StreamGate*>(state)->launch(stream);
+            },
+            this);
     }
 
     void release() {
@@ -193,6 +199,62 @@ struct HiddenCapture {
     HiddenCapture(const HiddenCapture&)            = delete;
     HiddenCapture& operator=(const HiddenCapture&) = delete;
 };
+
+// All three cache planes may use different physical page orders. Forked pages must be
+// independent even when the logical page list spans several physical runs.
+void source_preserving_reads(ninfer::DeviceContext& device, ninfer::Fp8KInt4VPagedKVSpec spec) {
+    spec.page_group_count = 8;
+    CopyFixture fixture(spec);
+    auto source    = fixture.pool->reserve(2);
+    auto separator = fixture.pool->reserve(1);
+    source.materialize_pages(1, device.stream);
+    separator.materialize_pages(1, device.stream);
+    source.materialize_pages(2, device.stream);
+    auto destination = fixture.pool->reserve(2);
+    destination.materialize_pages(2, device.stream);
+    paint_allocation(*fixture.pool, source, 0x21, device.stream);
+    ninfer::copy_paged_kv_allocation(source, destination, *fixture.pool, 2, device.stream);
+    device.synchronize_all();
+    verify_allocation(*fixture.pool, destination, 0x21, "fork");
+    paint_allocation(*fixture.pool, destination, 0x71, device.stream);
+    device.synchronize_all();
+    verify_allocation(*fixture.pool, source, 0x21, "unchanged fork source");
+
+    q3::detail::KVRamCache cache(8ULL << 20);
+    ninfer::DeviceBuffer hidden(256);
+    hidden.fill(0x4c);
+    ninfer::Tensor hidden_tensor(hidden.data(), ninfer::DType::U8, {256});
+    HiddenCapture capture(fixture, source, 971, hidden_tensor, device.copy_stream);
+    const auto captured = cache.capture(capture.source);
+    require(captured.status == q3::detail::RamCaptureStatus::Captured,
+            "source-preserving read capture failed");
+    device.synchronize_all();
+    q3::detail::RamRestoreTarget target;
+    target.text           = &destination;
+    target.text_pool      = fixture.pool.get();
+    target.text_semantics = fixture.semantics;
+    target.text_dst_pages = 1;
+    target.tail_hidden    = &hidden_tensor;
+    target.stream         = device.copy_stream;
+    cache.claim(captured.entry_id);
+    (void)cache.unpack_device(captured.entry_id, target);
+    device.synchronize_all();
+    cache.release_restored(captured.entry_id);
+    require(cache.snapshot().entry_count == 1 && cache.snapshot().restores == 1 &&
+                cache.plan_match(capture.prompt, q3::detail::prefix_hash_chain(capture.prompt)),
+            "fork restore consumed its source or missed restore accounting");
+    paint_allocation(*fixture.pool, destination, 0x91, device.stream);
+    device.synchronize_all();
+    cache.claim(captured.entry_id);
+    (void)cache.unpack_device(captured.entry_id, target);
+    device.synchronize_all();
+    verify_allocation(*fixture.pool, destination, 0x21, "RAM source preserved", 1);
+    require(all_bytes_equal(hidden, 0x4c), "RAM source hidden image changed");
+    require(cache.snapshot().entry_count == 1, "second read lost source before consume");
+    cache.consume(captured.entry_id);
+    require(cache.snapshot().entry_count == 0 && cache.snapshot().restores == 2,
+            "ordinary read did not consume after the fork");
+}
 
 // Two restores in one round each own an in-flight H2D. Consuming the first must account its copy
 // as a load, not orphan it as save time.
@@ -274,7 +336,7 @@ void stream_wait_does_not_block_host(ninfer::DeviceContext& device,
     std::atomic<bool> wait_threw{false};
     {
         StreamGate gate;
-        gate.launch(device.copy_stream);
+        gate.arm(cache);
         HiddenCapture capture(fixture, source, 901, hidden, device.copy_stream);
         captured = cache.capture(capture.source).status == q3::detail::RamCaptureStatus::Captured;
         if (captured) {
@@ -340,7 +402,7 @@ void failed_unpack_fences_enqueued_reads(ninfer::DeviceContext& device,
     bool fenced = false;
     {
         StreamGate gate;
-        gate.launch(device.copy_stream);
+        gate.arm(cache);
         try {
             (void)cache.unpack_device(entry_id, target);
         } catch (const std::logic_error&) { threw = true; }
@@ -734,6 +796,12 @@ int main() {
         require(eviction.entry_count == 1 && eviction.captures == 2 && eviction.evictions == 1,
                 "unpinned FIFO entry was not evicted for the replacement image");
 
+        source_preserving_reads(device, text_spec);
+        auto mixed_spec                = text_spec;
+        mixed_spec.plane_layouts.key   = ninfer::Fp8KInt4VPlaneLayout::TokenFastestHeadMajor;
+        mixed_spec.plane_layouts.value = ninfer::Fp8KInt4VPlaneLayout::FeatureFastestPageMajor;
+        mixed_spec.plane_layouts.value_scale = ninfer::Fp8KInt4VPlaneLayout::TokenFastestHeadMajor;
+        source_preserving_reads(device, mixed_spec);
         two_pending_loads_fold_as_loads(device, text_spec);
         stream_wait_does_not_block_host(device, text_spec);
         failed_unpack_fences_enqueued_reads(device, text_spec);

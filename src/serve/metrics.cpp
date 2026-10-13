@@ -200,6 +200,7 @@ constexpr const char* kApiErrorCodes[] = {
     "invalid_media",
     "invalid_tool_schema",
     "invalid_output_constraint",
+    "cache_write_conflict",
     "invalid_score_request",
     "invalid_score_result",
     "modality_not_supported",
