@@ -5,11 +5,11 @@ repository by custom AMD ports, not merged ancestry; `AGENTS.md` states the sync
 
 ## Baseline
 
-Reconciled through upstream `d5c38cda2e875aad37f49889c1f03eda1540bf20` (2026-10-09), advanced
-from `6e5b576e` (2026-10-06), `f0d3922e` (2026-10-04), `945515ea` (2026-10-04), `48eb0b01` (2026-10-03), `593c2d0c` (2026-10-03),
+Reconciled through upstream `17c504c98f263f29a29b1c0115925f02b9941a22` (2026-10-12), advanced
+from `d5c38cda` (2026-10-09), `6e5b576e` (2026-10-06), `f0d3922e` (2026-10-04), `945515ea` (2026-10-04), `48eb0b01` (2026-10-03), `593c2d0c` (2026-10-03),
 `574a8d91` (2026-10-02), `f7f70d89` (2026-10-02), `9639c32f` (2026-09-30), `34c7119b` (2026-09-28) and
 `e04fad3728573a0109236929f5d473475a8657f2` (2026-09-21, AMD ports `7187d95d`, `2eab0a50`,
-`49c896dd`) by the dispositions below. The next sync reviews upstream changes after `d5c38cda`
+`49c896dd`) by the dispositions below. The next sync reviews upstream changes after `17c504c9`
 against current AMD behavior.
 
 ## Ported features (`c450798c..e04fad37`)
@@ -404,3 +404,35 @@ including exact EBNF, schema values, EOS, cached compilation, streaming/result a
 attribution. Changed-line clang-tidy and git diff --check pass. Evidence:
 `profiles/bench/r9700-upstream-sync-20261009/`. No performance improvement is claimed; no commit,
 ancestry merge or deployment is created.
+
+## `d5c38cda..17c504c9` (1 upstream commit, reconciled 2026-10-12)
+
+- `17c504c98f263f29a29b1c0115925f02b9941a22`: ported disposable cache writes through
+  `ExecutionOptions.cache_write` and the common OpenAI/Responses/Anthropic `ninfer` object.
+  False reads preserve the original through an independent VRAM fork or a complete-original
+  RAM migration, restore RAM without consuming it, and retain disposable continuation state
+  ahead of ordinary eviction victims. Future-reuse captures and shutdown persistence reject
+  disposable state; a later writable continuation promotes its resulting state. Checkpoint
+  capture conflicts fail before enqueue/streaming. Source-invalid, stale-plan and destination
+  restore failures have distinct source-preserving cleanup. Native ownership retains the
+  bounded FIFO/head protection, request-local telemetry helpers and copy hold.
+  Paged payload copies honor each of the FP8-K/INT4-V/FP16-scale planes' own physical order;
+  native MTP publication and deferred GDN folds replace the upstream private state profile.
+  Startup defines complete paged/cyclic payloads and fixed egress padding without changing
+  valid frontiers. Transfer-test fences are held after DMA submission. Request-log schema 23
+  and every active consumer replace schema 22 consistently (upstream's 18-to-19 numbering
+  belongs to its separate log contract).
+
+Verification: warnings-as-errors Release build; eight affected host tests, including recovery
+restore/fork/stale-plan failure disposition and three serving schemas; 27 Python report-consumer
+checks; native exact-byte paged-copy/RAM tests with mixed plane orders, noncontiguous physical
+runs, independent destination mutation, restore accounting and later source consumption;
+disk-cache tests; and the production R9700 real Engine fixture at C1/C2 with ordinary, MTP and
+DFlash current/checkpoint forks, single-token MTP, original preservation, capacity rejection,
+disposable promotion, concurrent original/fork requests, disk cancellation and shutdown.
+The native page/RAM qualifier passes memcheck; recovery executor passes ASan/UBSan; changed-line
+clang-tidy and the final qualifier check report zero diagnostics. Upstream CUDA/NVFP4 test
+identities are replaced by native qualifiers and the explicit production artifact; CUDA stream
+helper and benchmark-only fixture changes are excluded. No performance claim, upstream ancestry merge,
+master promotion or deployment is part of this sync. Evidence:
+`profiles/bench/r9700-upstream-sync-20261012/`.

@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 22;
+inline constexpr int kRequestLogSchemaVersion        = 23;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 // Closed wire names shared by the request log and the GET /metrics exposition.
@@ -102,6 +102,7 @@ struct RequestLogContext {
     std::string protocol;
     std::string model;
     bool stream                             = false;
+    bool cache_write                        = true;
     std::size_t message_count               = 0;
     int requested_output_tokens             = 0;
     bool requested_output_tokens_client_set = false;
@@ -122,6 +123,7 @@ struct RequestRejectionLogContext {
     std::string protocol;
     std::string model;
     bool stream                             = false;
+    bool cache_write                        = true;
     std::size_t message_count               = 0;
     std::size_t media_item_count            = 0;
     int requested_output_tokens             = 0;

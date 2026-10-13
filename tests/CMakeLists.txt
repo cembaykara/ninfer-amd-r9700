@@ -389,3 +389,9 @@ ninfer_add_r9700_test(ninfer_r9700_output_constraint_real_test
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_r9700_output_constraint_real_test PROPERTIES
   LABELS "r9700;real" SKIP_RETURN_CODE 77 TIMEOUT 600 RESOURCE_LOCK r9700_device)
+
+ninfer_add_r9700_test(ninfer_r9700_engine_cache_write_real_test
+  SOURCES targets/qwen3_8_27b/test_engine_cache_write_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_r9700_engine_cache_write_real_test PROPERTIES
+  LABELS "r9700;real" SKIP_RETURN_CODE 77 TIMEOUT 600 RESOURCE_LOCK r9700_device)
