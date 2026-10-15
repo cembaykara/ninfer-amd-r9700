@@ -1,8 +1,9 @@
-name: ninfer-r9700
+name: ninfer-amd
 
 services:
   server:
     image: local/ninfer-r9700:compose
+    pull_policy: build
     build:
       context: .
       target: runtime
@@ -14,8 +15,12 @@ services:
     devices:
       - /dev/kfd:/dev/kfd
       - ${NINFER_DRM_RENDER_NODE:-/dev/dri/renderD128}:${NINFER_DRM_RENDER_NODE:-/dev/dri/renderD128}
-    ports:
-      - "${NINFER_BIND_ADDRESS:-127.0.0.1}:${NINFER_PORT:-8001}:8080"
+    expose:
+      - "8080"
+    networks:
+      proxy:
+        aliases:
+          - ninfer-r9700
     volumes:
       - type: bind
         source: ${NINFER_MODELS_DIR:-../models}
@@ -46,17 +51,17 @@ services:
       - --temperature
       - "1.5"
       - --max-context
-      - "${NINFER_MAX_CONTEXT:-32768}"
+      - "262144"
       - --max-concurrency
-      - "${NINFER_CONCURRENCY:-1}"
+      - "${NINFER_CONCURRENCY:-6}"
       - --prefill-chunk
       - "2048"
       - --kv-capacity
       - auto
       - --kv-ram-capacity
-      - "${NINFER_RAM_CACHE_MIB:-4096}"
+      - "${NINFER_RAM_CACHE_MIB:-8192}"
       - --kv-disk-capacity
-      - "${NINFER_DISK_CACHE_MIB:-32768}"
+      - "${NINFER_DISK_CACHE_MIB:-25600}"
       - --kv-disk-location
       - /cache/prefix
       - --spec
@@ -76,3 +81,7 @@ services:
       timeout: 5s
       start_period: 3m
       retries: 4
+
+networks:
+  proxy:
+    external: true

@@ -283,41 +283,6 @@ void validate_graph_profiles(const std::vector<GraphExecutionProfile>& profiles,
     }
 }
 
-DecodeGraphTopology& select_graph_topology(DecodeGraphFamily& family, std::uint32_t topology_class,
-                                           const char* label) {
-    const auto it = std::find_if(family.topologies.begin(), family.topologies.end(),
-                                 [topology_class](const DecodeGraphTopology& topology) {
-                                     return topology.topology_class == topology_class;
-                                 });
-    if (it == family.topologies.end()) {
-        throw std::logic_error(std::string(label) + " Device Graph topology is unavailable");
-    }
-    return *it;
-}
-
-// Installs a profile's definition into its topology executable; a failed update names the
-// profile transition (batch, draft width, frontier range, topology).
-void update_graph_profile(DecodeGraphFamily& family, DecodeGraphTopology& topology,
-                          std::size_t profile_index, const char* label) {
-    const auto describe = [](const DecodeGraphProfile& profile) {
-        return "B=" + std::to_string(profile.batch_size) +
-               " k=" + std::to_string(profile.draft_tokens) +
-               " frontier=" + std::to_string(profile.min_execution_frontier) + ".." +
-               std::to_string(profile.max_execution_frontier) +
-               " topology=" + std::to_string(profile.topology_class);
-    };
-    try {
-        topology.executable.update(family.profiles[profile_index].definition);
-    } catch (const std::exception& error) {
-        throw std::runtime_error(
-            std::string(label) + " graph profile {" +
-            (topology.installed_profile ? describe(family.profiles[*topology.installed_profile])
-                                        : std::string("unknown")) +
-            "} -> {" + describe(family.profiles[profile_index]) + "}: " + error.what());
-    }
-    topology.installed_profile = profile_index;
-}
-
 // Keeps the tool-mask matcher armed exactly while one speculative round can execute.
 struct TokenMaskRoundGuard {
     explicit TokenMaskRoundGuard(qwen3::TokenMaskExchange& exchange) : exchange(exchange) {
@@ -331,76 +296,35 @@ struct TokenMaskRoundGuard {
     qwen3::TokenMaskExchange& exchange;
 };
 
-DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGraphProfile& profile,
-                                             const char* label) {
-    DecodeGraphTopology& topology   = select_graph_topology(family, profile.topology_class, label);
-    const std::size_t profile_index = static_cast<std::size_t>(&profile - family.profiles.data());
-    if (topology.installed_profile != profile_index) {
-        update_graph_profile(family, topology, profile_index, label);
-    }
-    return topology.executable;
-}
-
 template <class Prepare>
 void instantiate_graph_family(DecodeGraphFamily& family, const char* label, DeviceContext& device,
                               Prepare&& prepare) {
     if (family.profiles.empty()) {
         throw std::logic_error(std::string(label) + " Device Graph family has no profiles");
     }
-
-    for (std::size_t i = 0; i < family.profiles.size(); ++i) {
-        DecodeGraphProfile& profile = family.profiles[i];
-        if (!profile.definition.ready()) {
-            throw std::logic_error(std::string(label) + " Device Graph definition is empty");
-        }
-        const auto existing =
-            std::find_if(family.topologies.begin(), family.topologies.end(),
-                         [&](const DecodeGraphTopology& topology) {
-                             return topology.topology_class == profile.topology_class;
-                         });
-        if (existing != family.topologies.end()) { continue; }
-
-        family.topologies.emplace_back();
-        DecodeGraphTopology& topology = family.topologies.back();
-        topology.topology_class       = profile.topology_class;
-        topology.executable.instantiate(profile.definition);
-        topology.installed_profile = i;
+    for (DecodeGraphProfile& profile : family.profiles) {
+        // HIP executable updates retain fresh kernel-argument storage on every
+        // profile transition. Immutable executables make residency startup-fixed.
+        profile.executable.instantiate(profile.definition);
+        profile.executable.upload(device.stream);
     }
-
-    const auto install_and_upload = [&](DecodeGraphTopology& topology, std::size_t profile_index) {
-        if (topology.installed_profile != profile_index) {
-            update_graph_profile(family, topology, profile_index, label);
+    for (DecodeGraphProfile& profile : family.profiles) {
+        // B, K and the target structural class fix the kernel routes. Warm the
+        // largest frontier in each class after uploading every immutable graph.
+        const bool has_larger_representative = std::any_of(
+            family.profiles.begin(), family.profiles.end(), [&](const DecodeGraphProfile& other) {
+                return other.batch_size == profile.batch_size &&
+                       other.draft_tokens == profile.draft_tokens &&
+                       other.topology_class == profile.topology_class &&
+                       other.max_execution_frontier > profile.max_execution_frontier;
+            });
+        if (has_larger_representative) {
+            continue;
         }
-        topology.executable.upload(device.stream);
+        prepare(profile.min_execution_frontier, profile.batch_size, profile.draft_tokens);
         device.synchronize();
-    };
-
-    for (DecodeGraphTopology& topology : family.topologies) {
-        std::optional<std::size_t> first_profile;
-        for (std::size_t i = 0; i < family.profiles.size(); ++i) {
-            if (family.profiles[i].topology_class == topology.topology_class) {
-                if (!first_profile) {
-                    first_profile = i;
-                    install_and_upload(topology, i);
-
-                    DecodeGraphProfile& profile = family.profiles[i];
-                    prepare(profile.min_execution_frontier, profile.batch_size,
-                            profile.draft_tokens);
-                    device.synchronize();
-                    topology.executable.launch(device.stream);
-                    device.synchronize();
-                    continue;
-                }
-                install_and_upload(topology, i);
-            }
-        }
-        if (!first_profile) {
-            throw std::logic_error(std::string(label) +
-                                   " Device Graph topology has no definitions");
-        }
-        if (topology.installed_profile != *first_profile) {
-            install_and_upload(topology, *first_profile);
-        }
+        profile.executable.launch(device.stream);
+        device.synchronize();
     }
 }
 
@@ -672,7 +596,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         disk.backend_pool       = backend_pool;
         disk.logical_page_bytes = page_bytes;
         disk.hidden_bytes       = sequences[0].tail_hidden.bytes();
-        disk.restore_io_threads = 16;
+        disk.restore_io_threads = qwen3::detail::kKvDiskRestoreIoThreads;
         kv_disk_cache_.emplace(std::move(disk));
     }
     // Last: the destructor does not run for a failed construction, so a failure here destroys
@@ -3918,16 +3842,13 @@ void ProgramImplCore::prepare_graphs() {
                 profile.batch_size             = batch_size;
                 profile.min_execution_frontier = planned.min;
                 profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
+                profile.topology_class         = planned.topology_class;
                 run_representative(planned.min, planned.max, batch_size, &profile.definition);
             }
         }
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        const auto k_stride = speculative_graph_stride(capacity, max_concurrency, captured_ks,
-                                                       speculative_backend, dflash_verify_width);
         for (const auto capture_k : captured_ks) {
 
             if (!io.mtp_decode || !decoder->mtp_cache()) {
@@ -4014,9 +3935,7 @@ void ProgramImplCore::prepare_graphs() {
                     profile.draft_tokens           = capture_k;
                     profile.min_execution_frontier = planned.min;
                     profile.max_execution_frontier = planned.max;
-                    profile.topology_class =
-                        qwen3::adaptive_k_index(captured_ks, capture_k) * k_stride +
-                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                    profile.topology_class         = planned.topology_class;
                     run_representative(planned.min, planned.max, batch_size, capture_k,
                                        &profile.definition);
                 }
@@ -4025,8 +3944,6 @@ void ProgramImplCore::prepare_graphs() {
     }
 
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        const auto k_stride = speculative_graph_stride(capacity, max_concurrency, captured_ks,
-                                                       speculative_backend, dflash_verify_width);
         for (const auto capture_k : captured_ks) {
 
             const std::uint32_t fixed_k = capture_k;
@@ -4102,9 +4019,7 @@ void ProgramImplCore::prepare_graphs() {
                     profile.draft_tokens           = capture_k;
                     profile.min_execution_frontier = planned.min;
                     profile.max_execution_frontier = planned.max;
-                    profile.topology_class =
-                        qwen3::adaptive_k_index(captured_ks, capture_k) * k_stride +
-                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                    profile.topology_class         = planned.topology_class;
                     run_representative(planned.min, planned.max, batch_size, &profile.definition);
                 }
             }
@@ -4124,9 +4039,9 @@ void ProgramImplCore::prepare_graphs() {
     const std::size_t captured_definitions     = ordinary_graphs.profiles.size() +
                                                  mtp_graphs.profiles.size() +
                                                  dflash_graphs.profiles.size();
-    const std::size_t instantiated_executables = ordinary_graphs.topologies.size() +
-                                                 mtp_graphs.topologies.size() +
-                                                 dflash_graphs.topologies.size();
+    const std::size_t instantiated_executables = ordinary_graphs.profiles.size() +
+                                                 mtp_graphs.profiles.size() +
+                                                 dflash_graphs.profiles.size();
     if (captured_definitions != expected_graph_definition_count) {
         throw std::logic_error("Device Graph definition inventory disagrees with its memory plan");
     }
@@ -4143,12 +4058,13 @@ void ProgramImplCore::prepare_graphs() {
         HIP_CHECK(hipMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
     }
     if (dflash) {
-        zero_dflash_local_cache(dflash->local);
-        HIP_CHECK(hipMemsetAsync(dflash->prefill_features.data, 0, dflash->prefill_features.bytes(),
+        auto& state = *dflash;
+        zero_dflash_local_cache(state.local);
+        HIP_CHECK(hipMemsetAsync(state.prefill_features.data, 0, state.prefill_features.bytes(),
                                  device.stream));
-        HIP_CHECK(hipMemsetAsync(dflash->prefill_positions.data, 0,
-                                 dflash->prefill_positions.bytes(), device.stream));
-        HIP_CHECK(hipMemsetAsync(dflash->pending_features.data, 0, dflash->pending_features.bytes(),
+        HIP_CHECK(hipMemsetAsync(state.prefill_positions.data, 0,
+                                 state.prefill_positions.bytes(), device.stream));
+        HIP_CHECK(hipMemsetAsync(state.pending_features.data, 0, state.pending_features.bytes(),
                                  device.stream));
     }
     HIP_CHECK(hipMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
@@ -4766,7 +4682,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
-            executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
+            executable = &profile.executable;
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -4968,7 +4884,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             DecodeGraphProfile& profile =
                 select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch", batch_k);
-            executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
+            executable = &profile.executable;
         }
 
         std::uint32_t realized_extent = 0;
@@ -5339,7 +5255,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_dflash_batch(
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "DFlash batch", batch_k);
-            executable = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
+            executable = &profile.executable;
         }
 
         // Packed-tree rounds draw deterministic drafts and produce no calibration.

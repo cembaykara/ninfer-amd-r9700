@@ -3,12 +3,14 @@
 #include "ninfer/ops/dflash2_path_select.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/swa.h"
+#include "ops/r9700/gdn_recurrence/gdn_verify_profile.h"
 #include "ops/r9700/linear/r9700_q4_activation_profile.h"
 #include "ops/r9700/linear/r9700_w8_activation_profile.h"
 #include "ops/r9700/kv/fp8_int4_kv_attention.h"
 #include "ops/r9700/kv/r9700_attention_profile.h"
 #include "targets/qwen3_8_27b/impl/r9700_full_attention.h"
 #include "targets/qwen3_8_27b/impl/variant.h"
+#include "targets/qwen3/impl/runtime/r9700_cache_profile.h"
 
 #define NINFER_QWEN3_VARIANT    ::ninfer::targets::qwen3_8_27b::detail::Variant
 #define NINFER_QWEN3_RUNTIME_NS qwen3_8_27b_r9700
@@ -20,6 +22,7 @@
 #include <ninfer/targets/qwen3/runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
@@ -285,12 +288,12 @@ void qualify_host_ordinary_graph_allowance() {
             const auto plan =
                 runtime::build_sequence_candidate_for_qualification(inputs, physical_pages);
             const std::size_t expected =
-                (23ULL + concurrency * (24ULL + 4ULL * (definitions - 3U))) * 1024ULL * 1024ULL +
+                (23ULL + 4ULL * definitions * concurrency) * 1024ULL * 1024ULL +
                 definitions * kLoweredDefinitionBytes; // B=1 definitions
             require(plan->graph_definition_count == definitions * concurrency &&
-                        plan->graph_executable_count == concurrency &&
+                        plan->graph_executable_count == definitions * concurrency &&
                         plan->graph_allowance_bytes == expected,
-                    "ordinary allowance omitted same-topology profile updates");
+                    "ordinary allowance omitted immutable profile executables");
             if (capacity == 4224U && concurrency == 1U) {
                 require(plan->graph_allowance_bytes >= 54525952ULL,
                         "ordinary allowance misses observed 52 MiB tiled preparation");
@@ -337,115 +340,162 @@ void qualify_host_hybrid_allocation_bound() {
                     minimum->device_reservation_bytes + 137U * increment,
                 "physical arena bound made the KV reservation curve non-affine");
     }
-    std::printf("r9700_runtime_planner: PASS host hybrid arena bound/nonhybrid affine capacity\n");
+    for (std::uint32_t concurrency = 1; concurrency <= ninfer::kMaximumConcurrency;
+         ++concurrency) {
+        for (const auto backend : {ninfer::SpeculativeBackend::DFlash,
+                                    ninfer::SpeculativeBackend::Mtp}) {
+            runtime::SequencePlanningInputs inputs{};
+            inputs.weights_profile = Variant::WeightsProfile::R9700Fp8Lut4;
+            inputs.capacity = 262144U;
+            inputs.max_concurrency = concurrency;
+            inputs.prefill_chunk = 2048U;
+            inputs.draft_window = backend == ninfer::SpeculativeBackend::DFlash ? 7U : 5U;
+            inputs.speculative_backend = backend;
+            inputs.features = {.vision = false, .speculative = backend};
+            inputs.use_device_graph = true;
+            const auto without_disk =
+                runtime::build_sequence_candidate_for_qualification(inputs, 4096U);
+            inputs.kv_disk_capacity_bytes = 1024ULL * 1024ULL * 1024ULL;
+            const auto with_disk =
+                runtime::build_sequence_candidate_for_qualification(inputs, 4096U);
+            // Independently derive packed page geometry from the represented codec:
+            // 256 FP8 keys, 128 packed INT4 value bytes, FP16 scales per KV head.
+            constexpr std::size_t head_bytes =
+                256U + 128U + 2U * (256U / ninfer::targets::qwen3::detail::kR9700TextKVValueGroup);
+            constexpr std::size_t page_bytes = std::size_t{16U} * 4U * head_bytes * 64U;
+            constexpr std::size_t physical_unit = 2ULL * 1024ULL * 1024ULL;
+            const std::size_t expected_disk =
+                (page_bytes * 32U + physical_unit - 1U) / physical_unit * physical_unit +
+                (backend == ninfer::SpeculativeBackend::DFlash ? 1U : 2U) * physical_unit;
+            require(with_disk->device_reservation_bytes - without_disk->device_reservation_bytes ==
+                        expected_disk + physical_unit,
+                    "KV capacity omits the SSD restore device allocations");
+            const auto next = runtime::build_sequence_candidate_for_qualification(inputs, 4097U);
+            require(next->device_reservation_bytes - with_disk->device_reservation_bytes ==
+                        page_bytes * (backend == ninfer::SpeculativeBackend::Mtp ? 17U : 16U) / 16U,
+                    "SSD restore staging changed the affine per-page KV capacity cost");
+        }
+    }
+    std::printf("r9700_runtime_planner: PASS host arena bounds and C1..8 SSD affine capacity\n");
 }
 
 void qualify_host_dflash_graph_allowance() {
-    namespace runtime                      = ninfer::targets::qwen3::detail::qwen3_8_27b_r9700;
-    constexpr std::size_t expected_classes = 1U;
-    std::size_t expected_allowance         = (48ULL + 26ULL * expected_classes) * 1024ULL * 1024ULL;
-    const runtime::SequencePlanningInputs inputs{
-        .weights_profile          = Variant::WeightsProfile::R9700Q4G64DFlash2Q4Evaluation,
-        .capacity                 = 8459U,
-        .max_concurrency          = 1U,
-        .prefill_chunk            = 4096U,
-        .draft_window             = 4U,
-        .dflash_verify_width      = 5U,
-        .speculative_backend      = ninfer::SpeculativeBackend::DFlash,
-        .proposal_head            = ninfer::ProposalHead::Optimized,
-        .features                 = {.vision        = false,
-                                     .speculative   = ninfer::SpeculativeBackend::DFlash,
-                                     .proposal_head = ninfer::ProposalHead::Optimized},
-        .use_device_graph         = true,
-        .device                   = 0,
-        .kv_ram_capacity_bytes    = 0U,
-        .context_checkpoint_marks = {},
-    };
-    const auto plan = runtime::build_sequence_candidate_for_qualification(inputs, 133U);
-    require(plan->capacity == 8459U && plan->kv_capacity == 8512U,
-            "DFlash C1 authority geometry changed");
-    const auto profiles = Variant::dflash_graph_profiles(8459U, 4U, 1U, 5U);
-    std::vector<std::uint32_t> topology_classes;
-    for (const auto profile : profiles) {
-        if (std::find(topology_classes.begin(), topology_classes.end(), profile.topology_class) ==
-            topology_classes.end()) {
-            topology_classes.push_back(profile.topology_class);
-        }
-    }
-    for (const auto topology : topology_classes) {
-        const auto count = static_cast<std::size_t>(
-            std::count_if(profiles.begin(), profiles.end(),
-                          [&](const auto& p) { return p.topology_class == topology; }));
-        if (count > 3U) expected_allowance += (count - 3U) * 4ULL * 1024ULL * 1024ULL;
-    }
-    require(plan->dflash_verify_width == 5U && plan->graph_definition_count == profiles.size() &&
-                plan->graph_executable_count == topology_classes.size() &&
-                topology_classes.size() == expected_classes,
-            "DFlash C1 K4/W5 graph topology inventory changed");
-    expected_allowance += profiles.size() * kLoweredDefinitionBytes; // C1: all lowered
-    require(plan->graph_allowance_bytes == expected_allowance,
-            "DFlash C1 K4/W5 allowance must reserve each distinct executable topology");
-    // Reproduce the selective-protected context 1024 startup geometry whose
-    // complete preparation measured 71 MiB with selected BF16 staging and tiled W8 head.
-    for (const std::uint32_t k : {4U, 5U}) {
-        auto measured_inputs = inputs;
-        measured_inputs.weights_profile =
-            Variant::WeightsProfile::R9700Q4SelectiveProtectedDFlash2Q4Evaluation;
-        measured_inputs.capacity            = 1024U;
-        measured_inputs.draft_window        = k;
-        measured_inputs.dflash_verify_width = k + 1U;
-        const auto measured =
-            runtime::build_sequence_candidate_for_qualification(measured_inputs, 16U);
-        require(measured->graph_executable_count == 1U &&
-                    measured->graph_allowance_bytes ==
-                        74ULL * 1024ULL * 1024ULL +
-                            measured->graph_definition_count * kLoweredDefinitionBytes &&
-                    measured->graph_allowance_bytes >= 74448896ULL,
-                "DFlash selective-protected graph allowance misses measured startup residency");
-    }
-    // Same executable, more frontier definitions: preserve the 1K calibration and
-    // account for additional installs at the reproduced compact-companion geometry.
-    for (const std::uint32_t concurrency : {1U, 2U, 3U, 4U}) {
-        for (const std::uint32_t capacity : {1024U, 4096U, 4240U}) {
-            for (const std::uint32_t k : {4U, 5U}) {
-                auto compact_inputs = inputs;
-                compact_inputs.weights_profile =
-                    Variant::WeightsProfile::R9700Q4Fp8SelectiveCapDFlash2Q4Evaluation;
-                compact_inputs.capacity            = capacity;
-                compact_inputs.prefill_chunk       = 2048U;
-                compact_inputs.max_concurrency     = concurrency;
-                compact_inputs.draft_window        = k;
-                compact_inputs.dflash_verify_width = k + 1U;
-                const auto compact = runtime::build_sequence_candidate_for_qualification(
-                    compact_inputs, ((capacity + 63U) / 64U) * concurrency);
-                const std::size_t definitions_per_batch = capacity == 1024U ? 3U : 6U;
-                // One split-verify executable serves every frontier definition; definitions
-                // beyond three need extra update slots.
-                const std::size_t classes       = 1U;
-                const std::size_t extra_updates = definitions_per_batch - 3U;
-                const std::size_t expected =
-                    (48ULL + concurrency * (26ULL * classes + 4ULL * extra_updates)) * 1024ULL *
-                        1024ULL +
-                    definitions_per_batch * kLoweredDefinitionBytes; // B=1 definitions
-                require(compact->graph_executable_count == classes * concurrency &&
-                            compact->graph_definition_count ==
-                                definitions_per_batch * concurrency &&
-                            compact->graph_allowance_bytes == expected,
-                        "DFlash compact companion omitted exact-B frontier updates");
-                if (capacity == 4240U && concurrency == 1U)
-                    require(compact->graph_allowance_bytes >= 78643200ULL,
-                            "DFlash compact companion misses measured 75-MiB preparation");
-                compact_inputs.use_device_graph = false;
+    namespace runtime = ninfer::targets::qwen3::detail::qwen3_8_27b_r9700;
+    for (std::uint32_t concurrency = 1U; concurrency <= ninfer::kMaximumConcurrency; ++concurrency) {
+        for (const std::uint32_t capacity : {64U, 1024U, 4240U, 262144U}) {
+            for (const std::uint32_t k : {1U, 3U, 7U}) {
+                runtime::SequencePlanningInputs inputs{};
+                inputs.weights_profile = Variant::WeightsProfile::R9700Q4G64Evaluation;
+                inputs.capacity = capacity;
+                inputs.max_concurrency = concurrency;
+                inputs.prefill_chunk = std::min(capacity, 2048U);
+                inputs.draft_window = k;
+                inputs.adaptive_draft = k == 7U;
+                inputs.speculative_backend = ninfer::SpeculativeBackend::DFlash;
+                inputs.proposal_head = ninfer::ProposalHead::Optimized;
+                inputs.features = {.vision = false,
+                                   .speculative = ninfer::SpeculativeBackend::DFlash,
+                                   .proposal_head = ninfer::ProposalHead::Optimized};
+                inputs.use_device_graph = true;
+                const auto plan = runtime::build_sequence_candidate_for_qualification(
+                    inputs, concurrency * ((capacity + 63U) / 64U));
+                std::size_t definitions = 0U;
+                std::size_t lowered = 0U;
+                for (const auto draft : ninfer::targets::qwen3::adaptive_draft_ks(
+                         inputs.speculative_backend, k, inputs.adaptive_draft)) {
+                    const auto width =
+                        ninfer::targets::qwen3::dflash_verify_width<Variant::DFlashConfig>(draft);
+                    for (std::uint32_t batch = 1U; batch <= concurrency; ++batch) {
+                        const auto count = Variant::dflash_graph_profiles(capacity, draft, batch,
+                                                                         width).size();
+                        definitions += count;
+                        if (batch == 1U) lowered += count;
+                    }
+                }
+                require(plan->graph_definition_count == definitions &&
+                            plan->graph_executable_count == definitions,
+                        "DFlash immutable executable inventory omits a reachable profile");
+                require(plan->graph_allowance_bytes ==
+                            (48ULL + 4ULL * definitions) * 1024ULL * 1024ULL +
+                                lowered * kLoweredDefinitionBytes,
+                        "DFlash reservation omits immutable executable residency");
+                inputs.use_device_graph = false;
                 const auto eager = runtime::build_sequence_candidate_for_qualification(
-                    compact_inputs, ((capacity + 63U) / 64U) * concurrency);
-                require(eager->graph_allowance_bytes == 0U && eager->graph_definition_count == 0U &&
-                            eager->graph_executable_count == 0U,
-                        "eager compact companion must not reserve graph updates");
+                    inputs, concurrency * ((capacity + 63U) / 64U));
+                require(eager->graph_allowance_bytes == 0 && eager->graph_executable_count == 0,
+                        "eager DFlash reserves graph residency");
             }
         }
     }
-    std::printf(
-        "r9700_runtime_planner: PASS host DFlash C1-C4 K4/K5 graph topology/update allowance\n");
+    // These constants come from independent physical measurements, not a model
+    // of executable counts. Keep the production capacity regression explicit.
+    constexpr std::array<std::size_t, 8> graph_mib{318, 578, 842, 1102, 1364, 1624, 1884, 2144};
+    constexpr std::array<std::size_t, 8> main_driver_mib{6, 6, 4, 4, 2, 2, 2, 2};
+#if defined(NINFER_R9700_XATTENTION_QUALIFICATION)
+    constexpr bool production_attention = false;
+#else
+    constexpr bool production_attention = true;
+#endif
+    constexpr auto planes = ninfer::targets::qwen3::detail::kR9700TextKVPlaneLayouts;
+    const bool measured_build =
+        production_attention && ninfer::targets::qwen3::detail::kR9700TextKVValueGroup == 16 &&
+        planes.key == ninfer::Fp8KInt4VPlaneLayout::TokenFastestHeadMajor &&
+        planes.value == ninfer::Fp8KInt4VPlaneLayout::FeatureFastestPageMajor &&
+        planes.value_scale == ninfer::Fp8KInt4VPlaneLayout::FeatureFastestPageMajor &&
+        ninfer::ops::r9700::linear::kQ4ActivationBits == 8U &&
+        ninfer::ops::r9700::linear::kW8ActivationBits == 8U &&
+        ninfer::ops::r9700::linear::kQ4PrefillA4Families == 0U &&
+        !ninfer::ops::r9700::linear::kDFlashSmallTCandidateEnabled &&
+        !ninfer::ops::r9700::linear::kDFlashMlpDownT5CandidateEnabled &&
+        !ninfer::ops::r9700::gdn_recurrence::kVerifyWaveQkCandidate &&
+        ninfer::ops::r9700::kv::kFp8QkWmmaDecode &&
+        !ninfer::ops::r9700::kv::kTextP129WmmaTailCandidate;
+    for (std::uint32_t c = 1; c <= ninfer::kMaximumConcurrency; ++c) {
+        runtime::SequencePlanningInputs inputs{};
+        inputs.weights_profile = Variant::WeightsProfile::R9700Fp8Lut4;
+        inputs.capacity = 262144U;
+        inputs.max_concurrency = c;
+        inputs.prefill_chunk = 2048U;
+        inputs.draft_window = 7U;
+        inputs.adaptive_draft = true;
+        inputs.speculative_backend = ninfer::SpeculativeBackend::DFlash;
+        inputs.proposal_head = ninfer::ProposalHead::Optimized;
+        inputs.features = {.vision = false,
+                           .speculative = ninfer::SpeculativeBackend::DFlash,
+                           .proposal_head = ninfer::ProposalHead::Optimized};
+        inputs.use_device_graph = true;
+        const auto calibrated = Variant::calibrated_dflash_graph_allowance_bytes(
+            inputs.weights_profile, inputs.features, inputs.capacity, c, inputs.prefill_chunk,
+            inputs.draft_window, inputs.adaptive_draft);
+        require(calibrated.has_value() == measured_build,
+                "production calibration applicability differs from measured build profile");
+        for (const bool disk : {false, true}) {
+            inputs.kv_disk_capacity_bytes = disk ? 1ULL << 30U : 0U;
+            const auto plan = runtime::build_sequence_candidate_for_qualification(inputs, 4096U);
+            require(plan->graph_definition_count == std::size_t{65U} * c &&
+                        plan->graph_executable_count == std::size_t{65U} * c,
+                    "production immutable executable inventory changed; remeasure residency");
+            if (measured_build)
+                require(plan->graph_allowance_bytes == graph_mib[c - 1U] * (1ULL << 20U),
+                        "production C-specific graph reservation differs from measurement");
+            const auto logical = plan->persistent.bytes + plan->workspace.capacity +
+                                 plan->request_transient_capacity_bytes + plan->graph_allowance_bytes;
+            constexpr std::size_t head_bytes =
+                256U + 128U + 2U * (256U / ninfer::targets::qwen3::detail::kR9700TextKVValueGroup);
+            constexpr std::size_t staging_bytes = std::size_t{16U} * 4U * head_bytes * 64U * 32U;
+            const std::size_t disk_mib = (staging_bytes + (2U << 20U) - 1U) / (2U << 20U) * 2U + 2U;
+            const std::size_t internal_mib = 4U + 2U + main_driver_mib[c - 1U] +
+                                             (disk ? disk_mib + 2U : 0U);
+            require(plan->device_reservation_bytes == logical + internal_mib * (1ULL << 20U),
+                    "NInfer-owned driver or SSD storage escaped the internal capacity budget");
+        }
+        for (const std::uint32_t chunk : {1024U, 4096U})
+            require(!Variant::calibrated_dflash_graph_allowance_bytes(
+                        inputs.weights_profile, inputs.features, inputs.capacity, c, chunk,
+                        inputs.draft_window, inputs.adaptive_draft),
+                    "unmeasured prefill chunk used production graph calibration");
+    }
+    std::printf("r9700_runtime_planner: PASS immutable DFlash C1..8/K/context inventory\n");
 }
 
 void qualify_host_mtp_graph_allowance() {
@@ -454,15 +504,15 @@ void qualify_host_mtp_graph_allowance() {
     struct Case {
         std::uint32_t context, concurrency, drafts;
         bool adaptive;
-        std::size_t definitions, executables, updates;
+        std::size_t definitions;
     };
 
-    // Includes singleton (no update), the reproduced short-context failure, full
+    // Includes singleton, the reproduced short-context failure, full
     // context profiles/split topologies, and all three independently captured Ks.
     for (const auto c :
-         {Case{64, 1, 3, false, 1, 1, 0}, Case{1024, 1, 3, false, 3, 1, 3},
-          Case{1024, 4, 5, false, 12, 4, 12}, Case{262144, 1, 3, false, 11, 3, 10},
-          Case{262144, 4, 5, false, 32, 8, 28}, Case{262144, 4, 5, true, 108, 28, 96}}) {
+         {Case{64, 1, 3, false, 1}, Case{1024, 1, 3, false, 3},
+          Case{1024, 4, 5, false, 12}, Case{262144, 1, 3, false, 11},
+          Case{262144, 4, 5, false, 32}, Case{262144, 4, 5, true, 108}}) {
         runtime::SequencePlanningInputs inputs{
             .weights_profile     = Variant::WeightsProfile::R9700Q4G64Evaluation,
             .capacity            = c.context,
@@ -480,12 +530,12 @@ void qualify_host_mtp_graph_allowance() {
         const auto plan = runtime::build_sequence_candidate_for_qualification(
             inputs, c.concurrency * ((c.context + 63U) / 64U));
         require(plan->graph_definition_count == c.definitions &&
-                    plan->graph_executable_count == c.executables,
+                    plan->graph_executable_count == c.definitions,
                 "MTP fixed/adaptive graph inventory differs from its captured K/B profiles");
-        const auto expected = (46ULL + 4ULL * (c.executables + c.updates)) * 1024ULL * 1024ULL +
+        const auto expected = (46ULL + 4ULL * c.definitions) * 1024ULL * 1024ULL +
                               c.definitions / c.concurrency * kLoweredDefinitionBytes;
         require(plan->graph_allowance_bytes == expected,
-                "MTP allowance omitted profile update/restore residency");
+                "MTP allowance omitted immutable executable residency");
         inputs.use_device_graph = false;
         const auto eager        = runtime::build_sequence_candidate_for_qualification(
             inputs, c.concurrency * ((c.context + 63U) / 64U));
@@ -493,7 +543,7 @@ void qualify_host_mtp_graph_allowance() {
                     eager->graph_executable_count == 0,
                 "eager MTP reserves graph residency");
     }
-    std::printf("r9700_runtime_planner: PASS host MTP graph instantiate/update allowance\n");
+    std::printf("r9700_runtime_planner: PASS host MTP immutable graph allowance\n");
 }
 
 using WeightsProfile = ninfer::targets::qwen3_8_27b::detail::WeightsProfile;
@@ -597,114 +647,32 @@ std::size_t qualify_plan(ninfer::DeviceContext& device, std::uint32_t concurrenc
             : 0U;
     require(plan.impl_->dflash_verify_width == expected_dflash_width,
             "plan did not preserve its fixed DFlash verify width");
-    if (use_device_graph && backend == ninfer::SpeculativeBackend::Mtp) {
-        constexpr std::size_t kMiB                 = 1024ULL * 1024ULL;
-        constexpr std::size_t kMtpGraphFamilyBytes = 46ULL * kMiB;
-        const auto profiles           = Variant::mtp_graph_profiles(max_context, drafts);
-        const std::size_t definitions = profiles.size() * static_cast<std::size_t>(concurrency);
-        std::vector<std::uint32_t> topology_classes;
-        for (std::uint32_t batch_size = 1; batch_size <= concurrency; ++batch_size) {
-            for (const auto profile : profiles) {
-                const std::uint32_t folded =
-                    profile.topology_class * concurrency + (batch_size - 1U);
-                if (std::find(topology_classes.begin(), topology_classes.end(), folded) ==
-                    topology_classes.end()) {
-                    topology_classes.push_back(folded);
-                }
+    if (use_device_graph) {
+        std::size_t definitions = 0U;
+        std::size_t lowered = 0U;
+        for (std::uint32_t batch = 1U; batch <= concurrency; ++batch) {
+            const auto count_profiles = [&](const auto& profiles) {
+                definitions += profiles.size();
+                if (batch == 1U) lowered += profiles.size();
+            };
+            if (backend == ninfer::SpeculativeBackend::None) {
+                count_profiles(Variant::ordinary_graph_profiles(max_context));
+            } else if (backend == ninfer::SpeculativeBackend::Mtp) {
+                count_profiles(Variant::mtp_graph_profiles(max_context, drafts));
+            } else {
+                count_profiles(Variant::dflash_graph_profiles(max_context, drafts, batch,
+                                                             expected_dflash_width));
             }
         }
-        require(plan.impl_->graph_definition_count == definitions,
-                "MTP graph plan omitted a reachable exact-B/profile definition");
-        require(plan.impl_->graph_executable_count == topology_classes.size(),
-                "MTP graph plan executable inventory does not match reachable topologies");
-        std::size_t operations = topology_classes.size();
-        for (const auto topology : topology_classes) {
-            const auto count = std::count_if(profiles.begin(), profiles.end(), [&](const auto& p) {
-                return p.topology_class == topology / concurrency;
-            });
-            if (count > 1) operations += static_cast<std::size_t>(count);
-        }
-        require(plan.impl_->graph_allowance_bytes == kMtpGraphFamilyBytes +
-                                                         4ULL * kMiB * operations +
-                                                         profiles.size() * kLoweredDefinitionBytes,
-                "MTP graph allowance does not match its ROCm family/executable inventory");
-    }
-    if (use_device_graph && backend == ninfer::SpeculativeBackend::None) {
-        constexpr std::size_t kMiB                          = 1024ULL * 1024ULL;
-        constexpr std::size_t kOrdinaryGraphFamilyBytes     = 23ULL * kMiB;
-        constexpr std::size_t kOrdinaryGraphExecutableBytes = 24ULL * kMiB;
-        const auto profiles           = Variant::ordinary_graph_profiles(max_context);
-        const std::size_t definitions = profiles.size() * static_cast<std::size_t>(concurrency);
-        std::vector<std::uint32_t> topology_classes;
-        for (std::uint32_t batch_size = 1; batch_size <= concurrency; ++batch_size) {
-            for (const auto profile : profiles) {
-                const std::uint32_t folded =
-                    profile.topology_class * concurrency + (batch_size - 1U);
-                if (std::find(topology_classes.begin(), topology_classes.end(), folded) ==
-                    topology_classes.end()) {
-                    topology_classes.push_back(folded);
-                }
-            }
-        }
-        require(plan.impl_->graph_definition_count == definitions,
-                "ordinary graph plan omitted a reachable exact-B/profile definition");
-        require(plan.impl_->graph_executable_count == topology_classes.size(),
-                "ordinary graph plan executable inventory does not match reachable topologies");
-        std::size_t update_bytes = 0U;
-        for (const auto topology : topology_classes) {
-            const std::size_t count = static_cast<std::size_t>(
-                std::count_if(profiles.begin(), profiles.end(), [&](const auto profile) {
-                    return profile.topology_class == topology / concurrency;
-                }));
-            if (count > 3U) update_bytes += (count - 3U) * 4ULL * kMiB;
-        }
+        const std::size_t family_mib = backend == ninfer::SpeculativeBackend::None ? 23U :
+                                      backend == ninfer::SpeculativeBackend::Mtp ? 46U : 48U;
+        require(plan.impl_->graph_definition_count == definitions &&
+                    plan.impl_->graph_executable_count == definitions,
+                "immutable graph inventory omitted a reachable exact-B profile");
         require(plan.impl_->graph_allowance_bytes ==
-                    kOrdinaryGraphFamilyBytes +
-                        kOrdinaryGraphExecutableBytes * topology_classes.size() + update_bytes +
-                        profiles.size() * kLoweredDefinitionBytes,
-                "ordinary graph allowance does not match its ROCm family/executable inventory");
-    }
-    if (use_device_graph && backend == ninfer::SpeculativeBackend::DFlash) {
-        constexpr std::size_t kMiB                   = 1024ULL * 1024ULL;
-        constexpr std::size_t kDFlashFamilyBytes     = 48ULL * kMiB;
-        constexpr std::size_t kDFlashExecutableBytes = 26ULL * kMiB;
-        constexpr std::size_t kDFlashK1FusedBytes    = 10ULL * kMiB;
-        std::size_t definitions                      = 0;
-        std::vector<std::uint32_t> topology_classes;
-        std::size_t expected_allowance = kDFlashFamilyBytes;
-        for (std::uint32_t batch_size = 1; batch_size <= concurrency; ++batch_size) {
-            const auto profiles = Variant::dflash_graph_profiles(max_context, drafts, batch_size,
-                                                                 expected_dflash_width);
-            definitions += profiles.size();
-            if (batch_size == 1U) expected_allowance += profiles.size() * kLoweredDefinitionBytes;
-            for (const auto profile : profiles) {
-                const std::uint32_t folded =
-                    profile.topology_class * concurrency + (batch_size - 1U);
-                if (std::find(topology_classes.begin(), topology_classes.end(), folded) !=
-                    topology_classes.end()) {
-                    continue;
-                }
-                topology_classes.push_back(folded);
-                if (drafts != 1U || profile.topology_class == 3U) {
-                    expected_allowance += kDFlashExecutableBytes;
-                    const auto count = static_cast<std::size_t>(
-                        std::count_if(profiles.begin(), profiles.end(), [&](const auto& p) {
-                            return p.topology_class == profile.topology_class;
-                        }));
-                    if (count > 3U) expected_allowance += (count - 3U) * 4ULL * kMiB;
-                } else if (profile.topology_class == 0U) {
-                    expected_allowance += kDFlashK1FusedBytes;
-                } else {
-                    throw std::runtime_error("unexpected DFlash K=1 topology class");
-                }
-            }
-        }
-        require(plan.impl_->graph_definition_count == definitions,
-                "DFlash graph plan omitted a reachable exact-B/profile definition");
-        require(plan.impl_->graph_executable_count == topology_classes.size(),
-                "DFlash graph plan executable inventory does not match reachable topologies");
-        require(plan.impl_->graph_allowance_bytes == expected_allowance,
-                "DFlash graph allowance does not match its ROCm topology inventory");
+                    (family_mib + 4U * definitions) * 1024U * 1024U +
+                        lowered * kLoweredDefinitionBytes,
+                "immutable graph allowance differs from its complete profile inventory");
     }
     return plan.workspace_capacity_bytes();
 }

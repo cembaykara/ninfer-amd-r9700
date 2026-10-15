@@ -1,5 +1,6 @@
 #include "targets/qwen3/impl/runtime/instance.h"
 #include "targets/qwen3/impl/runtime/layouts.h"
+#include "targets/qwen3/impl/runtime/kv_disk_cache.h"
 #include "targets/qwen3/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3/impl/runtime/prefill_schedule.h"
 #include "targets/qwen3/impl/runtime/context_checkpoint.h"
@@ -34,52 +35,9 @@ namespace {
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 constexpr std::size_t kArenaAlign = 256ULL;
 
-// ROCm 10 gfx1201 startup probes (2026-09-21, selective-protected weights): MTP K3/C1
-// and K5/C4, at 1K and native 262144 context, consumed at most 46 MiB before graph
-// instantiation. Each instantiate/update retained at most two 2-MiB allocator units;
-// upload retained none. Updates DO retain residency even when topology is unchanged.
-// Budget the actual instantiate + profile-install/restore inventory below, including
-// every adaptive K. These are target/toolchain calibration bounds, not HIP guarantees.
-constexpr std::size_t kR9700MtpGraphFamilyBytes    = 46ULL * kMiB;
-constexpr std::size_t kR9700MtpGraphOperationBytes = 4ULL * kMiB;
-// ROCm 10 gfx1201, 2026-09-22: selective-protected BF16 staging plus tiled
-// W8 head, ordinary C1/context1024, consumed 46 MiB in complete preparation
-// versus the matched control's 44 MiB. Reserve 23+24=47 MiB for this singleton,
-// leaving 1 MiB measured headroom. This is aggregate preparation calibration,
-// not isolated graph storage; retain the 24 MiB per-executable term. The C3
-// candidate consumed 72 MiB, within its previous 92 MiB bound.
-constexpr std::size_t kR9700OrdinaryGraphFamilyBytes     = 23ULL * kMiB;
-constexpr std::size_t kR9700OrdinaryGraphExecutableBytes = 24ULL * kMiB;
-// The ordinary 1K calibration includes three definitions per executable. Larger
-// frontiers install additional definitions even when topology is unchanged.
-// Charge their retained updates using the measured ROCm operation bound above;
-// do not infer a smaller bound from aggregate preparation deltas. At context4224,
-// five definitions consumed 52 MiB for the deployed selective tiled profile;
-// 23 + 24 + 2*4 = 55 MiB covers that preparation without changing the 1K budget.
-constexpr std::size_t kR9700OrdinaryCalibratedDefinitions = 3U;
-constexpr std::size_t kR9700OrdinaryGraphUpdateBytes      = 4ULL * kMiB;
-// ROCm 10 gfx1201, 2026-09-22: selective-protected BF16 staging, tiled W8 head
-// and Q4 projection gathering consume 73 MiB for C1/K4 at context1024. The
-// fixed-family 48 plus per-executable 26 MiB reserves 74 MiB (1 MiB headroom).
-// Matched startup checks consume 85/100 MiB observed/allowed at C2/K4 and
-// 109/152 MiB at C4/K5. These calibrate complete preparation, not isolated HIP
-// graph storage. Apply the fixed term once, not once per request. Retain the
-// existing executable terms: K>=2 and every packed-decode topology own 26 MiB; the K1
-// short-context fused topology owns 10 MiB. The strict residency guard remains.
-constexpr std::size_t kR9700DFlashGraphFamilyBytes       = 48ULL * kMiB;
-constexpr std::size_t kR9700DFlashGraphExecutableBytes   = 26ULL * kMiB;
-constexpr std::size_t kR9700DFlashK1FusedExecutableBytes = 10ULL * kMiB;
-// The K4/K5 1K calibration contains three definitions per executable. Larger
-// frontiers install more definitions on that same executable; each retains up to
-// the measured ROCm 4-MiB update bound. At C1/K4/context4240, five definitions
-// consumed 75 MiB with selective-cap FP8/Q4, exceeding the old fixed 74 MiB.
-// Charge updates, not additional executables or physical FP8 arena rounding.
-constexpr std::size_t kR9700DFlashCalibratedDefinitions = 3U;
-constexpr std::size_t kR9700DFlashGraphUpdateBytes      = 4ULL * kMiB;
-// Each single-sequence definition is lowered to persistent decode kernels
-// (ops/persistent_decode.h): its program storage and the lowered executable's residency. Lowering
-// three C1 definitions consumed 16 MiB beyond the executable terms with DFlash K7 and MTP K3, 8 MiB
-// without a draft.
+// Conservative bounds for uncalibrated startup selectors. Every captured profile
+// owns an immutable executable; runtime never instantiates or updates graphs.
+constexpr std::size_t kR9700GraphExecutableBytes = 4ULL * kMiB;
 constexpr std::size_t kR9700PersistentDecodeDefinitionBytes = 6ULL * kMiB;
 
 enum class GdnWorkspacePath : std::uint8_t {
@@ -116,36 +74,6 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
 std::uint32_t page_count(std::uint32_t capacity) {
     if (capacity == 0) { throw std::invalid_argument("Paged KV capacity must be positive"); }
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
-}
-
-struct GraphAllowance {
-    std::size_t executable_count = 0;
-    std::size_t bytes            = 0;
-};
-
-template <class ProfileAllowance>
-GraphAllowance graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
-                                        ProfileAllowance&& profile_allowance, const char* label) {
-    std::vector<std::pair<std::uint32_t, std::size_t>> classes;
-    for (const GraphExecutionProfile profile : profiles) {
-        const std::size_t allowance = profile_allowance(profile);
-        const auto existing = std::find_if(classes.begin(), classes.end(), [&](const auto& entry) {
-            return entry.first == profile.topology_class;
-        });
-        if (existing == classes.end()) {
-            classes.emplace_back(profile.topology_class, allowance);
-        } else {
-            existing->second = std::max(existing->second, allowance);
-        }
-    }
-
-    GraphAllowance result;
-    for (const auto& [topology_class, allowance] : classes) {
-        (void)topology_class;
-        ++result.executable_count;
-        result.bytes = checked_add(result.bytes, allowance, label);
-    }
-    return result;
 }
 
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
@@ -987,150 +915,75 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         impl->request_transient_capacity_bytes =
             schedule::VisionContext::output_transient_bytes(merged);
     }
-    // Single-sequence graph definitions, which capture lowers to persistent decode kernels.
-    std::size_t lowered_definitions = 0;
     if (impl->use_device_graph) {
-        // Allowance groups executable residency by topology, including MTP's retained
-        // profile-update allocations. Speculative K and exact batch size are already
-        // folded into topology_class; do not multiply the result by C again.
-        if (impl->speculative_backend == SpeculativeBackend::None) {
-            std::vector<GraphExecutionProfile> expanded;
-            const auto profiles = ordinary_graph_profiles(impl->capacity);
-            lowered_definitions += profiles.size();
-            for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
-                for (const GraphExecutionProfile planned : profiles) {
-                    GraphExecutionProfile folded = planned;
-                    folded.topology_class =
-                        planned.topology_class * impl->max_concurrency + (batch_size - 1U);
-                    expanded.push_back(folded);
-                }
-            }
-            const GraphAllowance allowance = graph_topology_allowance(
-                expanded,
-                [&](GraphExecutionProfile profile) {
-                    const auto definitions = static_cast<std::size_t>(
-                        std::count_if(expanded.begin(), expanded.end(), [&](const auto& other) {
-                            return other.topology_class == profile.topology_class;
-                        }));
-                    // D>1 definitions perform D updates, including restoration
-                    // of the first definition. The calibrated three already
-                    // cover that restore; each extra definition adds one update.
-                    const std::size_t extra_updates =
-                        definitions > kR9700OrdinaryCalibratedDefinitions
-                            ? definitions - kR9700OrdinaryCalibratedDefinitions
-                            : 0U;
-                    return checked_add(kR9700OrdinaryGraphExecutableBytes,
-                                       checked_mul(extra_updates, kR9700OrdinaryGraphUpdateBytes,
-                                                   "ordinary graph profile update allowance"),
-                                       "ordinary graph executable allowance");
-                },
-                "ordinary graph allowance");
-            impl->graph_definition_count = expanded.size();
-            impl->graph_executable_count = allowance.executable_count;
-            impl->graph_allowance_bytes  = checked_add(
-                kR9700OrdinaryGraphFamilyBytes, allowance.bytes, "ordinary graph family allowance");
-        } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            std::vector<GraphExecutionProfile> expanded;
-            const auto k_stride =
-                speculative_graph_stride(impl->capacity, impl->max_concurrency, impl->captured_ks,
-                                         impl->speculative_backend, impl->dflash_verify_width);
-            for (const auto k : impl->captured_ks) {
-                const auto profiles = mtp_graph_profiles(impl->capacity, k);
-                lowered_definitions += profiles.size();
-                for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency;
-                     ++batch_size) {
-                    for (const GraphExecutionProfile planned : profiles) {
-                        GraphExecutionProfile folded = planned;
-                        folded.topology_class =
-                            qwen3::adaptive_k_index(impl->captured_ks, k) * k_stride +
-                            planned.topology_class * impl->max_concurrency + (batch_size - 1U);
-                        expanded.push_back(folded);
+        std::size_t definitions = 0;
+        std::size_t lowered_definitions = 0;
+        for (std::uint32_t batch = 1; batch <= impl->max_concurrency; ++batch) {
+            const auto count_profiles = [&](const auto& profiles) {
+                definitions += profiles.size();
+                if (batch == 1U) lowered_definitions += profiles.size();
+            };
+            if (impl->speculative_backend == SpeculativeBackend::None) {
+                count_profiles(ordinary_graph_profiles(impl->capacity));
+            } else {
+                for (const auto k : impl->captured_ks) {
+                    if (impl->speculative_backend == SpeculativeBackend::Mtp) {
+                        count_profiles(mtp_graph_profiles(impl->capacity, k));
+                    } else {
+                        count_profiles(dflash_graph_profiles(
+                            impl->capacity, k, batch,
+                            dflash_captured_verify_width(k, impl->dflash_verify_width)));
                     }
                 }
             }
-            const GraphAllowance allowance = graph_topology_allowance(
-                expanded,
-                [&](GraphExecutionProfile profile) {
-                    const auto definitions = static_cast<std::size_t>(
-                        std::count_if(expanded.begin(), expanded.end(), [&](const auto& other) {
-                            return other.topology_class == profile.topology_class;
-                        }));
-                    // instantiate_graph_family installs each subsequent definition,
-                    // then restores the first: D updates for D>1, none for D=1.
-                    const std::size_t operations = 1U + (definitions > 1U ? definitions : 0U);
-                    return checked_mul(operations, kR9700MtpGraphOperationBytes,
-                                       "MTP graph profile installation allowance");
-                },
-                "MTP graph allowance");
-            impl->graph_definition_count = expanded.size();
-            impl->graph_executable_count = allowance.executable_count;
-            impl->graph_allowance_bytes  = checked_add(kR9700MtpGraphFamilyBytes, allowance.bytes,
-                                                       "MTP graph family allowance");
-        } else {
-            std::vector<GraphExecutionProfile> expanded;
-            const auto k_stride =
-                speculative_graph_stride(impl->capacity, impl->max_concurrency, impl->captured_ks,
-                                         impl->speculative_backend, impl->dflash_verify_width);
-            for (const auto k : impl->captured_ks) {
-                const std::uint32_t w = dflash_captured_verify_width(k, impl->dflash_verify_width);
-                for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency;
-                     ++batch_size) {
-                    const auto profiles = dflash_graph_profiles(impl->capacity, k, batch_size, w);
-                    if (batch_size == 1U) lowered_definitions += profiles.size();
-                    for (const GraphExecutionProfile planned : profiles) {
-                        GraphExecutionProfile folded = planned;
-                        folded.topology_class =
-                            qwen3::adaptive_k_index(impl->captured_ks, k) * k_stride +
-                            planned.topology_class * impl->max_concurrency + (batch_size - 1U);
-                        expanded.push_back(folded);
-                    }
-                }
-            }
-            const GraphAllowance allowance = graph_topology_allowance(
-                expanded,
-                [&](GraphExecutionProfile profile) {
-                    const std::uint32_t attention_topology =
-                        (profile.topology_class % k_stride) / impl->max_concurrency;
-                    // Every packed-decode topology (class 3) is the calibrated DFlash
-                    // verification executable, whatever its captured K.
-                    if (impl->adaptive_draft || impl->draft_window != 1U ||
-                        attention_topology == 3U) {
-                        const auto definitions = static_cast<std::size_t>(
-                            std::count_if(expanded.begin(), expanded.end(), [&](const auto& other) {
-                                return other.topology_class == profile.topology_class;
-                            }));
-                        const std::size_t extra_updates =
-                            definitions > kR9700DFlashCalibratedDefinitions
-                                ? definitions - kR9700DFlashCalibratedDefinitions
-                                : 0U;
-                        return checked_add(kR9700DFlashGraphExecutableBytes,
-                                           checked_mul(extra_updates, kR9700DFlashGraphUpdateBytes,
-                                                       "DFlash graph profile update allowance"),
-                                           "DFlash graph executable allowance");
-                    }
-                    if (attention_topology == 0U) { return kR9700DFlashK1FusedExecutableBytes; }
-                    throw std::logic_error("unknown DFlash K=1 graph topology class");
-                },
-                "DFlash exact-b graph allowance");
-            impl->graph_definition_count = expanded.size();
-            impl->graph_executable_count = allowance.executable_count;
-            impl->graph_allowance_bytes = checked_add(kR9700DFlashGraphFamilyBytes, allowance.bytes,
-                                                      "DFlash graph family allowance");
         }
-        impl->graph_allowance_bytes =
-            checked_add(impl->graph_allowance_bytes,
-                        checked_mul(lowered_definitions, kR9700PersistentDecodeDefinitionBytes,
-                                    "persistent decode allowance"),
-                        "graph allowance with persistent decode");
+        impl->graph_definition_count = definitions;
+        impl->graph_executable_count = definitions;
+        const std::size_t family_bytes =
+            (impl->speculative_backend == SpeculativeBackend::None ? 23U :
+             impl->speculative_backend == SpeculativeBackend::Mtp ? 46U : 48U) * kMiB;
+        impl->graph_allowance_bytes = checked_add(
+            checked_add(family_bytes,
+                        checked_mul(definitions, kR9700GraphExecutableBytes,
+                                    "immutable graph executable allowance"),
+                        "graph family allowance"),
+            checked_mul(lowered_definitions, kR9700PersistentDecodeDefinitionBytes,
+                        "persistent decode allowance"),
+            "graph allowance with persistent decode");
+        if (const auto calibrated = Variant::calibrated_dflash_graph_allowance_bytes(
+                impl->weights_profile, impl->features, impl->capacity, impl->max_concurrency,
+                impl->prefill_chunk, impl->draft_window, impl->adaptive_draft)) {
+            impl->graph_allowance_bytes = std::min(impl->graph_allowance_bytes, *calibrated);
+        }
     }
     impl->device_reservation_bytes = checked_add(
         checked_add(
             checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
             impl->request_transient_capacity_bytes, "request transient reservation"),
-        checked_add(impl->graph_allowance_bytes,
-                    Variant::runtime_allocation_overhead_bound(impl->weights_profile),
-                    "sequence physical allocation bound"),
+        checked_add(
+            impl->graph_allowance_bytes,
+            checked_add(Variant::runtime_allocation_overhead_bound(impl->weights_profile),
+                        Variant::runtime_driver_reservation_bytes(
+                            impl->weights_profile, impl->max_concurrency,
+                            impl->kv_disk_capacity_bytes != 0U),
+                        "sequence driver and physical allocation bounds"),
+            "sequence physical allocation bound"),
         "sequence graph allowance");
+    if (impl->kv_disk_capacity_bytes != 0) {
+        const auto& text = impl->persistent.decoder.text_kv.storage.storage;
+        const auto* backend = impl->persistent.decoder.mtp_kv
+                                  ? &impl->persistent.decoder.mtp_kv->storage.storage
+                                  : nullptr;
+        const std::size_t text_page_bytes = text.payload_bytes() / text.spec.page_group_count;
+        const std::size_t backend_page_bytes =
+            backend != nullptr ? backend->payload_bytes() / backend->spec.page_group_count : 0U;
+        impl->device_reservation_bytes = checked_add(
+            impl->device_reservation_bytes,
+            qwen3::detail::disk_restore_device_reservation_bytes(
+                std::max(text_page_bytes, backend_page_bytes), text.planes.size(),
+                backend != nullptr ? backend->planes.size() : 0U),
+            "KV disk restore device reservation");
+    }
     return impl;
 }
 

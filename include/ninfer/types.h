@@ -73,7 +73,8 @@ enum class KvDiskCompress : std::uint8_t {
 };
 
 // Automatic KV sizing leaves this much device memory free. The Engine allocates everything at
-// startup, so it only covers driver-side growth (lazy per-kernel scratch) and other GPU users.
+// startup and budgets its own lazy driver residency separately. This reserve is
+// exclusively for other GPU users and display activity.
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 64ULL * 1024ULL * 1024ULL;
 
 struct KvCapacityPolicy {

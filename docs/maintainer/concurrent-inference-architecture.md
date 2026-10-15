@@ -1161,7 +1161,7 @@ Resident Model Runtime 是 model-instance object，不是 request object。它�
 - 一份最大容量为 `C` 的 `DecodeBatchFrame`；
 - speculative backend 启用时，一份容量为 `C` 的 all-layer ReplaySSM record arena；其固定宽度为 MTP 的
   `draft_window+1` 或 DFlash 的 resolved `dflash_verify_width`；
-- startup-captured graph definitions 和 topology executables。
+- startup-captured graph definitions 和 immutable profile executables。
 
 每个 request 的持久状态只存在于 slot control 和该 slot 当前拥有的 `SequenceState`。Model Runtime 不保存
 “current request”，也不为每个 slot 复制 workspace、round buffers 或 graph assets。
@@ -1443,25 +1443,17 @@ DFlash 不保留单独的 `B=1` concurrency route。
 shared frame、workspace 和 state-pool bases。它读取 typed controls 和 selectors，不读取 request/slot
 identity。
 
-Captured definition 和 replayable executable 不是一一对应。Exact `B` and, when adaptive drafting is
-enabled, captured K are structural keys. Within that pair, only genuinely different node topology
-requires another executable:
+Each reachable exact `B`, captured K and context profile owns one immutable executable:
 
 ```text
-exact definitions[family,B,K,profile]
-          │ exact B + target-declared profile topology class
-          ▼
-executable[family,B,K,topology class]
+Definition[family,B,K,profile] -> Executable[family,B,K,profile]
 ```
 
-不同 context profiles 若在同一 exact `B` 下具有可更新的 node topology，共享一个 executable，并在 profile
-变化时安装选中的 definition。不同 `B` 不执行 cross-B graph update；这避免 batch-dependent operator route、
-kernel 参数和 launch shape 触发 `hipGraphExecUpdate` 不兼容。资源数量因此是 exact `B` 的有限集合，而不是
-`B × context profile` 的完整笛卡尔积。
-
-Profile 在 capture 前按 configured context ceiling 截断，只有实际 reachable 的 topology classes 才实例化
-executable。Backend-specific proposal shape 只有在真实改变 Device Graph node topology 时才形成每个 exact `B`
-下的 topology class，不生成 ordinary-tail 或额外 `B=1` compatibility graph。
+Definitions keep their rewritten device storage alive for their executable's lifetime.
+The finite profile inventory is clipped to the configured context ceiling before capture.
+There is no executable update or shared installed-profile state: repeated HIP executable
+updates retain kernel-argument allocations and cannot be assigned a finite runtime budget.
+Different request identities still use the same immutable executable for the same B/K/profile.
 
 Startup 对 graph family 的准备顺序固定为：
 
@@ -1476,15 +1468,15 @@ workspace extent remains separate from this finite descriptor inventory.
    library runtime 在 stream capture 前完成 lazy materialization；
 2. 捕获全部 exact-`B`/profile definitions。Capture 只记录 HIP work，不执行 model round，也不承担
    production 数值 qualification；
-3. 每个 topology executable 由其首个 definition 实例化。该 topology 的其余 definitions 逐个通过
-   `hipGraphExecUpdate` 验证兼容性，并通过 `hipGraphUpload` 完成 executable resource materialization；
-4. 每个 executable 只 replay 一次首个 definition 作为 startup smoke。遍历其余 profiles 后，以
-   update/upload 恢复首个 installed definition，不额外 replay。
+3. Instantiate and upload every profile's executable. For each family, exact batch, captured K
+   and target structural class, smoke-launch the profile with the largest frontier. Prepare its
+   frontier and synchronize before each launch. Structural class is startup warmup metadata;
+   executable ownership remains one per profile;
+4. Reset all mutated state and controls before exposing the Program. Capture's temporary repeated
+   private-page mappings remain valid through every smoke launch.
 
-因此 startup 不为每个 definition 执行 eager warm，也不把每个 profile 的 update 当成 real-model replay
-qualification。完整算子与 route correctness 由独立测试和 real-artifact integration route 负责；production
-startup 只验证 graph inventory、update compatibility、resource materialization 和每个 executable 的一次
-可执行性。
+Startup materializes the full immutable executable inventory. Smoke is a resource/lifetime check;
+independent operator tests and real-artifact integration remain the numerical authorities.
 
 ### 9.1a `B=1` persistent lowering
 
@@ -1496,8 +1488,8 @@ GDN front / pair-conv / record、Q/K norm-RoPE）替换为一个 persistent kern
 （verify attention、drafter、sampling、copies）保持不变，graph 仍是单链。
 
 Lowering 返回的 program storage（phase records、captured arguments、barrier words）由
-`DecodeGraphDefinition` 持有，生命周期覆盖 graph 及由其 instantiate / update 的 executables；同一
-topology 的 definitions 降低为相同 node 序列，因此 `hipGraphExecUpdate` 照常适用。Memory plan 为每个
+`DecodeGraphDefinition` owns this storage for both its graph and its immutable executable.
+The memory plan charges each
 lowered definition 计入固定 allowance。`B>1` definitions 不降低（lowered C4/C8 更慢），见
 `docs/performance.md`。
 
@@ -1512,13 +1504,10 @@ active set 改变时，runtime 发布新的 frame ingress 并选择匹配的预�
 [B,C,D]   -> Definition[B=3]
 ```
 
-Runtime 先选择 exact-`B` executable；若它当前安装的是同一 `B` 的另一个 context-profile definition，先执行
-whole-graph update，再 replay 一次。`B` 改变时直接选择另一个预实例化 executable。Active identity 改变但
-`B/profile` 不变时只更新 typed data，不更新 executable。Graph 不按 request identity、slot subset 或 slot
-bitmask 建 key，join、leave 和 slot reuse 不触发 capture。
-
-Installed-definition state 只由 GPU Executor 修改；update 和 replay 位于同一串行 execution lane。并发 callers
-不能直接 launch 或更新同一个 executable。
+Runtime selects the already instantiated executable for the exact B/K/context profile and
+replays it once. Active identity changes only typed ingress data; no request, slot subset or
+bitmask enters the graph key. Only the GPU Executor launches executables. Serving never calls
+HIP graph instantiate, update or upload.
 
 Paged-KV allocation、Linear Attention state ownership 和 retained-state reuse 只改变 block-table content 或
 selector values。Graph 始终绑定 pool/table-matrix base，因此这些 ownership transitions 也不形成 graph
@@ -1569,42 +1558,13 @@ eager 与 captured replay 逐位相同；以 live frontier 执行会在 16K 以�
 不得为每个 `B`、profile 或 captured definition 复制 logits、hidden、workspace 或 per-sequence state。
 Model/control ingress、forward 和 result egress 不存在 per-row device submission；跨 page 时的 table
 publication 属于 state substrate materialization。Serving 期间不 capture、instantiate 或扩展 graph family。
-MTP graph memory on ROCm 10/gfx1201 includes retained allocations from executable updates,
-not just instantiated topology count. The startup planner reserves a calibrated 46 MiB
-family term and 4 MiB per instantiate/update operation. For a topology with D definitions,
-startup performs one instantiate and, when D > 1, D updates (install subsequent profiles,
-then restore the first). Adaptive K uses the full K-specific inventory. September 21
-selective-protected probes measured 58/92 MiB for K3/C1 and K5/C4 at 1K context, and
-84/148 MiB at native context; individual operations retained at most 4 MiB. These are
-toolchain-specific allocation bounds, not performance results or general HIP guarantees.
-The observed-allocation startup guard remains mandatory.
-
-Ordinary graph preparation also retains profile-update allocations. Its calibrated
-23 MiB family plus 24 MiB per executable covers up to three definitions per topology
-(the 1024-context calibration). For each additional definition in that exact-B
-topology, reserve another 4 MiB using the existing measured ROCm update bound. Startup
-installs all definitions and restores the first, so each extra definition adds one
-update without necessarily adding an executable. Context 4096 has four definitions;
-4224 has five: C1 allowances are 51 and 55 MiB respectively, while context1024 stays
-47 MiB. The deployed selective tiled profile measured 52 MiB of complete preparation
-at context4224/P4096/G128/chunk2048. This is aggregate toolchain-specific residency,
-not isolated graph-storage measurement or a universal HIP bound; the strict observed
-allocation guard is unchanged. Eager execution reserves no graph allowance.
-
-DFlash K4/K5's calibrated 48 MiB family plus 26 MiB per exact-B/K executable likewise
-covers three definitions per topology at context1024. Each additional definition in
-that same topology reserves 4 MiB for the retained executable update, using the measured
-ROCm operation bound above. The 2026-09-23 selective-cap Q4/FP8 companion at
-C1/K4/P4096/G128/chunk2048/context4240 consumed 75 MiB, exceeding the old 74 MiB;
-its five definitions require an 82 MiB allowance. Context1024 remains 74 MiB.
-This is aggregate graph-preparation residency, not a measurement of isolated FP8
-library allocations. Fixed-K1's separately calibrated executable terms are unchanged;
-adaptive families charge their actual folded exact-B/K/topology definition inventory.
-Do not add the deficit to KV capacity, logical workspaces, or FP8 arena-rounding bounds.
-The observed-consumption guard remains fail-closed, and eager execution reserves zero.
-
-Startup graph allowance 必须计入全部 reachable exact-`B` definitions，以及每个 exact `B`、每个实际
-topology class 的一份 executable，不能沿用只覆盖 `B=1` definitions 的 reservation。
+The startup reservation includes all reachable definitions, their owned lowered storage,
+and one immutable executable per definition. Uncalibrated selectors use a conservative
+family allowance plus the measured per-executable allocation bound. Production C1..8
+uses the measured full-inventory reservation documented in `docs/performance.md`.
+The observed-allocation startup guard remains mandatory; eager execution reserves no graphs.
+NInfer-induced lazy driver resources belong in NInfer's reservation. The configurable KV
+headroom is reserved exclusively for external GPU users and display activity.
 
 Capture/smoke 使用的 temporary Paged-KV allocation 每个有效 row 只 materialize 一个 private physical
 page，并把该 page 重复发布到 temporary block-table row。准备一次 eager/smoke 时只清零 `[0,B)` 对应的

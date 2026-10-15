@@ -1168,16 +1168,13 @@ KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
         throw std::invalid_argument("KV disk cache requires an artifact_file_identity");
     }
     const std::size_t page_bytes = std::max<std::size_t>(config_.logical_page_bytes, 256);
-    const std::uint32_t readers  = std::min(
-        16u, std::max(1u, config_.restore_io_threads == 0 ? 1u : config_.restore_io_threads));
+    const std::uint32_t readers = disk_restore_reader_count(config_.restore_io_threads);
     restore_io_threads_ = readers;
     // Single-reader mode uses only io_loop for pages; multi-reader mode uses
     // exactly N restore workers. Each can own one dequeued job at a time.
     // Reserve before workers start so taking a job cannot lose ownership to OOM.
     reader_claims_.reserve(readers);
-    std::uint32_t slots = config_.restore_window_slots == 0 ? 2u : config_.restore_window_slots;
-    if (readers > 1) { slots = std::max(slots, 2u * readers); }
-    slots = std::min(64u, std::max(2u, slots));
+    const std::uint32_t slots = disk_restore_window_slots(config_.restore_window_slots, readers);
     window_.resize(slots);
     restore_window_stride_   = aligned_page_file_bytes(page_bytes);
     restore_window_bytes_    = restore_window_stride_ * static_cast<std::size_t>(slots);
