@@ -17,12 +17,14 @@
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/types.h"
 #include "ops/r9700/gdn/gdn_ops.h"
+#include "ops/r9700/gdn_recurrence/gdn_verify_profile.h"
 #include "ops/r9700/kv/r9700_attention_profile.h"
 #include "ops/r9700/linear/fp8lut4_linear.h"
 #include "ops/r9700/linear/fp8_small_t_linear.h"
 #include "ops/r9700/linear/linear_execution.h"
 #include "ops/r9700/linear/r9700_linear.h"
 #include "ops/r9700/linear/r9700_q4_activation_profile.h"
+#include "ops/r9700/linear/r9700_w8_activation_profile.h"
 #include "targets/qwen3_8_27b/impl/r9700_full_attention.h"
 #include "targets/qwen3/impl/runtime/r9700_cache_profile.h"
 
@@ -1852,6 +1854,41 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
                 : (ops::r9700::kv::use_split512_attention(block, maximum_visible, true) ? 2U : 0U);
     }
     return profiles;
+}
+
+std::optional<std::size_t> Variant::calibrated_dflash_graph_allowance_bytes(
+    WeightsProfile profile, qwen3::StartupFeatures features, std::uint32_t capacity,
+    std::uint32_t concurrency, std::uint32_t prefill_chunk, std::uint32_t draft_window,
+    bool adaptive_draft) {
+#if defined(NINFER_R9700_XATTENTION_QUALIFICATION)
+    constexpr bool production_attention = false;
+#else
+    constexpr bool production_attention = true;
+#endif
+    constexpr auto planes = qwen3::detail::kR9700TextKVPlaneLayouts;
+    const bool qualified_build =
+        production_attention &&
+        qwen3::detail::kR9700TextKVValueGroup == 16 &&
+        planes.key == Fp8KInt4VPlaneLayout::TokenFastestHeadMajor &&
+        planes.value == Fp8KInt4VPlaneLayout::FeatureFastestPageMajor &&
+        planes.value_scale == Fp8KInt4VPlaneLayout::FeatureFastestPageMajor &&
+        ops::r9700::linear::kQ4ActivationBits == 8U &&
+        ops::r9700::linear::kW8ActivationBits == 8U &&
+        ops::r9700::linear::kQ4PrefillA4Families == 0U &&
+        !ops::r9700::linear::kDFlashSmallTCandidateEnabled &&
+        !ops::r9700::linear::kDFlashMlpDownT5CandidateEnabled &&
+        !ops::r9700::gdn_recurrence::kVerifyWaveQkCandidate &&
+        ops::r9700::kv::kFp8QkWmmaDecode && !ops::r9700::kv::kTextP129WmmaTailCandidate;
+    if (!qualified_build || profile != WeightsProfile::R9700Fp8Lut4 || features.vision ||
+        !features.dflash() || !features.optimized_proposal() || capacity != maximum_context ||
+        concurrency == 0U || concurrency > 8U ||
+        prefill_chunk != 2048U || draft_window != 7U || !adaptive_draft)
+        return std::nullopt;
+
+    // Complete immutable inventory, measured separately at every C on gfx1201.
+    // profiles/bench/r9700-vram-runtime-budget-20261015/
+    constexpr std::array<std::size_t, 8> graph_mib{318, 578, 842, 1102, 1364, 1624, 1884, 2144};
+    return graph_mib[concurrency - 1U] << 20U;
 }
 
 void Variant::attention_projection(const Tensor& hidden,

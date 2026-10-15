@@ -193,19 +193,13 @@ struct DecodeGraphProfile {
     std::uint32_t draft_tokens           = 0;
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
-    std::uint32_t topology_class         = 0;
+    std::uint32_t topology_class         = 0; // Startup warmup metadata only.
     DecodeGraphDefinition definition;
-};
-
-struct DecodeGraphTopology {
-    std::uint32_t topology_class = 0;
     DecodeGraphExecutable executable;
-    std::optional<std::size_t> installed_profile;
 };
 
 struct DecodeGraphFamily {
     std::vector<DecodeGraphProfile> profiles;
-    std::vector<DecodeGraphTopology> topologies;
 };
 
 // Target model continuation for one logical sequence. This state remains meaningful after the

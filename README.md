@@ -95,8 +95,12 @@ Each agent may run one build at a time, capped at 12 compiler jobs by default (1
 
 For the native ROCm Docker image, dedicated development container and GPU device
 passthrough commands, see `docs/containers.md`. No NVIDIA container runtime is needed.
-`compose.yaml` defaults to temperature1.5, DFlash,4GiB RAM prefix cache and32GiB
-persistent disk cache; copy `.env.example` to `.env` and set your local paths.
+`compose.yaml` defaults to temperature1.5, DFlash, 8 GiB RAM prefix cache and 25 GiB
+persistent disk cache, C6 and adaptive draft length up to 7. It joins the external
+`proxy` Docker network at `ninfer-r9700:8080`, with no published host port.
+Copy `.env.example` to `.env` and set your local paths, then run
+`docker compose up -d`. Startup builds the image and reuses cached CMake/Ninja
+objects after source edits; no separate deployment script is needed.
 
 ## Run
 

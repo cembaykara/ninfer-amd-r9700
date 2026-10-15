@@ -97,16 +97,34 @@ weights are resident:
 
 ```text
 B(M)   = persistent state + workspace + request transient + Device Graph allowance
+         + SSD restore device storage + physical allocation bounds
 B_min  = B(M_min)
 B_step = B(M_min+1) - B(M_min)
 M      = min(M_max, M_min + floor((F-R-B_min)/B_step))
 ```
 
 `F` is device memory available after weights and `R` is the configured sizing headroom
-(`--kv-capacity-headroom`, default 64 MiB). The Engine allocates no device memory after startup, so
-`R` only covers driver-side growth such as lazily allocated kernel scratch; raise it when a desktop
-or another process shares the GPU. Startup failures in automatic mode name the option. The same production layout builder supplies `B_min` and `B_step`; the
+(`--kv-capacity-headroom`, default 64 MiB). `R` is exclusively for external GPU users and display
+activity. NInfer-owned storage and its lazy driver allocations belong in `B(M)`; the runtime
+reservation includes both. Raise `R` when a desktop or another process needs more memory.
+Startup failures in automatic mode name the option. The same production layout builder supplies `B_min` and `B_step`; the
 common resolver does not duplicate model dimensions or bytes-per-token formulas.
+
+Enabled SSD caching reserves its device restore window and per-pool scatter descriptors in
+`B(M)`. The production 16-reader window has 32 packed-page slots: G16 Text pages require 52 MiB
+of staging, plus a 2-MiB physical allocation bound for each scatter table (54 MiB with DFlash,
+56 MiB with MTP). Host file-alignment padding belongs only to the pinned host I/O window.
+This reservation is independent of physical KV page count and preserves the affine curve;
+it does not consume the external headroom.
+
+For the measured production `R9700Fp8Lut4` build at `S=262144`, adaptive DFlash K7 with
+the optimized proposal head, no Vision, and prefill chunk 2048, the target bounds the
+complete immutable Device Graph residency by its measured C1..8 inventory. This includes one
+executable for every captured profile and the lowered persistent decode definitions. Other startup
+selectors and qualification builds use the conservative immutable-executable inventory bound.
+The target separately reserves 2 MiB for startup driver residency and its measured C-specific
+lazy kernel-driver residency, including 2 MiB for the SSD scatter kernel when that tier is enabled.
+Startup rejects graph residency above the planned bound. See `docs/performance.md` for the measured cells and capacity qualification.
 
 The token embedding is materialized in pinned host memory, not in the device weights, so `F`
 includes its size (675,430,400 bytes for the production Q4G64 table). Persistent state includes

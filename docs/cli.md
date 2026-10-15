@@ -288,9 +288,10 @@ the 64-token page size. `--kv-capacity auto` loads the selected weights, measure
 memory, and directly chooses the largest legal page capacity for the complete enabled runtime
 layout. This includes the selected speculative backend, fixed sequence state, workspace, Vision
 request transient, and Device Graph allowance, while leaving `--kv-capacity-headroom` MiB (default
-64) unallocated. The Engine allocates all device memory at startup, so the default only covers
-driver-side growth such as lazily allocated kernel scratch; raise it when a desktop or another
-process uses the same GPU. A startup failure in automatic mode names this option. The token
+64) available for external GPU users and display activity. NInfer's own allocations and lazy
+driver residency are included in its runtime budget; they do not consume this reserve.
+Raise it when a desktop or another process needs more GPU memory. A startup failure in automatic
+mode names this option. The token
 embedding is held in pinned host memory rather than VRAM (the load summary's `weight pinned host`),
 so it is not part of the device weights. It does not probe
 allocations or resize the pool at request time. The single-request

@@ -48,6 +48,95 @@ The latest accepted measurements use:
 The GPU must otherwise be idle. Timings use HIP events around the claimed physical work after
 warmup. Independent exact/FP64 oracles run before performance values are admitted.
 
+### Native-context VRAM capacity (2026-10-15)
+
+The production `R9700Fp8Lut4` artifact was measured independently at every C1..8 on one
+gfx1201 R9700 with the selected `/opt/rocm/core-10.0` toolchain (HIP 7.15.26333),
+`max_context=262144`, prefill chunk 2048, adaptive DFlash K7, optimized proposal head, no
+Vision, 8-GiB RAM cache, 25-GiB SSD cache, and GPU power mode `auto`.
+
+The earlier startup-only calibration is superseded. Repeated `hipGraphExecUpdate` calls retain
+kernel-argument allocations on this HIP build: an independent two-graph, 1000-node reproducer
+measured 2/10/42/84/170 MiB retained after 1/8/32/64/128 updates, with exact buffer results.
+Thus the previous 42-MiB growth was NInfer-induced residency and was not a valid use of the
+64-MiB external headroom. An allowance based only on startup cannot bound that update path.
+
+Each B/K/context definition now owns an immutable executable: 65*C for this preset. Startup
+instantiates and uploads all of them, then warms the largest-frontier representative per
+family, exact B, captured K and target structural class. Serving directly selects the captured
+executable; it never updates, instantiates or uploads one. The measured graph reservation below
+has no arbitrary padding. Other selectors and qualification builds use the conservative full
+immutable-executable inventory bound; requalify the table after a graph/kernel/toolchain change.
+
+NInfer separately reserves 2 MiB of startup driver residency preceding graph preparation
+(the first synchronous HIP clear of DFlash's 8-byte completion flag),
+plus its measured lazy kernel-driver residency. The main-stream component
+is 6/6/4/4/2/2/2/2 MiB at C1..8; enabling SSD adds 2 MiB for the scatter kernel. These are
+NInfer-owned resources inside `B(M)`, in addition to the SSD's 52-MiB staging buffer and its
+2-MiB descriptor allocation bound. The existing 4-MiB bound covers physical allocation rounding
+of the runtime arenas. Neither physical rounding nor lazy driver resources consume external
+headroom. Physical allocation granularity is 2 MiB, so logical reservation bytes need not equal
+physical residency byte for byte.
+
+| C | Graph budget MiB | Late driver MiB, with SSD | Shared KV tokens | Long prompt per lane | Minimum observed free MiB |
+|---|---:|---:|---:|---:|---:|
+| 1 | 318 | 8 | 262,144 | 260,096 | 9676 |
+| 2 | 578 | 8 | 524,288 | 260,096 | 2554 |
+| 3 | 842 | 6 | 603,776 | 200,704 | 68 |
+| 4 | 1102 | 6 | 585,408 | 145,408 | 66 |
+| 5 | 1364 | 4 | 567,104 | 112,640 | 68 |
+| 6 | 1624 | 4 | 548,736 | 90,112 | 68 |
+| 7 | 1884 | 4 | 530,368 | 73,728 | 68 |
+| 8 | 2144 | 4 | 512,000 | 63,488 | 70 |
+
+For each C, a saved prefix was restored from SSD into a fresh Engine, and its next greedy token
+matched a cold run. The same Engine then ran an 8192-token prompt, a balanced long prompt near
+its shared physical capacity, and another 8192-token prompt. Every test generated 129 tokens
+per lane. Prefill-first scheduling held all C long requests decode-ready together; observed
+mapped pages covered at least all C prompts. The initial separate C1..8 checks used the
+container's mixed-forward `auto` scheduling. The explicit 2-MiB startup-driver correction was
+made after C1..4 long runs. C1..2 retained the same capped pools; C3..4 received a final
+startup/short-workload capacity recheck. Their long prompt lengths were unchanged and their
+observed mapped pages fit the final smaller pools. Their table minima are earlier long-run
+observations, conservative for those smaller pools, rather than new long-run measurements.
+No runtime graph updates or new executable instantiations occurred, and no measured cell
+consumed the 64-MiB external reserve. Allocation
+probes and periodic/boundary memory queries make these capacity checks ineligible as throughput
+measurements.
+
+At C6, the original 2418-MiB graph allowance becomes 1624 MiB. With corrected
+SSD storage and driver accounting, shared KV capacity is 548,736 tokens,
+28,928 above the original 519,808-token control. This replaces the invalid earlier claim of
+569,664 tokens. C1 and C2 reach the `C*max_context` ceiling, explaining their unused VRAM.
+
+The earlier instrument-free 1024-versus-2048 chunk sweep covered every C1..8 on the prior shared
+executable implementation, with 8192-token pure-prefill and whole-inference workloads, one
+warmup and three repetitions. C6 measured 3400.86 versus 3341.14 prefill tok/s and 47.405 versus
+47.267 whole output tok/s for 2048 versus 1024; C3 favored 1024. Those timing results remain
+under `profiles/bench/r9700-vram-qualification-20261015/`, but its startup-only capacity
+qualification is explicitly superseded. Chunk 2048 remains the deployed choice; the current
+exact graph calibration does not admit unmeasured chunk 1024.
+
+A separate uninstrumented C6 confirmation on the immutable executable implementation used
+the same 8192-token workloads, one warmup and three repetitions. Prefill measured 3395.44
+tok/s versus the earlier 3400.86 (-0.16%); whole output measured 47.435 versus 47.405 tok/s
+(+0.06%). These observed differences do not establish a throughput improvement or regression.
+The comparison is recorded in `performance-comparison.json` beside the capacity evidence.
+
+Five focused host planner/routing checks, SSD cache integration, and the immutable first-launch
+and 128-switch zero-growth GPU regression pass. Real-artifact C2 graph/eager checks retained
+exact greedy tokens for ordinary decoding and fixed-K7 DFlash. Changed-line static analysis and
+independent source/allocation review pass. Commands, environment, per-C memory observations,
+exact-token evidence and the consolidated qualification are under
+`profiles/bench/r9700-vram-runtime-budget-20261015/`.
+
+The rebuilt Compose service was also checked at C6: health, image identity, literal
+`--max-context 262144`, resolved 548,736-token capacity, greedy generation and default-temperature
+generation passed. It reported 1608 MiB graph residency against the 1624-MiB measured bound,
+with 88 MiB free at startup. The per-C bound retains the maximum observed qualification
+residency rather than subtracting this deployment's 16-MiB unused graph allowance.
+`deployment.json` records the live metrics and request checks.
+
 ### Sustained memory bound
 
 The native exact-device probe uses two 4 GiB buffers, 512 times larger than L2, and reports five
