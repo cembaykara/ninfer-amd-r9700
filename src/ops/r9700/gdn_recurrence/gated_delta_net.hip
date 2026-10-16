@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -285,17 +286,25 @@ void require_selector(const Tensor& tensor, int batch, const char* label, bool a
 
 } // namespace
 
+std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t width, bool normalize_qk) {
+    if (width < 1 || width > kMaximumPrefillWidth) {
+        throw std::invalid_argument("gated_delta_net: invalid workspace width");
+    }
+    return normalize_qk ? r9700::gdn_recurrence::prefill_workspace_bytes(width) : 0;
+}
+
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
-                     Tensor& out, hipStream_t stream) {
-    gated_delta_net(q, k, v, g, beta, scale, normalize_qk, ssm_state, ssm_state, out, stream);
+                     Tensor& out, WorkspaceArena& workspace, hipStream_t stream) {
+    gated_delta_net(q, k, v, g, beta, scale, normalize_qk, ssm_state, ssm_state, out, workspace,
+                    stream);
 }
 
 static void gated_delta_net_impl(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                                  const Tensor& beta, float scale, bool normalize_qk,
                                  const Tensor& state_in, Tensor& state_out, Tensor& out,
-                                 Tensor* prefix_state, std::int32_t prefix_tokens,
-                                 hipStream_t stream) {
+                                 WorkspaceArena* workspace, Tensor* prefix_state,
+                                 std::int32_t prefix_tokens, hipStream_t stream) {
     const Geometry geometry =
         validate_inputs(q, k, v, g, beta, scale, out, 1, kMaximumPrefillWidth);
     require_tensor(state_in, DType::FP32, {kDim, kDim, kValueHeads}, "state_in");
@@ -322,12 +331,15 @@ static void gated_delta_net_impl(const Tensor& q, const Tensor& k, const Tensor&
                                 reinterpret_cast<std::uintptr_t>(k.data) % 16U == 0U;
     if (normalize_qk && prefix_state == nullptr && vector_aligned &&
         geometry.width >= r9700::gdn_recurrence::kChunkedMinimumWidth) {
+        const std::size_t bytes = gated_delta_net_workspace_capacity_bytes(geometry.width, true);
+        auto scope    = workspace != nullptr ? std::optional(workspace->scope()) : std::nullopt;
+        void* scratch = bytes == 0 ? nullptr : workspace->alloc_bytes(bytes).data;
         HIP_CHECK(r9700::gdn_recurrence::prefill_chunked(
             static_cast<const hip_bfloat16*>(q.data), static_cast<const hip_bfloat16*>(k.data),
             static_cast<const hip_bfloat16*>(v.data), static_cast<const float*>(g.data),
             static_cast<const float*>(beta.data), static_cast<const float*>(state_in.data),
             static_cast<float*>(state_out.data), static_cast<hip_bfloat16*>(out.data),
-            geometry.width, scale, stream));
+            geometry.width, scale, scratch, stream));
         return;
     }
 #define NINFER_LAUNCH_ORDINARY(NORM)                                                               \
@@ -351,9 +363,10 @@ static void gated_delta_net_impl(const Tensor& q, const Tensor& k, const Tensor&
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, const Tensor& ssm_state_in,
-                     Tensor& ssm_state_out, Tensor& out, hipStream_t stream) {
+                     Tensor& ssm_state_out, Tensor& out, WorkspaceArena& workspace,
+                     hipStream_t stream) {
     gated_delta_net_impl(q, k, v, g, beta, scale, normalize_qk, ssm_state_in, ssm_state_out, out,
-                         nullptr, 0, stream);
+                         &workspace, nullptr, 0, stream);
 }
 
 void gated_delta_net_trace_prefix_state(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -361,7 +374,7 @@ void gated_delta_net_trace_prefix_state(const Tensor& q, const Tensor& k, const 
                                         bool normalize_qk, Tensor& ssm_state, Tensor& out,
                                         Tensor& prefix_state, std::int32_t prefix_tokens,
                                         hipStream_t stream) {
-    gated_delta_net_impl(q, k, v, g, beta, scale, normalize_qk, ssm_state, ssm_state, out,
+    gated_delta_net_impl(q, k, v, g, beta, scale, normalize_qk, ssm_state, ssm_state, out, nullptr,
                          &prefix_state, prefix_tokens, stream);
 }
 

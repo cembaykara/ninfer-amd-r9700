@@ -620,6 +620,144 @@ harness. Prefill rows predate the 2026-09-28 output-head and
 attention GPTQ reconversions, which change weight values but not formats or routes, and all rows
 predate the 2026-09-30 reduction to 21 protections (C1 decode +2.3%, C4 unchanged, prefill +0.4%).
 
+## Prefill follow-up attribution after bulk graph submission (2026-10-16)
+
+Diagnostic on `experimental` after pulling `6f069b6c`, rebuilt Release `ninfer_bench`, production
+21-protection `r9700-fp8lut4` artifact, one R9700/gfx1201, ROCm 10, unchanged 300 W cap and
+`auto` power profile. The canonical host-argument bulk graph flags from the container were used.
+The shared GPU lease covered every inference process and was released after collection.
+
+Workloads use `bench/fixtures/bench_corpus.ids`, chunk 2048 and mixed-forward `auto`:
+C1 ordinary prefill-only 8192 tokens (one sampled output, no speculation), and C6 fresh whole
+8192-token prompts with fixed DFlash K7, optimized proposal head and 128 decode steps per lane
+(129 output tokens including the first prefill token). One warmup and three unprofiled repetitions,
+max context 262144 and automatic KV capacity, gave:
+
+| Scope | Mean | Standard deviation |
+|---|---:|---:|
+| C1 8K prefill throughput | 3431.50 tok/s | 9.92 tok/s |
+| C1 8K prefill service | 2.38716 s | 0.00690 s |
+| C6 aggregate active prefill throughput | 3193.67 tok/s | 4.74 tok/s |
+| C6 summed prefill service | 15.39048 s | 0.02285 s |
+| C6 whole wave wall | 16.68891 s | 0.32627 s |
+
+Service and decode costs overlap; they must not be added as a wall-time decomposition.
+These are current baselines, not an A/B speedup result.
+
+Selected-region marker/kernel/copy traces capture one measured repetition after one warmup,
+excluding load, graph priming and warmup. Traces use max context 16384 and workload-sized KV
+(C6 timing uses 593856 KV tokens) to leave profiler memory. All traced output token IDs match all
+three unprofiled repetitions, including every C6 lane. Kernel shares below use summed dispatch
+durations, which can overlap; they are attribution, not exclusive wall shares:
+
+| Kernel family | C1 prefill | C6 whole |
+|---|---:|---:|
+| FP8LUT4/raw-FP8 prefill GEMMs | 80.93% | 72.78% |
+| of which MLP gate/up and down | 56.71% | 50.49% |
+| Chunked GDN recurrence | 5.70% | 5.25% |
+| Dense prefill attention | 5.57% | 4.99% |
+| Text FP8 activation preparation | 5.06% | 4.59% |
+| GDN projection/conv scatter | 1.56% | 1.38% |
+
+C6 projection durations include the verify columns sharing mixed forwards. Its initial ordinary
+owner uses 2048-token chunks; most subsequent prefill/mixed projection launches use width 1024.
+The dominant GEMM variants use 240 VGPRs; raw-FP8 and smaller-width variants use fewer. All
+captured prefill GEMMs have zero scratch; chunked GDN uses 256 VGPRs, 58880 bytes LDS
+and 8 bytes scratch. A late 100 ms telemetry sample during the C6 trace observed 41 samples above
+90% GPU busy, averaging 297 W; this is a coarse trace-time observation, not proof of individual
+kernel saturation or a reason to change clocks/power.
+
+The highest-value kernel target is the MLP GEMM family at N34816/K5120 (gate/up) and
+N5120/K17408 (down), particularly the real mixed width 1024 and ordinary width 2048. A serial
+estimate from the C6 trace puts a 10% reduction of MLP kernel duration near 5% of whole-wave
+latency; this is a prioritization bound, not an achieved or guaranteed speedup. Prior wider/narrower
+tiles and weight-staging experiments remain rejected as recorded below. A new challenger needs a
+specific improvement to issue/staging/epilogue efficiency and the owning FP64 oracle before timing.
+GDN register lifetime/scratch and moving reusable intra-chunk work off its serial recurrence are
+secondary hypotheses; its entire captured cost is only about 5%, and the previously rejected
+value-row split should not be repeated without a changed mechanism. Attention is a secondary
+8K target; the historical 128K attention-heavy attribution remains a different workload.
+
+The union of kernel intervals leaves 5.73% of C1 measured wall and 11.46% of C6 measured wall
+without a captured kernel active. C6 copy durations sum to 13.21 ms (0.08% of measured wall),
+so transfers alone cannot explain that interval, although copy duration is not additive wall time.
+The subsequent HIP API trace (`c6-whole8192-api-trace`) retained exact token parity. It recorded
+15.508 s inside 756 `hipMemcpyAsync` calls, of which 96.38% overlapped active GPU kernels; this
+API duration must not be added to GPU time or interpreted as CPU execution cost. The 51087
+`hipLaunchKernel` calls totalled 202.60 ms of API wall duration, 83.30% overlapping GPU kernels.
+The trace also records the profiler's system-memory interception-queue fallback. Its graph/API
+latencies and inactive intervals cannot replace unprofiled measurements or justify deleting
+required host-visible token/state synchronization. C6 ordinary chunk markers cover only the
+initial owner, so their gap cannot describe all mixed prefill service. Remaining inactive time
+is not established recoverable launch overhead.
+
+Evidence: `profiles/rocprof/r9700-prefill-20261016/` contains exact commands, unprofiled reports,
+selected-region SQLite traces, token comparisons and standalone attribution scripts. No numerical,
+kernel, scheduling or container configuration was changed by this diagnostic. The maintained
+legacy whole-profile analyzer rejects benchmark schema 24 and C6; the retained standalone SQL
+analysis validates measured-region containment and uses explicit stage associations instead.
+
+## Shared GDN chunk preparation (2026-10-16)
+
+The follow-up optimization above targets state-independent work inside GDN rather than changing
+precision, clocks, scheduling or graph submission. For normalized ordinary T>=256, a separate
+chunk-parallel kernel computes normalized FP16 keys, FP32 query scales and FP32 QK/KK products
+once per Q/K head, shared by its three value heads. Per-value-head controls, FP16 A/P casts,
+diagonal solves and FP32 recurrent state stay in the existing recurrence. T16..255 keeps the
+direct chunk route. Caller-owned transient workspace is explicit in the Op and runtime plan:
+18.125 MiB at T2048, reused below the existing MLP workspace peak. This is GDN scratch, not an
+attention KV-cache plane.
+
+On the same R9700, Release ROCm 10 toolchain, canonical graph flags and unchanged `auto`/300 W
+profile, independent public FP64 oracle checks passed for ordinary in-place/distinct state,
+partial chunks, T255/256/257 crossover, snapshot and replay. Maximum output absolute error was
+1.114e-5, relative L2 0.001864 and state absolute error 1.527e-5. The same public qualifier's
+unprofiled event screen gave:
+
+| Ordinary normalized width | Incumbent | Shared preparation | Latency reduction |
+|---|---:|---:|---:|
+| T1024 | 0.318171 ms | 0.297464 ms | 6.51% |
+| T2048 | 0.636317 ms | 0.607608 ms | 4.52% |
+
+The integrated qualifier measured 0.297719/0.607449 ms at these widths. The producer uses 51
+VGPRs, 17408 bytes LDS and zero scratch; the prepared recurrence uses 256 VGPRs, 58880 bytes LDS
+and 12 bytes scratch. ISA inspection found the incumbent's 8-byte scratch was one offset save
+before the chunk loop and reload afterward, not repeated per-chunk traffic. A lane-contiguous
+vector-product workspace alternative passed the oracle but gave no timing benefit and was discarded.
+
+Whole-inference admission uses the same workloads and artifact as the attribution section,
+max context 262144, automatic KV, one warmup and three repetitions per invocation, in
+incumbent/candidate/candidate/incumbent order. The shared lease covers all invocations, with no
+build during timing. Pooled medians of six repetitions per implementation are:
+
+| Scope | Incumbent | Shared preparation | Observed latency reduction |
+|---|---:|---:|---:|
+| C1 ordinary 8192-token prefill service | 2.390364 s | 2.382705 s | 0.32% |
+| C6 fixed-K7 8192,128 whole wave | 16.768307 s | 16.748495 s | 0.12% |
+
+These small whole-inference differences have overlapping timing ranges; they establish no robust
+general speedup. The qualified improvement is at the GDN operator, with C6 whole inference
+nearly neutral. A 2.910451 s C1 incumbent outlier makes means unsuitable for this comparison.
+C6 summed prefill-service medians are 15.606773/15.812400 s, but include mixed decode work and
+are not exclusive prefill GPU time. Eleven repetitions have wave minus summed service near
+0.936 s; the first incumbent alone has 1.548 s. Aggregate reports cannot determine the cause of
+that phase-placement difference, so it does not establish a prefill-kernel regression.
+All twelve repetitions per concurrency have exact generated-token parity; C6 speculative
+statistics also match exactly. Workspace capacity/allocator peak remain 265043968/256262144
+bytes, and automatic KV capacity is unchanged by this implementation.
+
+The dominant GEMM hypotheses were also tested against the independent FP64 oracle and whole
+C1 prefill. Moving weight decode/store earlier than stage 3 passed the oracle but increased
+mean latency from 2.40010 s to 2.41972–2.44761 s. A 512x128 sixteen-wave CTA passed the oracle
+but took 2.458/2.468 s versus a stable 2.376 s incumbent. Both were rejected; production GEMM
+code is unchanged. The HIP API trace above does not justify removing required token/state
+synchronization or treating overlapping API waits as recoverable CPU time.
+
+The selected GDN route passed the required gfx1201 racecheck, memcheck and initcheck, the
+runtime planner qualifier, and focused clang-tidy with zero diagnostics. Evidence and exact
+commands are in `profiles/bench/r9700-prefill-opt-20261016/`; API attribution remains under
+`profiles/rocprof/r9700-prefill-20261016/`.
+
 ## Drafter leftovers after the persistent decode kernel (2026-10-03)
 
 A whole-round C1 kernel trace (DFlash K7 `--lm-head-draft`) puts the drafter and selection at
@@ -2372,7 +2510,8 @@ non-dual-issue FP32 VALU rate) is replaced by a chunked (WY) route: one workgrou
 walks 64-token chunks with FP16 WMMA products and FP32 accumulation, keeps each wave's 16 state
 rows as S^T WMMA accumulators that feed the next chunk directly, solves only the four FP32
 diagonal blocks of (I + A)^-1 and forms the corrected values by block forward substitution. It
-uses no workspace. P2048 is about 0.7–0.87 ms per call. Output error versus FP64 stays at the BF16
+initially used no workspace (the 2026-10-16 shared-preparation update above adds transient
+workspace for T>=256). P2048 was about 0.7–0.87 ms per call. Output error versus FP64 stays at the BF16
 floor (rel-RMS 1.73e-3 versus 1.66e-3 for the staged route); the FP32 state carries about 5e-4
 relative error on long synthetic runs (no growth with length), inside the GDN Op criterion.
 Interleaved: 4K 2242→2306, 32K 1874→1930 tok/s (eval artifact); 4K prefill PPL

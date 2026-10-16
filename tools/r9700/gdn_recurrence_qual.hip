@@ -252,6 +252,8 @@ struct DeviceInputs {
 void qualify_ordinary(int width, bool in_place, bool normalize, int salt, hipStream_t stream) {
     const Inputs in = inputs(width, 1, salt);
     DeviceInputs device(in);
+    ninfer::DeviceArena recurrence_workspace(std::max(
+        std::size_t{256}, ninfer::ops::gated_delta_net_workspace_capacity_bytes(in.width, true)));
     const std::size_t state_count    = static_cast<std::size_t>(kValueHeads) * kDim * kDim;
     const std::vector<float> initial = fp32_fixture(state_count, 31, 8192.0F);
     ninfer::DeviceBuffer state_in    = uploaded(initial);
@@ -263,10 +265,10 @@ void qualify_ordinary(int width, bool in_place, bool normalize, int salt, hipStr
     ninfer::Tensor o(output.data(), ninfer::DType::BF16, {kDim, kValueHeads, in.width});
     if (in_place) {
         ninfer::ops::gated_delta_net(device.tq, device.tk, device.tv, device.tg, device.tbeta,
-                                     kScale, normalize, tin, o, stream);
+                                     kScale, normalize, tin, o, recurrence_workspace, stream);
     } else {
         ninfer::ops::gated_delta_net(device.tq, device.tk, device.tv, device.tg, device.tbeta,
-                                     kScale, normalize, tin, tout, o, stream);
+                                     kScale, normalize, tin, tout, o, recurrence_workspace, stream);
     }
     HIP_CHECK(hipStreamSynchronize(stream));
     std::vector<double> state(initial.begin(), initial.end());
@@ -293,6 +295,8 @@ void qualify_selected_p2048(hipStream_t stream) {
     constexpr std::array<int, 8> kStateKeys{0, 1, 31, 32, 63, 64, 95, 127};
     const Inputs in = inputs(kWidth, 1, 211);
     DeviceInputs device(in);
+    ninfer::DeviceArena recurrence_workspace(std::max(
+        std::size_t{256}, ninfer::ops::gated_delta_net_workspace_capacity_bytes(in.width, true)));
     const std::size_t state_count    = static_cast<std::size_t>(kValueHeads) * kDim * kDim;
     const std::vector<float> initial = fp32_fixture(state_count, 223, 8192.0F);
     ninfer::DeviceBuffer state_in    = uploaded(initial);
@@ -310,9 +314,9 @@ void qualify_selected_p2048(hipStream_t stream) {
     ninfer::Tensor out_in_place(output_in_place.data(), ninfer::DType::BF16,
                                 {kDim, kValueHeads, kWidth});
     ninfer::ops::gated_delta_net(device.tq, device.tk, device.tv, device.tg, device.tbeta, kScale,
-                                 true, tin, tout, out, stream);
+                                 true, tin, tout, out, recurrence_workspace, stream);
     ninfer::ops::gated_delta_net(device.tq, device.tk, device.tv, device.tg, device.tbeta, kScale,
-                                 true, tin_place, out_in_place, stream);
+                                 true, tin_place, out_in_place, recurrence_workspace, stream);
     HIP_CHECK(hipStreamSynchronize(stream));
 
     const auto actual_output          = copied<hip_bfloat16>(output, in.v.size());
@@ -436,7 +440,8 @@ void qualify_selected_p2048(hipStream_t stream) {
         ninfer::Tensor aliased_output(device.v.data(), ninfer::DType::BF16,
                                       {kDim, kValueHeads, kWidth});
         ninfer::ops::gated_delta_net(device.tq, device.tk, device.tv, device.tg, device.tbeta,
-                                     kScale, true, tin, tout, aliased_output, stream);
+                                     kScale, true, tin, tout, aliased_output, recurrence_workspace,
+                                     stream);
     } catch (const std::invalid_argument&) { alias_rejected = true; }
     if (!alias_rejected) { fail("selected P2048 overlapping output accepted"); }
 }
@@ -444,6 +449,8 @@ void qualify_selected_p2048(hipStream_t stream) {
 double time_ordinary(int width, hipStream_t stream) {
     const Inputs in = inputs(width, 1, 97 + width);
     DeviceInputs device(in);
+    ninfer::DeviceArena recurrence_workspace(std::max(
+        std::size_t{256}, ninfer::ops::gated_delta_net_workspace_capacity_bytes(in.width, true)));
     const std::size_t state_count    = static_cast<std::size_t>(kValueHeads) * kDim * kDim;
     const std::vector<float> initial = fp32_fixture(state_count, 101, 8192.0F);
     ninfer::DeviceBuffer state_in    = uploaded(initial);
@@ -454,7 +461,7 @@ double time_ordinary(int width, hipStream_t stream) {
     ninfer::Tensor out(output.data(), ninfer::DType::BF16, {kDim, kValueHeads, in.width});
     auto launch = [&] {
         ninfer::ops::gated_delta_net(device.tq, device.tk, device.tv, device.tg, device.tbeta,
-                                     kScale, true, tin, tout, out, stream);
+                                     kScale, true, tin, tout, out, recurrence_workspace, stream);
     };
     for (int warmup = 0; warmup < 5; ++warmup) { launch(); }
     HIP_CHECK(hipStreamSynchronize(stream));
@@ -712,6 +719,10 @@ int main() {
         qualify_ordinary(100, false, true, 31, device.stream);
         qualify_ordinary(16, false, true, 41, device.stream);
         qualify_ordinary(33, true, true, 43, device.stream);
+        // Prepared chunk work begins at T256; protect both sides and its masked final chunk.
+        qualify_ordinary(255, true, true, 97, device.stream);
+        qualify_ordinary(256, false, true, 101, device.stream);
+        qualify_ordinary(257, true, true, 103, device.stream);
         qualify_ordinary(2047, true, true, 37, device.stream);
         qualify_snapshot(3, 2, 53, device.stream);
         qualify_snapshot(1, static_cast<int>(ninfer::kMaximumConcurrency), 59, device.stream);

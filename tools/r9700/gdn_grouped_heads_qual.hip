@@ -29,6 +29,8 @@ void qualify(int width, bool in_place, hipStream_t stream) {
               << " state=" << (in_place ? "in-place" : "distinct") << std::endl;
     const Inputs in = inputs(width, 1, 1301 + width);
     DeviceInputs device(in);
+    ninfer::DeviceArena recurrence_workspace(std::max(
+        std::size_t{256}, ninfer::ops::gated_delta_net_workspace_capacity_bytes(in.width, true)));
     const std::size_t state_count    = static_cast<std::size_t>(kValueHeads) * kDim * kDim;
     const std::vector<float> initial = fp32_fixture(state_count, 1319 + width, 8192.0F);
     ninfer::DeviceBuffer state_in    = uploaded(initial);
@@ -46,7 +48,8 @@ void qualify(int width, bool in_place, hipStream_t stream) {
     ninfer::Tensor incumbent_out(incumbent_output.data(), ninfer::DType::BF16,
                                  {kDim, kValueHeads, width});
     ninfer::ops::gated_delta_net(device.tq, device.tk, device.tv, device.tg, device.tbeta, kScale,
-                                 true, incumbent_in, incumbent_state, incumbent_out, stream);
+                                 true, incumbent_in, incumbent_state, incumbent_out,
+                                 recurrence_workspace, stream);
     ninfer::DeviceBuffer& destination = in_place ? state_in : state_out;
     launch_grouped(device, state_in, destination, output, width, stream);
     HIP_CHECK(hipStreamSynchronize(stream));
@@ -113,6 +116,8 @@ Row time_row(int width, hipStream_t stream) {
     std::cerr << "grouped-head timing begin T=" << width << std::endl;
     const Inputs in = inputs(width, 1, 1427 + width);
     DeviceInputs device(in);
+    ninfer::DeviceArena recurrence_workspace(std::max(
+        std::size_t{256}, ninfer::ops::gated_delta_net_workspace_capacity_bytes(in.width, true)));
     const std::size_t state_count = static_cast<std::size_t>(kValueHeads) * kDim * kDim;
     ninfer::DeviceBuffer state_in = uploaded(fp32_fixture(state_count, 1433, 8192.0F));
     ninfer::DeviceBuffer state_out(state_in.size());
@@ -122,7 +127,7 @@ Row time_row(int width, hipStream_t stream) {
     ninfer::Tensor out(output.data(), ninfer::DType::BF16, {kDim, kValueHeads, width});
     const Samples incumbent = sample(stream, [&] {
         ninfer::ops::gated_delta_net(device.tq, device.tk, device.tv, device.tg, device.tbeta,
-                                     kScale, true, tin, tout, out, stream);
+                                     kScale, true, tin, tout, out, recurrence_workspace, stream);
     });
     const Samples candidate =
         sample(stream, [&] { launch_grouped(device, state_in, state_out, output, width, stream); });

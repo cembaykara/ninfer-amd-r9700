@@ -91,6 +91,8 @@ struct TimingRow {
 TimingRow timing_row(int width, std::uint32_t chunk, hipStream_t stream) {
     const Inputs in = inputs(width, 1, 907 + width + static_cast<int>(chunk));
     DeviceInputs device(in);
+    ninfer::DeviceArena recurrence_workspace(std::max(
+        std::size_t{256}, ninfer::ops::gated_delta_net_workspace_capacity_bytes(in.width, true)));
     const std::size_t state_count = static_cast<std::size_t>(kValueHeads) * kDim * kDim;
     ninfer::DeviceBuffer state_in = uploaded(fp32_fixture(state_count, 911, 8192.0F));
     ninfer::DeviceBuffer state_out(state_in.size());
@@ -103,7 +105,7 @@ TimingRow timing_row(int width, std::uint32_t chunk, hipStream_t stream) {
     ninfer::DeviceBuffer workspace(workspace_bytes);
     const TimingSamples incumbent = timing_samples(stream, [&] {
         ninfer::ops::gated_delta_net(device.tq, device.tk, device.tv, device.tg, device.tbeta,
-                                     kScale, true, tin, tout, out, stream);
+                                     kScale, true, tin, tout, out, recurrence_workspace, stream);
     });
     const TimingSamples candidate = timing_samples(stream, [&] {
         HIP_CHECK(ninfer::ops::r9700::gdn_recurrence::affine_chunk_qualification(
