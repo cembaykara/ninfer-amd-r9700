@@ -65,10 +65,7 @@ artifact::LoadProgress artifact_progress(const LoadProgress& progress) {
 
 std::size_t runtime_bytes_after_planned_weights(const DeviceContext& device,
                                                 std::uint64_t weight_bytes) {
-    std::size_t free_bytes  = 0;
-    std::size_t total_bytes = 0;
-    HIP_CHECK(hipSetDevice(device.device));
-    HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
+    const std::size_t free_bytes = device.available_vram();
     if (weight_bytes > free_bytes) {
         throw std::invalid_argument("model weights require " + std::to_string(weight_bytes) +
                                     " bytes of device memory, but only " +
@@ -76,14 +73,6 @@ std::size_t runtime_bytes_after_planned_weights(const DeviceContext& device,
                                     " bytes are free before loading weights");
     }
     return free_bytes - static_cast<std::size_t>(weight_bytes);
-}
-
-std::size_t current_free_device_bytes(const DeviceContext& device) {
-    std::size_t free_bytes  = 0;
-    std::size_t total_bytes = 0;
-    HIP_CHECK(hipSetDevice(device.device));
-    HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
-    return free_bytes;
 }
 
 // Automatic sizing claims nearly all free device memory, so memory taken by another process
@@ -141,19 +130,21 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
+    // Registered host memory can consume physical GPU page-table storage. Complete it
+    // before sizing so its actual residency is already included in available VRAM.
+    std::unique_ptr<HostPinnedArena> kv_ram_arena;
+    if (kv_ram_future.valid()) { kv_ram_arena = kv_ram_future.get(); }
     runtime::KvCapacityResolution capacity_resolution =
         with_automatic_headroom_hint(options.kv_capacity, [&] {
             return runtime::resolve_kv_capacity(options.kv_capacity, curve,
-                                                current_free_device_bytes(device));
+                                                device.available_vram());
         });
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
     if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized target plan");
     }
-    auto loaded = std::make_unique<Loaded>(std::move(model));
-    std::unique_ptr<HostPinnedArena> kv_ram_arena;
-    if (kv_ram_future.valid()) { kv_ram_arena = kv_ram_future.get(); }
+    auto loaded   = std::make_unique<Loaded>(std::move(model));
     auto instance = with_automatic_headroom_hint(options.kv_capacity, [&] {
         auto constructed =
             std::make_unique<Instance>(std::move(loaded), capacity_resolution,
@@ -161,8 +152,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         device.synchronize();
         return constructed;
     });
-    instance->kv_capacity_resolution.available_after_startup_bytes =
-        current_free_device_bytes(device);
+    instance->kv_capacity_resolution.available_after_startup_bytes = device.available_vram();
 
     LoadSummary summary;
     summary.target               = std::string(target_key);

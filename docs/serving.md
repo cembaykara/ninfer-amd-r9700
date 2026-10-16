@@ -987,6 +987,10 @@ scrape_configs:
 | generation | `ninfer_generation_requests_total{protocol,result,stream,thinking,tools}`, TTFT / end-to-end / inter-token latency histograms, phase and per-request KV copy histograms, prompt/completion/reasoning/computed-prefill token histograms, prefill and decode tok/s histograms, finish reasons, tool calls, ignored tool markup, media requests, and token-count requests |
 | HTTP | `ninfer_http_requests_total{method,protocol,route,status}`, `ninfer_http_request_duration_seconds{protocol,route}`, `ninfer_http_in_flight_requests`, `ninfer_api_errors_total{code}` over a closed code set, and Responses store records/bytes and caps |
 
+The two `available_after_*` memory values are startup snapshots, not live free-memory counters.
+They use the smaller of HIP availability and graphics-inclusive physical free VRAM from the
+matching PCI device's amdgpu counters. The after-weights snapshot also follows RAM-cache registration.
+
 | Question | Signal |
 |---|---|
 | In flight? | `ninfer_http_in_flight_requests` vs `ninfer_scheduler_running_requests` vs `ninfer_scheduler_waiting_requests` |
