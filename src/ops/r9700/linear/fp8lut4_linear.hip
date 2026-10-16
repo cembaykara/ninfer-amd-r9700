@@ -470,127 +470,6 @@ __global__ __launch_bounds__(256) void fp8lut4_mid_deep_kernel(KernelArgs a) {
 #endif
 }
 
-// ---- One token: a GEMV of 32 rows per CTA (one per lane) and four waves each owning a K quarter
-// with four steps in flight. Each lane decodes its row's two 32-column groups per 64-column step
-// (slots r % 16 and 16 + r % 16 of the N16 x K64 tile) and accumulates FP8 dot4 products against
-// the broadcast activation; the quarters combine in order. No WMMA columns are wasted on absent
-// tokens.
-constexpr std::uint32_t kGemvSplit = 4U, kGemvSteps = 4U;
-
-template <bool kAccumulate, bool kSiluPair>
-__global__ __launch_bounds__(32U * kGemvSplit) void fp8lut4_t1_kernel(KernelArgs a) {
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
-    __shared__ uint2 table[256];
-    __shared__ float partial[kGemvSplit][32];
-    const std::uint32_t first_blocks = a.weight.rows / 32U;
-    const bool second                = blockIdx.x >= first_blocks;
-    const Fp8Lut4Weight weight       = second ? a.second : a.weight;
-    const Fp8Lut4Output output       = second ? a.second_output : a.output;
-    const std::uint32_t row_base     = (second ? blockIdx.x - first_blocks : blockIdx.x) * 32U;
-    fp8lut4::load_table(table, threadIdx.x, 32U * kGemvSplit);
-    const std::uint32_t lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U;
-    const std::uint32_t row     = row_base + lane;
-    const std::uint32_t columns = weight.columns, steps_total = columns / 64U;
-    const std::uint32_t steps    = steps_total / kGemvSplit;
-    const std::size_t first_tile = static_cast<std::size_t>(row / 16U) * steps_total + wave * steps;
-    const std::uint8_t* codes    = weight.codes + first_tile * 512U + (row % 16U) * 16U;
-    const std::uint8_t* groups   = weight.groups + first_tile * 32U + row % 16U;
-    const std::uint8_t* activation = a.activation + static_cast<std::size_t>(wave) * steps * 64U;
-
-    struct Batch {
-        uint4 c[kGemvSteps][2];
-        std::uint32_t g[kGemvSteps][2];
-        uint4 x[kGemvSteps][4];
-    };
-
-    const auto load = [&](std::uint32_t step) {
-        Batch value;
-#    pragma unroll
-        for (std::uint32_t i = 0; i < kGemvSteps; ++i) {
-            const std::uint8_t* tile  = codes + static_cast<std::size_t>(step + i) * 512U;
-            value.c[i][0]             = *reinterpret_cast<const uint4*>(tile);
-            value.c[i][1]             = *reinterpret_cast<const uint4*>(tile + 256U);
-            const std::uint8_t* group = groups + static_cast<std::size_t>(step + i) * 32U;
-            value.g[i][0]             = group[0];
-            value.g[i][1]             = group[16];
-            const uint4* x            = reinterpret_cast<const uint4*>(
-                activation + static_cast<std::size_t>(step + i) * 64U);
-            value.x[i][0] = x[0];
-            value.x[i][1] = x[1];
-            value.x[i][2] = x[2];
-            value.x[i][3] = x[3];
-        }
-        return value;
-    };
-    float sum          = 0.0F;
-    const auto consume = [&](const Batch& value) {
-#    pragma unroll
-        for (std::uint32_t i = 0; i < kGemvSteps; ++i) {
-#    pragma unroll
-            for (std::uint32_t half = 0; half < 2U; ++half) {
-                const uint2 book = table[value.g[i][half]];
-                const uint4 word = value.c[i][half];
-                const uint2 w0 = decode8(word.x, book), w1 = decode8(word.y, book);
-                const uint2 w2 = decode8(word.z, book), w3 = decode8(word.w, book);
-                const uint4 x0 = value.x[i][2U * half], x1 = value.x[i][2U * half + 1U];
-                sum = __builtin_amdgcn_dot4_f32_fp8_fp8(static_cast<int>(w0.x),
-                                                        static_cast<int>(x0.x), sum);
-                sum = __builtin_amdgcn_dot4_f32_fp8_fp8(static_cast<int>(w0.y),
-                                                        static_cast<int>(x0.y), sum);
-                sum = __builtin_amdgcn_dot4_f32_fp8_fp8(static_cast<int>(w1.x),
-                                                        static_cast<int>(x0.z), sum);
-                sum = __builtin_amdgcn_dot4_f32_fp8_fp8(static_cast<int>(w1.y),
-                                                        static_cast<int>(x0.w), sum);
-                sum = __builtin_amdgcn_dot4_f32_fp8_fp8(static_cast<int>(w2.x),
-                                                        static_cast<int>(x1.x), sum);
-                sum = __builtin_amdgcn_dot4_f32_fp8_fp8(static_cast<int>(w2.y),
-                                                        static_cast<int>(x1.y), sum);
-                sum = __builtin_amdgcn_dot4_f32_fp8_fp8(static_cast<int>(w3.x),
-                                                        static_cast<int>(x1.z), sum);
-                sum = __builtin_amdgcn_dot4_f32_fp8_fp8(static_cast<int>(w3.y),
-                                                        static_cast<int>(x1.w), sum);
-            }
-        }
-    };
-    Batch current = load(0U);
-    __syncthreads(); // codebook
-    for (std::uint32_t step = kGemvSteps; step < steps; step += kGemvSteps) {
-        const Batch next = load(step);
-        consume(current);
-        current = next;
-    }
-    consume(current);
-    partial[wave][lane] = sum;
-    __syncthreads();
-    if (wave != 0U) return;
-    float total = partial[0][lane];
-#    pragma unroll
-    for (std::uint32_t split = 1; split < kGemvSplit; ++split) total += partial[split][lane];
-    const float y     = total * weight.scales[row] * a.token_scales[0];
-    const bool poison = a.status[0] != Fp8ActivationOk;
-    if constexpr (kSiluPair) {
-        // Rows 16 b + i (gate) and 16 b + 8 + i (up) sit in lanes l and l ^ 8.
-        const float partner = __shfl_xor(y, 8, 32);
-        if ((lane & 8U) == 0U) {
-            auto* out = reinterpret_cast<std::uint16_t*>(output.leading) + row_base / 2U +
-                        (lane / 16U) * 8U + lane % 8U;
-            *out      = poison ? kCanonicalBf16QuietNan : silu_pair_value(y, partner);
-        }
-    } else {
-        std::uint16_t* out = output_at(weight, output, 0U, row);
-        if (poison) {
-            *out = kCanonicalBf16QuietNan;
-        } else if constexpr (kAccumulate) {
-            *out = round_bf16(bf16_float(*out) + bf16_float(round_bf16(y)));
-        } else {
-            *out = round_bf16(y);
-        }
-    }
-#else
-    (void)a;
-#endif
-}
-
 // ---- Prefill: a 256-token x 128-row CTA of eight waves (4 along tokens x 2 along rows), each
 // owning 4x4 WMMA fragments. Per 64-column slab every thread decodes one 32-column group of one
 // weight row into the double-buffered LDS tile; the waves read the activation fragments straight
@@ -853,13 +732,17 @@ void launch_small_depth(const KernelArgs& args, hipStream_t stream) {
 
 hipError_t launch_small(const KernelArgs& args, hipStream_t stream) {
     if (args.tokens == 1U) {
-        const dim3 grid((args.weight.rows + args.second.rows) / 32U), block(32U * kGemvSplit);
+        const dim3 grid((args.weight.rows + args.second.rows) / 32U),
+            block(32U * fp8lut4_kernels::kGemvSplit);
         if (args.output.silu_pair)
-            hipLaunchKernelGGL((fp8lut4_t1_kernel<false, true>), grid, block, 0, stream, args);
+            hipLaunchKernelGGL((fp8lut4_kernels::fp8lut4_t1_kernel<false, true>), grid, block, 0,
+                               stream, args);
         else if (args.output.accumulate)
-            hipLaunchKernelGGL((fp8lut4_t1_kernel<true, false>), grid, block, 0, stream, args);
+            hipLaunchKernelGGL((fp8lut4_kernels::fp8lut4_t1_kernel<true, false>), grid, block, 0,
+                               stream, args);
         else
-            hipLaunchKernelGGL((fp8lut4_t1_kernel<false, false>), grid, block, 0, stream, args);
+            hipLaunchKernelGGL((fp8lut4_kernels::fp8lut4_t1_kernel<false, false>), grid, block, 0,
+                               stream, args);
     } else if (args.tokens <= fp8lut4::kSmallTokens) {
         launch_small_depth<fp8lut4::kVerifySplit, fp8lut4::kVerifySteps, 1U>(args, stream);
     } else {

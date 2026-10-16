@@ -1214,6 +1214,7 @@ void spill_crc_runs_without_index_mutex(ninfer::DeviceContext& device) {
     const std::uint64_t resident_entry = planned_entry(disk, resident);
     bool encode_admitted               = false;
     bool encode_committed              = false;
+    bool prepare_visible               = false;
     {
         const std::vector<ninfer::TokenId> tokens(64, 82);
         const auto ram_id = capture_tokens(ram, pool, allocation, device, tokens);
@@ -1222,14 +1223,20 @@ void spill_crc_runs_without_index_mutex(ninfer::DeviceContext& device) {
         disk.request_idle_spill();
         require(hold.entered(), "spill-crc-unlocked raw spill never reached its encode");
         hold.arm();
+        const auto active = disk.try_snapshot();
+        // Encoding still owns a private session. Preparation is active, but an installed
+        // session's age is zero until prepare_spill publishes it.
+        prepare_visible = active && active->spill_active && active->spill_elapsed_seconds == 0.0 &&
+                          active->captures == 1;
         const bool admitted = disk_admission_round(disk, resident, resident_entry);
         encode_admitted     = hold.disarm() && admitted;
         disk.test_hold_spill_encode(false);
         encode_committed =
             wait_pred([&] { return disk.ram_is_durable(ram_id); }, std::chrono::seconds(10));
     }
-    bool crc_admitted  = false;
-    bool crc_committed = false;
+    bool crc_admitted    = false;
+    bool crc_committed   = false;
+    bool session_visible = false;
     {
         const std::vector<ninfer::TokenId> tokens(64, 83);
         const auto ram_id = capture_tokens(ram, pool, allocation, device, tokens);
@@ -1238,6 +1245,9 @@ void spill_crc_runs_without_index_mutex(ninfer::DeviceContext& device) {
         disk.request_idle_spill();
         require(hold.entered(), "spill-crc-unlocked spill never reached its page-batch CRC build");
         hold.arm();
+        const auto active = disk.try_snapshot();
+        session_visible   = active && active->spill_active && active->spill_elapsed_seconds > 0.0 &&
+                            active->captures == 2;
         const bool admitted = disk_admission_round(disk, resident, resident_entry);
         crc_admitted        = hold.disarm() && admitted;
         hold.release();
@@ -1245,10 +1255,17 @@ void spill_crc_runs_without_index_mutex(ninfer::DeviceContext& device) {
             [&] { return disk.ram_is_durable(ram_id) && planned_entry(disk, tokens) != 0; },
             std::chrono::seconds(10));
     }
+    require(prepare_visible, "held spill preparation hid its active snapshot");
+    require(session_visible, "held spill session hid its active snapshot or elapsed age");
     require(encode_admitted, "admission waited for a raw spill's state encode and CRC");
     require(encode_committed, "raw spill held at its encode did not commit");
     require(crc_admitted, "admission waited for a spill's page-batch CRC build");
     require(crc_committed, "spill held at its page-batch CRC build did not commit");
+    disk.wait_idle_and_fsync();
+    const auto idle = disk.snapshot();
+    require(!idle.spill_active && idle.pending_jobs == 0 && idle.spill_elapsed_seconds == 0.0 &&
+                idle.captures == 3 && idle.save_seconds > 0.0,
+            "completed spills retained active work or lost completed lifetime counters");
 }
 
 // Capacity eviction is two-phase: the FIFO victim leaves planning under the mutex, its tombstone

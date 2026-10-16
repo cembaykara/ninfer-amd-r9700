@@ -9,6 +9,7 @@
 
 #include "ninfer/types.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -229,6 +230,33 @@ enum class DiskUnlockedIo : std::uint8_t {
     Count,
 };
 
+inline constexpr std::uint32_t kKvDiskRestoreIoThreads   = 16;
+inline constexpr std::uint32_t kKvDiskRestoreWindowSlots = 2;
+
+[[nodiscard]] inline std::uint32_t disk_restore_reader_count(std::uint32_t requested) {
+    return std::clamp(requested, 1U, 16U);
+}
+
+[[nodiscard]] inline std::uint32_t disk_restore_window_slots(std::uint32_t requested,
+                                                             std::uint32_t readers) {
+    const auto slots = requested == 0 ? 2U : requested;
+    return std::clamp(readers > 1 ? std::max(slots, 2U * readers) : slots, 2U, 64U);
+}
+
+// gfx1201 hipMalloc rounds each independent device allocation to at most 2 MiB.
+// Budget both the restore window and each pool's scatter descriptor allocation.
+[[nodiscard]] inline std::size_t disk_restore_device_reservation_bytes(std::size_t page_bytes,
+                                                                       std::size_t text_planes,
+                                                                       std::size_t backend_planes) {
+    constexpr std::size_t unit = 2ULL * 1024ULL * 1024ULL;
+    const auto physical = [](std::size_t bytes) { return (bytes + unit - 1U) / unit * unit; };
+    const auto slots    = disk_restore_window_slots(
+        kKvDiskRestoreWindowSlots, disk_restore_reader_count(kKvDiskRestoreIoThreads));
+    return physical(std::max<std::size_t>(page_bytes, 256U) * slots) +
+           physical(text_planes * sizeof(PagedKVScatterPlane)) +
+           physical(backend_planes * sizeof(PagedKVScatterPlane));
+}
+
 struct DiskOpenConfig {
     std::filesystem::path location;
     std::size_t capacity_bytes = 0;
@@ -241,7 +269,7 @@ struct DiskOpenConfig {
     std::size_t logical_page_bytes     = 0;
     std::uint64_t hidden_bytes         = 0;
     std::uint32_t max_index_entries    = 1u << 18;
-    std::uint32_t restore_window_slots = 2;
+    std::uint32_t restore_window_slots = kKvDiskRestoreWindowSlots;
     std::uint32_t restore_io_threads   = 1;
     std::uint32_t pack_page_batch      = 4;
     DiskFaultPoint test_fault_point    = DiskFaultPoint::None;
@@ -453,7 +481,14 @@ public:
         return waiting_reader_drain_.load(std::memory_order_acquire);
     }
 
-    void test_gate_state_h2d(hipEvent_t gate);
+    // Delays a page or immediate-state completion fence after every restore DMA is submitted.
+    void test_before_restore_completion(bool state, void (*callback)(void*, hipStream_t),
+                                        void* context) noexcept {
+        before_restore_completion_         = callback;
+        before_restore_completion_context_ = context;
+        hold_state_completion_             = state;
+    }
+
     void test_release_restore_job_barrier();
     void test_arm_restore_state_barrier();
     [[nodiscard]] bool test_restore_state_entered() const;
@@ -1149,25 +1184,28 @@ private:
     std::uint64_t object_id_reservation_limit_  = 1;
     std::array<std::uint32_t, 5> pack_active_segment_{};
     std::array<std::uint64_t, 5> pack_active_tail_{};
-    int lock_fd_                                 = -1;
-    void* restore_window_allocation_             = nullptr;
-    void* restore_window_mem_                    = nullptr;
-    std::size_t restore_window_bytes_            = 0;
-    std::size_t restore_window_stride_           = 0;
-    void* page_staging_                          = nullptr;
-    std::size_t page_staging_bytes_              = 0;
-    std::size_t page_staging_stride_             = 0;
-    hipStream_t page_scatter_stream_             = nullptr;
-    hipStream_t scatter_test_gate_stream_        = nullptr;
-    hipEvent_t scatter_test_gate_                = nullptr;
-    PagedKVScatterPlane* text_scatter_planes_    = nullptr;
-    std::size_t text_scatter_plane_count_        = 0;
-    std::size_t text_scatter_max_plane_bytes_    = 0;
-    std::size_t text_scatter_page_bytes_         = 0;
-    PagedKVScatterPlane* backend_scatter_planes_ = nullptr;
-    std::size_t backend_scatter_plane_count_     = 0;
-    std::size_t backend_scatter_max_plane_bytes_ = 0;
-    std::size_t backend_scatter_page_bytes_      = 0;
+    int lock_fd_                                           = -1;
+    void* restore_window_allocation_                       = nullptr;
+    void* restore_window_mem_                              = nullptr;
+    std::size_t restore_window_bytes_                      = 0;
+    std::size_t restore_window_stride_                     = 0;
+    void* page_staging_                                    = nullptr;
+    std::size_t page_staging_bytes_                        = 0;
+    std::size_t page_staging_stride_                       = 0;
+    hipStream_t page_scatter_stream_                       = nullptr;
+    void (*before_restore_completion_)(void*, hipStream_t) = nullptr;
+    void* before_restore_completion_context_               = nullptr;
+    bool hold_state_completion_                            = false;
+    hipStream_t scatter_test_gate_stream_                  = nullptr;
+    hipEvent_t scatter_test_gate_                          = nullptr;
+    PagedKVScatterPlane* text_scatter_planes_              = nullptr;
+    std::size_t text_scatter_plane_count_                  = 0;
+    std::size_t text_scatter_max_plane_bytes_              = 0;
+    std::size_t text_scatter_page_bytes_                   = 0;
+    PagedKVScatterPlane* backend_scatter_planes_           = nullptr;
+    std::size_t backend_scatter_plane_count_               = 0;
+    std::size_t backend_scatter_max_plane_bytes_           = 0;
+    std::size_t backend_scatter_page_bytes_                = 0;
 
     struct ImmediateStateSlices {
         std::span<std::uint8_t> gdn_conv;

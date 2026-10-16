@@ -248,8 +248,13 @@ q/k/v placement, and publication of the represented convolution column to the Pr
 ReplaySSM record row while leaving persistent state unchanged. The recurrent stage likewise emits
 raw key/value/gate records; after output resolution, one all-layer Fold applies only the committed
 record prefix to the lane's current state. A continuing DFlash chain row instead defers its Fold
-into its next verification forward, where each GDN layer's Fold runs ahead of that layer's front
-(`gdn_replay_fold_layer`, fused into the FP8 front); the result is bitwise the all-layer Fold.
+into its next verification forward. For a batched chain above 32 aggregate tokens, `gdn_replay_prepare_layer` publishes
+convolution history and preserves the committed raw K/V/gate prefix in caller workspace before
+the front overwrites the record row. `gated_delta_net_replay_record` then folds that prefix at
+its initial FP32 state load, publishes the committed state, and continues the current unaccepted
+recurrence without another state read. Smaller forwards and state-observing diagnostic taps retain the front
+Fold (`gdn_replay_fold_layer`, fused into the FP8 front). Both routes are bitwise the all-layer
+Fold; tree and mixed rounds retain their existing Fold ownership.
 
 The eliminated qkv intermediate is not a semantic cast boundary; each exact route uses its
 directly oracle-qualified private precision and staging. The separate Z projection remains in the

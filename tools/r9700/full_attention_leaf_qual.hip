@@ -284,10 +284,12 @@ void require_invalid(hipError_t status, const char* label) {
 
 // Exercise the actual target bridge with a pending publication and device-selected compact
 // table row. Other rows remain unmapped: ignoring the selector cannot produce the oracle.
-void qualify_long_dflash(ninfer::DeviceContext& device) {
+void qualify_long_dflash(ninfer::DeviceContext& device, std::uint32_t selected_context = 0U) {
     if constexpr (kValueGroup != 16U) return;
     constexpr std::size_t guard_bytes = 256U;
-    for (const std::uint32_t context : {15200U, 32768U}) {
+    for (const std::uint32_t context : selected_context != 0U
+                                           ? std::vector<std::uint32_t>{selected_context}
+                                           : std::vector<std::uint32_t>{15200U, 32768U}) {
         const std::uint32_t mapped_pages   = (context + kPageSize - 1U) / kPageSize;
         const std::uint32_t physical_pages = mapped_pages + 1U;
         ninfer::LayoutBuilder builder;
@@ -338,7 +340,9 @@ void qualify_long_dflash(ninfer::DeviceContext& device) {
                         represented_bf16(mean + (static_cast<int>(hash % 101U) - 50) / 64.0F);
                 }
         const auto cache = encode_cache(source_keys, source_values, pages, physical_pages);
-        for (const std::uint32_t rows : {4U, 5U, 6U, 7U, 8U}) {
+        for (const std::uint32_t rows : selected_context != 0U
+                                            ? std::vector<std::uint32_t>{1U, 8U}
+                                            : std::vector<std::uint32_t>{4U, 5U, 6U, 7U, 8U}) {
             // Both extents cover the five widths; together they select every compact C1..4 row.
             const std::int32_t selected_row =
                 rows == 4U || rows == 8U
@@ -493,8 +497,15 @@ void qualify_long_dflash(ninfer::DeviceContext& device) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        std::uint32_t selected_context = 0;
+        if (argc == 3 && std::string(argv[1]) == "--long-context") {
+            selected_context = static_cast<std::uint32_t>(std::stoul(argv[2]));
+            if (selected_context < 8192U || selected_context > 262144U)
+                fail("invalid long context");
+        } else if (argc != 1)
+            fail("usage: full_attention_qual [--long-context 8192..262144]");
         const auto selects_packed = [](std::uint32_t rows, std::size_t context, bool tree) {
             return ninfer::ops::r9700::kv::use_packed_decode_attention(rows, context, tree);
         };
@@ -528,7 +539,8 @@ int main() {
         if (!device.is_gfx1201() || device.props.warpSize != 32) {
             fail("selected physical device is not wave32 gfx1201");
         }
-        qualify_long_dflash(device);
+        qualify_long_dflash(device, selected_context);
+        if (selected_context != 0U) return 0;
 
         ninfer::LayoutBuilder cache_builder;
         const ninfer::Fp8KInt4VPagedKVSpec cache_spec{

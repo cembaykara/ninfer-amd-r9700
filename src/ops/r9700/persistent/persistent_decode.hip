@@ -168,6 +168,34 @@ inline PhaseStreams fp8lut4_streams(const linear::Fp8Lut4Weight& first,
     return streams;
 }
 
+// T1 projects 32 rows per CTA instead of SmallT's 16. Its next CTA overwrites only
+// the codebook before the first barrier; the prior CTA has finished reading it.
+template <bool Accumulate, bool SiluPair>
+struct Fp8Lut4T1 : CapturedGrid {
+    static constexpr bool lds_reuse_safe = true;
+    static constexpr auto kernel =
+        &linear::fp8lut4_kernels::fp8lut4_t1_kernel<Accumulate, SiluPair>;
+    static constexpr std::uint32_t launch_threads = 32U * linear::fp8lut4_kernels::kGemvSplit;
+    static constexpr std::uint32_t threads        = launch_threads;
+    using Shared                                  = linear::fp8lut4_kernels::T1Shared;
+
+    template <class Params>
+    static PhaseStreams streams(const Params& params) {
+        const auto& a = slot_value<0>(params);
+        auto result   = fp8lut4_streams(a.weight, a.second);
+        for (auto& part : result.parts)
+            for (auto& range : part) range.bytes *= 2U;
+        result.split /= 2U;
+        return result;
+    }
+
+    template <class Cta>
+    __device__ static void run(const Cta& cta, Shared& shared,
+                               const linear::fp8lut4_kernels::KernelArgs& a) {
+        linear::fp8lut4_kernels::t1_body<Accumulate, SiluPair>(cta, shared, a);
+    }
+};
+
 // T <= 16 (one token tile): a single-sequence verification width is at most 8.
 template <bool kAccumulate, bool kSiluPair>
 struct Fp8Lut4SmallT {
@@ -392,7 +420,8 @@ struct QkNormRope : CapturedGrid {
 using linear::fp8_small_t_kernels::Epilogue;
 // The kernels of a single-sequence decode graph (verification width at most 8).
 using Entries =
-    std::tuple<Fp8Lut4SmallT<false, false>, Fp8Lut4SmallT<true, false>, Fp8Lut4SmallT<false, true>,
+    std::tuple<Fp8Lut4T1<false, false>, Fp8Lut4T1<true, false>, Fp8Lut4T1<false, true>,
+               Fp8Lut4SmallT<false, false>, Fp8Lut4SmallT<true, false>, Fp8Lut4SmallT<false, true>,
                Fp8SmallT<Epilogue::Store>, Fp8SmallT<Epilogue::PairSplit>,
                Fp8SmallT<Epilogue::Residual>, QuantizeActivation, QuantizeNormalized, QuantizeGated,
                QuantizeGatedRmsNorm, GdnNormalizedFront, GdnPairConvRecord<4U>,
@@ -539,8 +568,10 @@ __device__ __forceinline__ void prefetch_code(std::uint32_t entry, std::uint64_t
 // (a touched dword fills its line, core/cache_warm.h), until the barrier opens: the wait of a
 // block a phase leaves idle, or that finishes early, overlaps the next phase's memory stream. A
 // pure cache hint: the loaded values are discarded.
+// Bind the next entry by reference: its LDS word is published only by the first barrier
+// below. Passing by value would read the new phase slot before its writer synchronizes.
 __device__ __forceinline__ void grid_barrier(std::uint64_t* arrivals, const PhaseStreams& next,
-                                             std::uint32_t next_entry) {
+                                             const std::uint32_t& next_entry) {
     __shared__ std::uint32_t open;
     __shared__ std::uint64_t target;
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
@@ -825,7 +856,54 @@ bool hosted(hipGraphNode_t node, Hosted& out) {
 
 } // namespace
 
-DeviceBuffer persistent_decode_lower(hipGraph_t graph) {
+struct PersistentDecodeStorage::Impl {
+    struct Image {
+        std::vector<std::uint8_t> bytes;
+        std::uint64_t hash;
+        std::shared_ptr<DeviceArena> arena;
+        std::uint8_t* base;
+    };
+
+    std::vector<Image> images;
+    std::shared_ptr<DeviceArena> current;
+
+    const Image& intern(std::vector<std::uint8_t> bytes) {
+        std::uint64_t hash = 14695981039346656037ULL;
+        for (const std::uint8_t byte : bytes) {
+            hash ^= byte;
+            hash *= 1099511628211ULL;
+        }
+        for (const Image& image : images) {
+            if (image.hash == hash && image.bytes == bytes) return image;
+        }
+        constexpr std::size_t kChunkBytes = 2U << 20U;
+        constexpr std::size_t kAlignment  = 256U;
+        const std::size_t next =
+            current ? (current->used() + kAlignment - 1U) / kAlignment * kAlignment : 0U;
+        if (!current || next + bytes.size() > current->capacity()) {
+            const std::size_t capacity =
+                (bytes.size() + kChunkBytes - 1U) / kChunkBytes * kChunkBytes;
+            current = std::make_shared<DeviceArena>(capacity);
+        }
+        const DeviceSpan slice = current->alloc_bytes(bytes.size(), kAlignment);
+        HIP_CHECK(hipMemcpy(slice.data, bytes.data(), bytes.size(), hipMemcpyHostToDevice));
+        // Pageable H2D may return before the null-stream DMA finishes. Graph consumers use a
+        // nonblocking compute stream, so finish the upload before exposing the image.
+        HIP_CHECK(hipStreamSynchronize(nullptr));
+        images.push_back({std::move(bytes), hash, current, static_cast<std::uint8_t*>(slice.data)});
+        return images.back();
+    }
+};
+
+PersistentDecodeStorage::PersistentDecodeStorage() : impl_(std::make_unique<Impl>()) {}
+
+PersistentDecodeStorage::~PersistentDecodeStorage()                                  = default;
+PersistentDecodeStorage::PersistentDecodeStorage(PersistentDecodeStorage&&) noexcept = default;
+PersistentDecodeStorage&
+PersistentDecodeStorage::operator=(PersistentDecodeStorage&&) noexcept = default;
+
+PersistentDecodeImageOwners persistent_decode_lower(hipGraph_t graph,
+                                                    PersistentDecodeStorage& images) {
     if (graph == nullptr) throw std::invalid_argument("persistent_decode_lower: null graph");
     const std::vector<hipGraphNode_t> chain = chain_nodes(graph);
 
@@ -850,7 +928,7 @@ DeviceBuffer persistent_decode_lower(hipGraph_t graph) {
         if (end - index >= 2U) runs.push_back(Run{index, end - index});
         index = end;
     }
-    if (runs.empty()) return DeviceBuffer{};
+    if (runs.empty()) return {};
 
     // Device image: the barrier words, then one PhaseSlot record per phase.
     const auto& table       = entries();
@@ -882,9 +960,6 @@ DeviceBuffer persistent_decode_lower(hipGraph_t graph) {
                 records[index - 1U].streams = records[index].streams;
         }
     }
-    DeviceBuffer storage(image.size());
-    storage.copy_from_host(image.data(), image.size());
-
     int device = 0;
     HIP_CHECK(hipGetDevice(&device));
     int wgps = 0;
@@ -897,10 +972,18 @@ DeviceBuffer persistent_decode_lower(hipGraph_t graph) {
                                " persistent blocks per WGP are resident, expected " +
                                std::to_string(kBlocksPerWgp));
 
-    auto* base              = static_cast<std::uint8_t*>(storage.data());
+    PersistentDecodeImageOwners owners;
     std::size_t first_phase = 0;
     for (const Run& run : runs) {
-        Program program{reinterpret_cast<const PhaseSlot*>(base + kPhaseOffset) + first_phase,
+        std::vector<std::uint8_t> run_image(kPhaseOffset + run.count * sizeof(PhaseSlot), 0U);
+        std::memcpy(run_image.data() + kPhaseOffset, records + first_phase,
+                    run.count * sizeof(PhaseSlot));
+        const auto& stored = images.impl_->intern(std::move(run_image));
+        auto* base         = stored.base;
+        if (std::find(owners.begin(), owners.end(), stored.arena) == owners.end()) {
+            owners.push_back(stored.arena);
+        }
+        Program program{reinterpret_cast<const PhaseSlot*>(base + kPhaseOffset),
                         reinterpret_cast<std::uint64_t*>(base),
                         static_cast<std::uint32_t>(run.count),
                         static_cast<std::uint32_t>(launches[run.first].entry)};
@@ -930,7 +1013,7 @@ DeviceBuffer persistent_decode_lower(hipGraph_t graph) {
             HIP_CHECK(hipGraphDestroyNode(chain[index]));
         if (successor != nullptr) HIP_CHECK(hipGraphAddDependencies(graph, &node, &successor, 1U));
     }
-    return storage;
+    return owners;
 }
 
 } // namespace ninfer::ops

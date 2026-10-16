@@ -5,6 +5,8 @@
 #include <hip/hip_runtime.h>
 
 #include <functional>
+#include <memory>
+#include <vector>
 
 namespace ninfer {
 
@@ -21,14 +23,15 @@ public:
     void capture(hipStream_t stream, const std::function<void()>& body);
     // Rewrites the captured graph in place; the definition keeps the device storage the
     // rewritten nodes reference for as long as it holds the graph.
-    void rewrite(const std::function<DeviceBuffer(hipGraph_t)>& rewriter);
+    void
+    rewrite(const std::function<std::vector<std::shared_ptr<DeviceArena>>(hipGraph_t)>& rewriter);
     [[nodiscard]] bool ready() const noexcept;
     void reset() noexcept;
 
 private:
     friend class DecodeGraphExecutable;
     hipGraph_t graph_ = nullptr;
-    DeviceBuffer storage_;
+    std::vector<std::shared_ptr<DeviceArena>> storage_;
 };
 
 class DecodeGraphExecutable {
@@ -42,7 +45,6 @@ public:
     DecodeGraphExecutable& operator=(DecodeGraphExecutable&& other) noexcept;
 
     void instantiate(const DecodeGraphDefinition& definition);
-    void update(const DecodeGraphDefinition& definition);
     void upload(hipStream_t stream);
     void launch(hipStream_t stream);
     [[nodiscard]] bool ready() const noexcept;

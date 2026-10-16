@@ -3,6 +3,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/decode_graph.h"
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
@@ -18,6 +19,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <memory>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -178,9 +181,13 @@ Fixture make_fixture(const ninfer::GdnReplayRecords& records) {
 
 std::vector<double> recurrent_oracle(const Fixture& fixture, int row,
                                      const std::vector<int>& sequence,
-                                     const std::vector<float>& initial) {
+                                     const std::vector<float>& initial,
+                                     std::vector<double>* outputs = nullptr,
+                                     const Fixture* queries       = nullptr) {
+    if (outputs != nullptr) outputs->clear();
     std::vector<double> state(initial.begin(), initial.end());
     std::array<double, static_cast<std::size_t>(kQkHeads) * kStateDim> normalized{};
+    std::array<double, static_cast<std::size_t>(kQkHeads) * kStateDim> query{};
     for (int token : sequence) {
         for (int qk_head = 0; qk_head < kQkHeads; ++qk_head) {
             double norm2 = 0.0;
@@ -193,6 +200,19 @@ std::vector<double> recurrent_oracle(const Fixture& fixture, int row,
             const double inverse = 1.0 / std::sqrt(norm2 + 1.0e-6);
             for (int dim = 0; dim < kStateDim; ++dim) {
                 normalized[static_cast<std::size_t>(qk_head) * kStateDim + dim] *= inverse;
+            }
+            if (outputs != nullptr) {
+                double query_norm2 = 0.0;
+                for (int dim = 0; dim < kStateDim; ++dim) {
+                    const auto index = static_cast<std::size_t>(qk_head) * kStateDim + dim;
+                    query[index] =
+                        fp32((queries != nullptr ? *queries : fixture)
+                                 .key[key_index(kOracleLayer, row, token, qk_head, dim)]);
+                    query_norm2 += query[index] * query[index];
+                }
+                const double query_inverse = 1.0 / std::sqrt(query_norm2 + 1.0e-6);
+                for (int dim = 0; dim < kStateDim; ++dim)
+                    query[static_cast<std::size_t>(qk_head) * kStateDim + dim] *= query_inverse;
             }
         }
         for (int value_head = 0; value_head < kValueHeads; ++value_head) {
@@ -217,6 +237,12 @@ std::vector<double> recurrent_oracle(const Fixture& fixture, int row,
                     element =
                         alpha * element +
                         delta * normalized[static_cast<std::size_t>(qk_head) * kStateDim + key_dim];
+                }
+                if (outputs != nullptr) {
+                    double dot = 0.0;
+                    for (int key_dim = 0; key_dim < kStateDim; ++key_dim)
+                        dot += state[state_base + key_dim] * query[qk_head * kStateDim + key_dim];
+                    outputs->push_back(dot * static_cast<double>(1.F / std::sqrt(128.F)));
                 }
             }
         }
@@ -487,10 +513,317 @@ void qualify_deferred(const ninfer::GdnReplayRecords& records,
     }
     require_same(snapshot(), expected, "front-fused deferred fold");
 
+    // The next record round overwrites the persistent record planes. Preparation must stage
+    // every old head before that overwrite, including when a row is a strict no-op.
+    std::vector<std::unique_ptr<ninfer::DeviceBuffer>> storage;
+    const auto allocate = [&](ninfer::DType dtype, std::initializer_list<std::int32_t> shape) {
+        const ninfer::Tensor view(nullptr, dtype, shape);
+        storage.push_back(std::make_unique<ninfer::DeviceBuffer>(view.bytes()));
+        return ninfer::Tensor(storage.back()->data(), dtype, shape);
+    };
+    auto current           = fixture;
+    const auto layer_first = key_index(kOracleLayer, 0, 0, 0, 0);
+    for (std::size_t i = layer_first; i < layer_first + kCapacity * kWidth * kQkHeads * kStateDim;
+         ++i)
+        current.key[i] = bf16(-0.75F * fp32(current.key[i]));
+    auto queries = current;
+    for (std::size_t i = layer_first; i < layer_first + kCapacity * kWidth * kQkHeads * kStateDim;
+         ++i)
+        queries.key[i] =
+            bf16(0.375F * fp32(current.key[i]) + (static_cast<int>(i % 17) - 8) / 16.F);
+    auto q      = allocate(ninfer::DType::BF16, {128, 16, kWidth, kCapacity});
+    auto k      = allocate(ninfer::DType::BF16, {128, 16, kWidth, kCapacity});
+    auto v      = allocate(ninfer::DType::BF16, {128, 48, kWidth, kCapacity});
+    auto g      = allocate(ninfer::DType::FP32, {48, kWidth, kCapacity});
+    auto beta   = allocate(ninfer::DType::FP32, {48, kWidth, kCapacity});
+    auto output = allocate(ninfer::DType::BF16, {128, 48, kWidth, kCapacity});
+    auto slots  = allocate(ninfer::DType::I32, {kCapacity});
+    auto valid  = allocate(ninfer::DType::I32, {kCapacity});
+    auto live   = records.layer(kOracleLayer, 0, kCapacity);
+    ninfer::ops::GdnRecordFold staged{allocate(ninfer::DType::BF16, {128, 16, kWidth, kCapacity}),
+                                      allocate(ninfer::DType::BF16, {128, 48, kWidth, kCapacity}),
+                                      allocate(ninfer::DType::FP32, {2, 48, kWidth, kCapacity}),
+                                      nullptr};
+    const std::array<int, kCapacity> current_slots{0, 1}, current_valid{kWidth, kWidth - 1};
+    HIP_CHECK(hipMemcpy(slots.data, current_slots.data(), slots.bytes(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(valid.data, current_valid.data(), valid.bytes(), hipMemcpyHostToDevice));
+    HIP_CHECK(
+        hipMemcpy(q.data, queries.key.data() + layer_first, q.bytes(), hipMemcpyHostToDevice));
+    HIP_CHECK(
+        hipMemcpy(k.data, current.key.data() + layer_first, k.bytes(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(v.data, current.value.data() + value_index(kOracleLayer, 0, 0, 0, 0),
+                        v.bytes(), hipMemcpyHostToDevice));
+    std::vector<float> host_g(kCapacity * kWidth * 48), host_beta(host_g.size());
+    for (int b = 0; b < kCapacity; ++b)
+        for (int t = 0; t < kWidth; ++t)
+            for (int h = 0; h < 48; ++h) {
+                const auto index = (b * kWidth + t) * 48 + h;
+                host_g[index]    = current.gate[gate_index(kOracleLayer, b, t, h, 0)];
+                host_beta[index] = current.gate[gate_index(kOracleLayer, b, t, h, 1)];
+            }
+    HIP_CHECK(hipMemcpy(g.data, host_g.data(), g.bytes(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(beta.data, host_beta.data(), beta.bytes(), hipMemcpyHostToDevice));
+    const auto restore_records = [&] {
+        HIP_CHECK(hipMemcpy(live.key.data, fixture.key.data() + layer_first, live.key.bytes(),
+                            hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(live.value.data,
+                            fixture.value.data() + value_index(kOracleLayer, 0, 0, 0, 0),
+                            live.value.bytes(), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(live.gate.data,
+                            fixture.gate.data() + gate_index(kOracleLayer, 0, 0, 0, 0),
+                            live.gate.bytes(), hipMemcpyHostToDevice));
+    };
+    const auto record = [&](const ninfer::ops::GdnRecordFold* fold) {
+        ninfer::ops::gated_delta_net_replay_record(
+            q, k, v, g, beta, 1.F / std::sqrt(128.F), states.recurrent.at(kOracleLayer), valid,
+            slots, live.key, live.value, live.gate, output, stream, nullptr, nullptr, {}, fold);
+    };
+    for (bool noop : {false, true}) {
+        host_rows.row[0].commit_columns = noop ? 0 : 3;
+        HIP_CHECK(
+            hipMemcpy(device_rows.data(), &host_rows, sizeof(host_rows), hipMemcpyHostToDevice));
+        reset();
+        restore_records();
+        ninfer::ops::gdn_replay_fold_layer(layer_fold(kOracleLayer), stream);
+        record(nullptr);
+        HIP_CHECK(hipStreamSynchronize(stream));
+        const auto expected_output = copy_tensor<hip_bfloat16>(output);
+        const auto expected_state  = snapshot();
+        const auto expected_key    = copy_tensor<hip_bfloat16>(live.key);
+        const auto expected_value  = copy_tensor<hip_bfloat16>(live.value);
+        const auto expected_gate   = copy_tensor<float>(live.gate);
+        // Independent complete FP64 fold -> represented FP32 state -> current recurrence,
+        // with independent Q and K, followed by the recurrence qualifier's BF16 output criterion.
+        for (int b = 0; b < kCapacity; ++b) {
+            const int source_row = host_rows.row[b].record_row;
+            std::vector<int> old_sequence(host_rows.row[b].commit_columns);
+            std::iota(old_sequence.begin(), old_sequence.end(), 0);
+            const auto old_ideal =
+                recurrent_oracle(fixture, source_row, old_sequence, initial_recurrent[source_row]);
+            const std::vector<float> represented(old_ideal.begin(), old_ideal.end());
+            std::vector<int> sequence(current_valid[b]);
+            std::iota(sequence.begin(), sequence.end(), 0);
+            std::vector<double> ideal;
+            (void)recurrent_oracle(current, b, sequence, represented, &ideal, &queries);
+            double error2 = 0.0, oracle2 = 0.0, maximum = 0.0;
+            for (std::size_t i = 0; i < ideal.size(); ++i) {
+                const double value = fp32(expected_output[b * kWidth * 48 * 128 + i]);
+                const double error = value - ideal[i];
+                maximum            = std::max(maximum, std::abs(error));
+                error2 += error * error;
+                oracle2 += ideal[i] * ideal[i];
+            }
+            if (maximum > 0.025 || std::sqrt(error2 / std::max(oracle2, 1e-30)) > 0.02)
+                fail("prepared fold-record independent FP64 output mismatch");
+            for (int t = current_valid[b]; t < kWidth; ++t)
+                for (int i = 0; i < 48 * 128; ++i)
+                    if (expected_output[(b * kWidth + t) * 48 * 128 + i].data != 0)
+                        fail("prepared fold-record invalid suffix is not exact zero");
+        }
+        const auto fused = [&] {
+            ninfer::ops::gdn_replay_prepare_layer(layer_fold(kOracleLayer), staged, stream);
+            record(&staged);
+        };
+        const auto verify = [&] {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            require_same(snapshot(), expected_state, "prepared fold-record state/history");
+            require_bf16_exact(copy_tensor<hip_bfloat16>(output), expected_output,
+                               "fold-record output");
+            require_bf16_exact(copy_tensor<hip_bfloat16>(live.key), expected_key,
+                               "fold-record key");
+            require_bf16_exact(copy_tensor<hip_bfloat16>(live.value), expected_value,
+                               "fold-record value");
+            if (copy_tensor<float>(live.gate) != expected_gate) fail("fold-record gate differs");
+        };
+        reset();
+        restore_records();
+        fused();
+        verify();
+        ninfer::DecodeGraphDefinition definition;
+        definition.capture(stream, fused);
+        ninfer::DecodeGraphExecutable executable;
+        executable.instantiate(definition);
+        for (int replay = 0; replay < 3; ++replay) {
+            reset();
+            restore_records();
+            executable.launch(stream);
+            verify();
+        }
+    }
+    reset();
+    restore_records();
+    host_rows.row[0].commit_columns = 3;
+    HIP_CHECK(hipMemcpy(device_rows.data(), &host_rows, sizeof(host_rows), hipMemcpyHostToDevice));
+    std::cout << "prepared fold-record FP64/output/state/alias/noop/graph=PASS\n";
+
     ninfer::ops::GdnLayerFold oversized = layer_fold(kOracleLayer);
     oversized.batch                     = kCapacity + 1;
     require_invalid([&] { ninfer::ops::gdn_replay_fold_layer(oversized, stream); },
                     "deferred batch above record capacity");
+}
+
+// Real W8 server batches: every lane has permuted source rows and state slots, including
+// zero, short and full accepted prefixes. Fixture columns repeat after six, while the independent
+// recurrence oracle evaluates all eight transitions rather than copying a device reduction.
+void qualify_w8_batch(int batch, const Fixture& fixture, hipStream_t stream) {
+    constexpr int width = 8;
+    ninfer::LayoutBuilder builder;
+    const auto layout = ninfer::plan_gdn_replay_records(builder, {.layers          = 48,
+                                                                  .record_capacity = batch,
+                                                                  .width           = width,
+                                                                  .conv_channels   = 10240,
+                                                                  .qk_heads        = 16,
+                                                                  .value_heads     = 48,
+                                                                  .key_dim         = 128,
+                                                                  .value_dim       = 128});
+    ninfer::DeviceBuffer record_storage(builder.finish(256));
+    ninfer::GdnReplayRecords records({record_storage.data(), record_storage.size()}, layout);
+    auto live = records.layer(0, 0, batch);
+    std::vector<std::unique_ptr<ninfer::DeviceBuffer>> storage;
+    const auto allocate = [&](ninfer::DType dtype, std::initializer_list<std::int32_t> shape) {
+        const ninfer::Tensor view(nullptr, dtype, shape);
+        storage.push_back(std::make_unique<ninfer::DeviceBuffer>(view.bytes()));
+        return ninfer::Tensor(storage.back()->data(), dtype, shape);
+    };
+    auto state  = allocate(ninfer::DType::FP32, {128, 128, 48, batch});
+    auto conv   = allocate(ninfer::DType::BF16, {10240, 3, batch});
+    auto q      = allocate(ninfer::DType::BF16, {128, 16, width, batch});
+    auto k      = allocate(ninfer::DType::BF16, {128, 16, width, batch});
+    auto v      = allocate(ninfer::DType::BF16, {128, 48, width, batch});
+    auto g      = allocate(ninfer::DType::FP32, {48, width, batch});
+    auto beta   = allocate(ninfer::DType::FP32, {48, width, batch});
+    auto output = allocate(ninfer::DType::BF16, {128, 48, width, batch});
+    auto slots  = allocate(ninfer::DType::I32, {batch});
+    auto valid  = allocate(ninfer::DType::I32, {batch});
+    auto rows   = allocate(ninfer::DType::I32, {4, 8});
+    ninfer::ops::GdnRecordFold staged{allocate(ninfer::DType::BF16, {128, 16, width, batch}),
+                                      allocate(ninfer::DType::BF16, {128, 48, width, batch}),
+                                      allocate(ninfer::DType::FP32, {2, 48, width, batch}),
+                                      nullptr};
+    std::vector<hip_bfloat16> old_k(batch * width * 16 * 128), old_v(batch * width * 48 * 128),
+        old_c(batch * width * 10240), current_k(old_k.size()), current_q(old_k.size());
+    std::vector<float> old_gate(batch * width * 48 * 2), host_g(batch * width * 48),
+        host_beta(host_g.size());
+    auto current     = fixture;
+    const auto begin = key_index(kOracleLayer, 0, 0, 0, 0);
+    for (std::size_t j = begin; j < begin + kCapacity * kWidth * 16 * 128; ++j)
+        current.key[j] = bf16(-0.75F * fp32(current.key[j]));
+    auto queries = current;
+    for (std::size_t j = begin; j < begin + kCapacity * kWidth * 16 * 128; ++j)
+        queries.key[j] =
+            bf16(0.375F * fp32(current.key[j]) + (static_cast<int>(j % 17) - 8) / 16.F);
+    for (int b = 0; b < batch; ++b)
+        for (int t = 0; t < width; ++t) {
+            const auto column = b * width + t;
+            std::copy_n(fixture.key.data() + key_index(kOracleLayer, b % 2, t % kWidth, 0, 0),
+                        16 * 128, old_k.data() + column * 16 * 128);
+            std::copy_n(current.key.data() + key_index(kOracleLayer, b % 2, t % kWidth, 0, 0),
+                        16 * 128, current_k.data() + column * 16 * 128);
+            std::copy_n(queries.key.data() + key_index(kOracleLayer, b % 2, t % kWidth, 0, 0),
+                        16 * 128, current_q.data() + column * 16 * 128);
+            std::copy_n(fixture.value.data() + value_index(kOracleLayer, b % 2, t % kWidth, 0, 0),
+                        48 * 128, old_v.data() + column * 48 * 128);
+            std::copy_n(fixture.conv.data() + conv_index(kOracleLayer, b % 2, t % kWidth, 0), 10240,
+                        old_c.data() + column * 10240);
+            for (int h = 0; h < 48; ++h) {
+                const auto index = (column * 48 + h) * 2;
+                old_gate[index]  = fixture.gate[gate_index(kOracleLayer, b % 2, t % kWidth, h, 0)];
+                old_gate[index + 1] =
+                    fixture.gate[gate_index(kOracleLayer, b % 2, t % kWidth, h, 1)];
+                host_g[index / 2]    = old_gate[index];
+                host_beta[index / 2] = old_gate[index + 1];
+            }
+        }
+    HIP_CHECK(hipMemcpy(q.data, current_q.data(), q.bytes(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(k.data, current_k.data(), k.bytes(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(v.data, old_v.data(), v.bytes(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(g.data, host_g.data(), g.bytes(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(beta.data, host_beta.data(), beta.bytes(), hipMemcpyHostToDevice));
+    std::vector<int> host_slots(batch), host_valid(batch);
+    ninfer::ops::GdnDeferredFoldRows host_rows{};
+    constexpr int commits[8] = {0, 1, 2, 3, 6, 8, 4, 7};
+    for (int b = 0; b < batch; ++b) {
+        host_slots[b]    = (b + 3) % batch;
+        host_valid[b]    = width - b % 3;
+        host_rows.row[b] = {.linear_state_slot = host_slots[b],
+                            .commit_columns    = commits[b],
+                            .record_row        = (b + 1) % batch};
+    }
+    HIP_CHECK(hipMemcpy(slots.data, host_slots.data(), slots.bytes(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(valid.data, host_valid.data(), valid.bytes(), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(rows.data, &host_rows, sizeof(host_rows), hipMemcpyHostToDevice));
+    const ninfer::ops::GdnLayerFold fold{
+        &records, state, conv, 0, static_cast<const ninfer::ops::GdnDeferredFoldRows*>(rows.data),
+        batch};
+    const auto reset = [&] {
+        HIP_CHECK(hipMemcpy(live.key.data, old_k.data(), live.key.bytes(), hipMemcpyHostToDevice));
+        HIP_CHECK(
+            hipMemcpy(live.value.data, old_v.data(), live.value.bytes(), hipMemcpyHostToDevice));
+        HIP_CHECK(
+            hipMemcpy(live.gate.data, old_gate.data(), live.gate.bytes(), hipMemcpyHostToDevice));
+        HIP_CHECK(
+            hipMemcpy(live.conv.data, old_c.data(), live.conv.bytes(), hipMemcpyHostToDevice));
+        for (int b = 0; b < batch; ++b) {
+            const auto initial = initial_state(b);
+            const auto history = initial_conv(b);
+            HIP_CHECK(hipMemcpy(static_cast<float*>(state.data) + b * 48 * 128 * 128,
+                                initial.data(), initial.size() * sizeof(float),
+                                hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(static_cast<hip_bfloat16*>(conv.data) + b * 3 * 10240,
+                                history.data(), history.size() * sizeof(hip_bfloat16),
+                                hipMemcpyHostToDevice));
+        }
+    };
+    const auto record = [&](const ninfer::ops::GdnRecordFold* old) {
+        ninfer::ops::gated_delta_net_replay_record(q, k, v, g, beta, 1.F / std::sqrt(128.F), state,
+                                                   valid, slots, live.key, live.value, live.gate,
+                                                   output, stream, nullptr, nullptr, {}, old);
+    };
+    reset();
+    ninfer::ops::gdn_replay_fold_layer(fold, stream);
+    record(nullptr);
+    HIP_CHECK(hipStreamSynchronize(stream));
+    const auto expected_state  = copy_tensor<float>(state);
+    const auto expected_conv   = copy_tensor<hip_bfloat16>(conv);
+    const auto expected_output = copy_tensor<hip_bfloat16>(output);
+    reset();
+    ninfer::ops::gdn_replay_prepare_layer(fold, staged, stream);
+    record(&staged);
+    HIP_CHECK(hipStreamSynchronize(stream));
+    if (copy_tensor<float>(state) != expected_state) fail("W8 folded state differs");
+    require_bf16_exact(copy_tensor<hip_bfloat16>(conv), expected_conv, "W8 convolution");
+    const auto actual = copy_tensor<hip_bfloat16>(output);
+    require_bf16_exact(actual, expected_output, "W8 output");
+    for (int b = 0; b < batch; ++b) {
+        const int slot = host_slots[b], source = host_rows.row[b].record_row;
+        std::vector<int> previous_sequence(commits[b]), current_sequence(host_valid[b]);
+        for (std::size_t t = 0; t < previous_sequence.size(); ++t)
+            previous_sequence[t] = t % kWidth;
+        for (std::size_t t = 0; t < current_sequence.size(); ++t) current_sequence[t] = t % kWidth;
+        const auto old_ideal =
+            recurrent_oracle(fixture, source % 2, previous_sequence, initial_state(slot));
+        require_state_close(
+            std::vector<float>(expected_state.begin() + slot * 48 * 128 * 128,
+                               expected_state.begin() + (slot + 1) * 48 * 128 * 128),
+            old_ideal, "W8 independent state oracle");
+        const std::vector<float> represented(old_ideal.begin(), old_ideal.end());
+        std::vector<double> ideal;
+        (void)recurrent_oracle(current, b % 2, current_sequence, represented, &ideal, &queries);
+        double error2 = 0.0, oracle2 = 0.0, maximum = 0.0;
+        for (std::size_t t = 0; t < ideal.size(); ++t) {
+            const double error = fp32(actual[b * width * 48 * 128 + t]) - ideal[t];
+            maximum            = std::max(maximum, std::abs(error));
+            error2 += error * error;
+            oracle2 += ideal[t] * ideal[t];
+        }
+        if (maximum > 0.025 || std::sqrt(error2 / std::max(oracle2, 1e-30)) > 0.02)
+            fail("W8 independent output oracle mismatch");
+        for (int t = host_valid[b]; t < width; ++t)
+            for (int f = 0; f < 48 * 128; ++f)
+                if (actual[(b * width + t) * 48 * 128 + f].data != 0)
+                    fail("W8 inactive suffix not zero");
+    }
+    std::cout << "prepared fold-record B=" << batch << " W8 FP64/state/output/alias=PASS\n";
 }
 
 void qualify(hipStream_t stream) {
@@ -507,6 +840,8 @@ void qualify(hipStream_t stream) {
     ninfer::DeviceBuffer record_storage(record_builder.finish(256));
     ninfer::GdnReplayRecords records({record_storage.data(), record_storage.size()}, record_layout);
     const Fixture fixture = make_fixture(records);
+    qualify_w8_batch(6, fixture, stream);
+    qualify_w8_batch(8, fixture, stream);
     HIP_CHECK(hipMemcpy(records.conv.data, fixture.conv.data(), records.conv.bytes(),
                         hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(records.key.data, fixture.key.data(), records.key.bytes(),

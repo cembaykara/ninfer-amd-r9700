@@ -48,6 +48,453 @@ The latest accepted measurements use:
 The GPU must otherwise be idle. Timings use HIP events around the claimed physical work after
 warmup. Independent exact/FP64 oracles run before performance values are admitted.
 
+### Decode optimization profile at 512 through 64K context (2026-10-16)
+
+Fresh characterization of `6f069b6c`, the production `r9700-fp8lut4` artifact, fixed G16
+FP8-K/INT4-V/FP16-scale cache, chunk 2048, and the Compose bulk host-argument graph environment.
+Each unprofiled point discards one repetition and measures three greedy corpus P+G128 requests
+under `auto`. These are diagnostic baselines, not an optimization A/B; some points have a slow
+repetition, with the full ranges retained in the report. No clock, voltage or power-policy
+setting was changed.
+
+| C1 prompt tokens | Plain decode median ms/token | DFlash K7 median ms/round, including fallback | Plain attention kernel ms/graph | DFlash attention kernel ms/graph |
+|---:|---:|---:|---:|---:|
+| 512 | 27.997 | 29.293 | 0.368 | 0.392 |
+| 8,192 | 28.480 | 30.211 | 0.766 | 1.034 |
+| 32,768 | 30.045 | 32.067 | 2.316 | 2.835 |
+| 65,536 | 31.618 | 33.998 | 3.932 | 4.742 |
+
+The first two timing columns are unprofiled. Attention columns are consumer-plus-merge duration
+sums from matching P+G128 traces and support attribution only. Attention rises from about 1.4%
+to 13.3% of plain kernel time and 14.3% of DFlash kernel time. C1 target projection cost stays
+nearly constant: plain FP8LUT4 T1 projections take about 21.1 ms/graph; DFlash persistent target
+phases take about 25.1 ms/graph and its Q4 drafter projections about 2.4 ms/graph. The persistent
+bucket includes several Ops; this trace does not resolve its internal phases or establish current
+physical HBM saturation. Output throughput across contexts also changes with acceptance and is
+not an isolated measure of context overhead.
+
+The C6/P8192/G128 compact decode point measures 572.6 aggregate output tok/s median on this
+greedy corpus. Its matching trace contains 25 B6, two B5 and one B3 graphs. Across those graphs,
+GDN replay folding takes 2.96 ms and recurrence recording 2.51 ms per graph; all GDN state/front
+work totals 6.02 ms, about 13.6% of kernel duration. The B6 class alone totals 44.83 ms of kernel
+duration, including 6.08 ms GDN state/front and 4.94 ms attention. These are kernel sums, not
+unprofiled physical round timings or application sampling throughput.
+
+Candidates identified by this initial profile (follow-up decisions below):
+
+- **Batched GDN state traffic:** reconstruct committed recurrent state at the next record's
+  initial-state load to avoid another state read. Preserve early convolution-state publication,
+  FP32 state evolution and old/new replay-record lifetimes. Merely moving the fold into the
+  front removes no state traffic. This needs a new complete-boundary oracle and timing decision.
+- **Long-context attention access:** improve the physical K/V access pattern or remove repeated
+  traffic while preserving the three planes and QK/PV arithmetic. The logical Text-cache minimum
+  is 26,624 bytes per context token, or 1.745 GB at 64K. At the previously measured 636 GB/s read
+  probe, an ideal single pass alone costs 2.74 ms, before partials, compute, barriers and read
+  amplification. This is an optimistic traffic floor, not a new bandwidth measurement or an
+  achievable latency. Prior rejected rings, vector-load substitutions and chunk-count sweeps
+  need a new mechanism before repetition.
+- **Plain T1 persistent hosting:** `fp8lut4_t1_kernel` is absent from the persistent registry;
+  about 245 invocations/token remain separate launches and interrupt hosted producer/projection
+  runs. Hosting the exact T1 body could reduce boundaries without reducing weight traffic.
+  Register/occupancy and streaming effects still require qualification and whole-decode timing;
+  the earlier failed B>1 lowering must not be treated as a promoted solution.
+
+All 27 baseline repetitions repeat their tokens exactly within each workload, and all nine
+matching-geometry traces reproduce baseline tokens exactly. Initial G32 traces changed capacity
+and short-context trajectories; they are preliminary diagnostics, not the final attribution.
+Known dependent nodes have overlapping timestamps in the ROCm graph traces. The classic control
+also retains such overlap for plain decode, while its summed kernel time differs from bulk by
+less than 0.05% at both short C1 points, with exact tokens. The cause is not established.
+Replay dispatch counts are reconciled by graph/node occurrence and dispatch order; no causal
+gap, idle-fraction or stall claim is made from those timestamps. This initial study changed no
+kernel or production route. It did not cover mixed rounds, tools, HTTP, adaptive p-less acceptance or
+concurrent 64K contexts.
+
+Evidence, exact commands, ranges, per-symbol/grid attribution and control checks:
+`profiles/bench/r9700-decode-opportunities-20261016/report.txt`, `analysis.json`,
+`manifest.json`, `matched-manifest.json`, and `trace-controls.json`.
+
+### Decode profile follow-up (2026-10-16)
+
+The follow-up retains the exact T1 FP8LUT4 arithmetic in a shared CTA body and hosts its
+Store, residual and SiLU-pair entries in the existing persistent decode dispatcher. The
+C1/P8192/G128 ordinary-decode A/B uses six balanced processes, each with one discarded and
+three measured repetitions. Paired candidate/control ratios are 0.91654, 0.91587 and 0.91631;
+the median reduction is **8.37%** (3.6454 to 3.3398 seconds per 128 tokens). Generated tokens
+are exact. The independent FP64 Linear qualifier and all 23 exact persistent-lowering
+scenarios pass. The persistent kernel uses 238 VGPRs, 22,504 LDS bytes and no scratch/spills.
+
+Batched DFlash chain verification above 32 aggregate tokens preserves old committed raw records
+in caller workspace,
+publishes convolution history before projection, then folds FP32 recurrent state at the next
+record consumer's initial load. This removes one state read without publishing current
+unaccepted recurrence state. The independent FP64 fold/recurrence oracle, exact ordinary
+state/history/record comparison, permuted slots, partial prefixes and graph replays pass at
+B2/W6 and B6,B8/W8. The fused record kernel uses 56 VGPRs, 18,560 LDS bytes and no spills.
+The isolated C6/P8192/K7 A/B (six balanced processes, discarded warmup plus three repetitions)
+reduces decode time by 1.15%, with exact tokens. Both arms of that mechanism comparison used
+the same subsequently rejected attention candidate; final production comparisons are recorded
+in the evidence directory. The finite crossover retains the existing front Fold through 32
+aggregate tokens: forcing the new route at C2/C3/C4 K7 or C6 K3 slows decode by 1.1–1.3%.
+Above that boundary, the C8/K7 comparison reduces decode by 1.72%, with exact tokens.
+
+The final persistent kernel also binds the next phase entry by reference and reads it only after
+the phase-slot publication barrier. Its previous by-value argument read LDS before the writer
+synchronized; this could select a stale instruction-prefetch entry. The final native 23-scenario
+exact-buffer qualification passes. The final same-session three-repetition A/Bs are:
+
+| Workload, G128 | Control median decode seconds | Final median decode seconds | Time reduction |
+|---|---:|---:|---:|
+| C1 plain, P8192 | 3.63709 | 3.34141 | 8.13% |
+| C1 plain, P65536 | 4.03783 | 3.74278 | 7.31% |
+| C1 DFlash K7, P512 | 1.40741 | 1.40521 | 0.16% (neutral) |
+| C6 DFlash K7, P8192 | 1.34016 | 1.32283 | 1.29% |
+
+The short points discard one warmup; the 64K point measures three complete P+G requests without
+a discarded repetition. All retained tokens match the control exactly. Fixed-K7 C6 eager and
+C5 mixed-forward-256 whole requests also match original tokens exactly. Adaptive C7 graph
+control/final tokens match; adaptive eager selects different timing-dependent draft-width
+histories and differs even in the original build, so cross-mode adaptive exact-token parity
+is not claimed.
+
+Standalone T1 race checking passes 2,085 workgroups with zero hazards; the staged GDN fold/record
+qualifier passes 168,384 workgroups with zero hazards. The persistent checker no longer reports
+the phase-publication read. It still reports shared-memory hazards across the scheduler's atomic
+wave-group barriers, which that checker explicitly does not model. Those barriers were reviewed
+against their release/acquire protocol, and exact lowering/graph replay passes; the whole
+persistent race-check run is **limited**, not a clean sanitizer pass. No suppression or weakened
+checker was added. Final persistent resources remain 238 VGPRs, 100 SGPRs, 22,504 LDS bytes,
+and zero private scratch/spills.
+
+Long-context attention retained its existing physical layout and consumer. A full BF16 K-page
+staging candidate slows C1/P65536/K7 decode by 5.55%; a double-buffered raw-FP8 K-page candidate
+slows it by 4.60% and C6/P8192/K7 by 2.86%. Both passed the independent FP64 oracle and exact
+model tokens, but are rejected on whole-decode timing. A 16-token physical K tile keeps the
+original arithmetic and LDS footprint; nine balanced event pairs at 64K show ratios 0.97784
+for T1 and 0.99583 for T8. The latter is only 0.42% of the attention operator, below a material
+whole-round gain for the DFlash bottleneck, so the format change is rejected. No alternate
+cache format or candidate dispatch remains in production. The attention qualifier now accepts
+`--long-context 65536` for direct T1/T8 FP64, fragmented-page, publication and graph checks.
+
+**Unresolved latency spike:** repeated 512+1536-token runs reproduce roughly 0.6–0.9-second
+rounds. KFD traces align these with `EVICT_USERPTR` intervals and repeated restore retries,
+while individual traced kernels remain below 2.4 ms. Spin waiting does not remove the pause.
+The profiler inserts registered system-memory queue rings, so memory-policy decisions were
+also checked without profiler interception: corrected production defaults reach 745/708 ms,
+`HSA_USE_SVM=0` reaches 758 ms, and combined legacy/GTT settings with ordinary-RAM I/O staging
+still reach 168 and 428 ms. The I/O-staging control reaches 896 ms. Tokens remain exact. No
+allocator, I/O staging, synchronization-policy or environment-setting challenger is retained.
+These results do not establish a qualified production mitigation or the specific invalidation
+caller. Further diagnosis needs privileged kernel caller-stack tracing: `perf_event_paranoid=4`,
+root-only tracefs permissions and unavailable passwordless sudo block that step here. The scoped
+`trace_userptr_root.sh` in the evidence directory is syntax-checked and ready for that follow-up;
+it has not been executed. It holds the GPU lease and cleans up its private trace instance and
+uniquely named probes without changing power, VM, driver or firmware policy.
+
+Commands, paired samples, numerical and resource evidence are retained under
+`profiles/bench/r9700-decode-fixes-20261016/`. Measurements use the same production artifact,
+fixed three-plane cache, physical PCI device and bulk graph environment as the initial profile,
+with `auto` checked before and after GPU work. No clock, voltage or power-policy changes were
+made. Temporary candidates and per-round timing diagnostics are not production code.
+
+### Bulk graph submission with host arguments (2026-10-16 UTC)
+
+Compose now selects `DEBUG_HIP_GRAPH_CLASSIC_PATH=0`, `ROC_ENABLE_LARGE_BAR=0`,
+`ROC_SKIP_KERNEL_ARG_COPY=0`, `HSA_DISABLE_FRAGMENT_ALLOCATOR=1`, and
+`DEBUG_HIP_GRAPH_BATCH_SIZE=16384`. On HIP 7.15.26333 / ROCr 1.21 this places immutable
+executable arguments in pinned host memory while retaining cached AQL packet replay.
+It removes the classic path's per-node command creation without restoring its predecessor's
+large device argument pools. `ROC_ENABLE_LARGE_BAR=0` controls the runtime allocation policy;
+it does not change the card's BAR configuration. Shared fixed-address phase images remain intact.
+
+The checked-in `ninfer_r9700_graph_launch_bench` alternates two immutable graphs with distinct
+512-byte by-value payloads and an output pointer per node. An independent integer oracle checks
+initialization, capture, warmup and every repetition. Seven repetitions each submit 100 graphs,
+with synchronization outside each submission-thread CPU interval. The host is a Ryzen 9 7950X3D;
+GPU power policy is `auto`, with no simultaneous build or GPU workload.
+
+| Nodes per graph | Classic submission CPU, us | Bulk host-argument submission CPU, us | Reduction |
+|---:|---:|---:|---:|
+| 1 | 3.35 | 2.46 | 26.4% |
+| 1000 | 1024.34 | 14.61 | 98.6% |
+| 4096 | 4717.60 | 44.34 | 99.1% |
+
+These are median calling-thread CPU times, not GPU execution time or token throughput.
+Synchronized wall time for 1000 nodes was 3825.81 versus 3696.64 us; for 4096 nodes it was
+15001.6 versus 14964.9 us. Both include synchronization. The largest observed model graph has
+1020 nodes, including 1008 kernel nodes. Packet batch caps 256/1024/4096/16384 passed the same
+exact oracle. The selected cap, 16384, won at 4096 nodes; 1024 was slightly faster at 1000 nodes
+(13.51 versus 14.61 us). This does not establish a unique winner at every graph size. Direct doorbell and alternate
+kernel-argument memory controls gave no reliable additional benefit in pinned-core forward/reverse
+controls and retain their defaults. This is a measured reduction, not a claim of zero remaining
+runtime overhead.
+
+Normal argument copying is required. `ROC_SKIP_KERNEL_ARG_COPY=1` failed the 4096-node oracle
+and also produced a launch failure in a subsequent check; the normal-copy route passed at all
+three sizes with both host and device argument pools. The selected mode also passed all 19
+persistent-phase cases and exact graph/eager generated-token checks for ordinary, MTP and
+DFlash inference at C2. No kernel arithmetic or model precision changed.
+
+Raw scope-separated evidence is under `profiles/bench/r9700-graph-submit-20261016/qualified/`:
+`submission-matrix.json`, `submission-provenance.json`, `pinned-submission.json`,
+`phase-qual.json`, and `functional.json`. The provenance records the inherited normal-copy,
+host-argument environment as well as each matrix row's overrides.
+
+The production adaptive-K7 preset retains the measured C-specific GPU graph inventory:
+
+| C | Graph budget / observed, MiB | Shared KV tokens | Minimum physical/HIP free, MiB |
+|---:|---:|---:|---:|
+| 1 | 56 | 262144 | 9835.71 |
+| 2 | 56 | 524288 | 2970.71 |
+| 3 | 60 | 630144 | 73.90 |
+| 4 | 60 | 622016 | 71.28 |
+| 5 | 62 | 613952 | 68.13 |
+| 6 | 62 | 605824 | 66.98 |
+| 7 | 62 | 597696 | 66.19 |
+| 8 | 62 | 589568 | 65.77 |
+
+All C1..8 cells exercise startup, fresh-Engine SSD restore with an exact cold-token check,
+and short/repeated requests, with all C lanes decode-ready. C6 and C8 additionally run near
+capacity at 100352 and 71680 prompt tokens per lane respectively. The minimum is sampled every
+50 ms and checked at synchronized phase boundaries; it is not a proof against unsampled
+external allocations. The 64-MiB external headroom remains physically available. These are
+instrumented memory checks, not throughput measurements. `physical-manifest.json` records the
+commands, actual graph bytes, resolved KV and observed driver growth. The fixed startup inventory
+guard remains mandatory. Host argument pools consume pinned host RAM rather than device VRAM.
+
+Uninstrumented whole-model comparisons use fixed DFlash K7, optimized proposal head, P2048,
+max context 262144, an 8192-token prompt, one warmup and three repetitions. Isolated decode measures
+256 post-prefill decode tokens per lane; whole inference includes the first prefill token plus
+128 decode tokens per lane. Both policies use
+automatic KV sizing. Every generated greedy token matches across policies at C1 and C6.
+
+| Workload | Previous classic | Bulk host arguments | Change |
+|---|---:|---:|---:|
+| C1 isolated decode tok/s | 192.368 | 192.404 | +0.02% |
+| C1 whole output tok/s | 39.275 | 39.267 | -0.02% |
+| C6 isolated decode tok/s | 661.820 | 668.690 | +1.04% |
+| C6 whole output tok/s | 45.737 | 47.282 | +3.38% |
+
+C6 resolved KV capacities were 593856 / 593856 tokens (classic / bulk).
+
+`model-performance.json` and the individual reports retain throughput dispersion and commands.
+C6 whole-inference standard deviations were 1.621 / 0.019 tok/s (classic / bulk), so the
+observed +3.38% whole-inference difference does not establish a repeatable speedup by itself.
+This compares submission policies at fixed K; production adaptive length can change its draft
+schedule with timing, so unchanged adaptive runs need not produce identical continuations.
+The prior adaptive-repeatability limitation remains in force. These results establish the
+submission-CPU reduction and measured model behavior, not a universal minimum launch cost.
+
+A separate instrumented C6 fixed-K7 whole run (8192/128, max context 16384) measured
+CPU time strictly inside each real `hipGraphLaunch`, discarding the first two calls per
+executable. Across 32 / 32 retained calls (classic / bulk), weighted mean
+submission CPU was 767.89 / 25.89 us.
+These instrumented runs establish submission attribution, not throughput.
+`model-submit-profile.json` retains node counts, call counts and per-executable CPU ranges;
+the read-only interposer source is retained beside it.
+
+The rebuilt Compose container passed health, image/argument verification, greedy HTTP and default
+sampling checks. It resolved 605824 KV tokens with graph observed/budget 62/62 MiB, 67.07 MiB
+available after startup and 67.04 MiB physically free after requests. Host cgroup peak was
+18.29 GiB under the unchanged 24-GiB/no-swap limit. The container was then stopped and this
+session's GPU lease released; the queued owner immediately acquired it. `deployment.json` and
+`lock-released.json` record the checks and handoff.
+
+### Previous classic graph residency and CPU submission (2026-10-16 UTC)
+
+The following measurements describe the preceding classic-replay revision. Its memory results
+remain a historical control; the active Compose submission policy is described above.
+
+That revision selected `DEBUG_HIP_GRAPH_CLASSIC_PATH=1`, `ROC_SKIP_KERNEL_ARG_COPY=1`, and
+`HSA_DISABLE_FRAGMENT_ALLOCATOR=1` on the selected HIP 7.15.26333 / ROCr 1.21 runtime,
+with other driver controls at their defaults.
+The calibrated preset remains `R9700Fp8Lut4`, C1..8, max context 262144, prefill chunk 2048,
+adaptive DFlash K7, optimized proposal head, no Vision, RAM cache 8192 MiB and SSD cache 25600 MiB.
+
+Classic replay avoids the packet path's per-executable device argument pools. Direct argument
+capture uses runtime-owned argument storage and removes a redundant CPU copy. Persistent decode
+lowering also interns byte-identical run images into fixed-address 2-MiB arenas. Definitions
+retain those arenas after the startup index is destroyed. Their shared barrier words require the
+Engine's single ordered compute stream; replay adds no allocation, interning or graph update.
+
+The previous 74-MiB value was a C6 observation, not a universal graph bound. With shared images,
+the complete immutable inventory (65*C executables) exactly matches the following per-C graph
+allowances. The low table applies only to all three settings and the qualified production preset.
+The same preset without those settings retains the prior packet-path table as a conservative
+bound; it is not a newly minimized measurement of that path. Other presets and qualification
+builds use the full conservative inventory bound. Requalify when kernels, inventory or the HIP toolchain change.
+The observed-allocation startup guard remains mandatory.
+
+| C | Graph MiB, observed = budget | Late driver MiB, including SSD | Shared KV tokens | Long prompt qualification per lane | Minimum physical free MiB |
+|---|---:|---:|---:|---:|---:|
+| 1 | 56 | 8 | 262,144 | 65,536 | 9835.754 |
+| 2 | 56 | 8 | 524,288 | 65,536 | 2970.883 |
+| 3 | 60 | 6 | 630,144 | 65,536 | 74.203 |
+| 4 | 60 | 6 | 622,016 | 65,536 | 71.723 |
+| 5 | 62 | 4 | 613,952 | 65,536 | 68.695 |
+| 6 | 62 | 4 | 605,824 | 100,352 | 67.668 |
+| 7 | 62 | 4 | 597,696 | 65,536 | 67.016 |
+| 8 | 62 | 4 | 589,568 | 71,680 | 66.715 |
+
+All physical KV storage is allocated before the workload, and startup warms every captured
+B/K/target structural class at its largest frontier. The initial HIP-availability campaign
+restored an SSD prefix and ran 8K/long/8K prompts at every C, generating 129 tokens per lane.
+Long prompts used 64K at C1..5/C7 and near-capacity lengths at C6/C8, with all C lanes decode-ready.
+
+Deployment exposed a limitation of that counter: HIP reported 70 MiB available at startup,
+while physical free VRAM was about 16 MiB after HTTP smoke requests. Those readings occur at
+different times and do not establish the exact source of the gap. An isolated fresh-HIP process
+also showed a different counter relationship, so no fixed offset or exact driver cause is assumed.
+Sizing now waits for RAM-cache registration and uses the smaller of HIP availability and the
+matching PCI device's graphics-inclusive amdgpu total-minus-used counter. Startup availability
+uses the same query; the required sysfs counters must be readable.
+
+The table records corrected automatic capacities and physical runtime minima from a second,
+independent 50-ms sampler. Every C repeats startup, SSD restoration with its next greedy token
+exact against a cold run, and short requests. C6/C8 also repeat near-capacity long requests.
+The other long-prompt entries refer to the first campaign's larger physical pools; their graph,
+operator and lifetime qualification remains applicable at the reduced capacities. The late-driver
+column retains the HIP-measured growth used for its separate reservation. Capacity checks are
+instrumented and are not throughput evidence.
+
+The existing separate reservations remain valid: 2 MiB startup driver residency, the C-specific
+late driver values above, SSD device storage (54 MiB with DFlash), and a 4-MiB bound for physical
+arena rounding. None consumes the external 64-MiB headroom. At C6, graph allowance falls from
+1624 to 62 MiB and shared KV grows from the prior deployment's 548736 to 605824 tokens after the physical-availability correction.
+
+The exact-capacity C8 engine reproduced a workspace allocation failure with 442 MiB reported
+free. Allocating workspace first then reached an SSD staging allocation failure with 124 MiB
+reported free. Disabling ROCr's fragment allocator resolves the reproduced failures with the
+original allocation order and the same capacity; no ordering workaround or extra reserve is
+retained. The exact allocator failure mechanism is not established by this comparison.
+
+The unprofiled launch probe alternates two 1000-node integer graphs with a 512-byte payload plus
+an output pointer per node. Five repetitions retain exact output and zero late VRAM growth.
+Median submission-thread CPU time falls from 1049.80 to
+696.86 microseconds per graph (33.62% less).
+This is CPU submission work, not total process CPU or whole-model throughput.
+
+Separate uninstrumented model runs use one warmup and three repetitions, without concurrent
+compilation. The baseline also uses classic replay and disables ROCr's fragment allocator;
+the candidate adds direct argument capture. C1 fixes K7; C6 uses the deployed adaptive policy
+and automatic KV capacity. Controlled C1 and C6 fixed-K7 runs have exact greedy token parity;
+C6 fixed-K7 also checks that both policies resolve the same physical KV capacity. Adaptive C6 continuations are not
+exactly repeatable even within the unchanged baseline: both policies produce the same two observed
+129-token continuation variants across workloads, with the first divergent token at index 73. Their measured draft-length schedules
+differ, but the aggregate reports do not establish the causal transition. Adaptive results are
+throughput observations, not exact-token parity evidence. The table uses
+per-repetition medians; the raw reports retain means and deviations. One short C1 baseline
+repetition was slower, so its mean difference does not establish a speed gain.
+
+| Measurement | Classic median | Direct-argument median | Observed change |
+|---|---:|---:|---:|
+| C1 fixed K7 pp128+tg512, decode tok/s | 90.119 | 90.085 | -0.04% |
+| C1 fixed K7 pp8192+tg512, decode tok/s | 224.489 | 224.537 | +0.02% |
+| C6 adaptive max K7 8192/256, isolated decode tok/s | 653.468 | 620.092 | -5.11% |
+| C6 adaptive max K7 8192/128, whole output tok/s | 47.147 | 47.027 | -0.25% |
+| C6 fixed K7 8192/256, isolated decode tok/s | 665.719 | 661.953 | -0.57% |
+| C6 fixed K7 8192/128, whole output tok/s | 46.522 | 47.278 | +1.63% |
+
+The CPU saving does not imply an equal inference-speed gain. Report means, deviations, commands,
+exact-token checks, per-C memory evidence and primary runtime source references are retained in
+`profiles/bench/r9700-classic-launch-20261016/`. The 19-case exact graph transformation checks
+pass in packet and classic modes, real-artifact C2 graph/eager parity passes for ordinary/MTP/
+DFlash, planner checks cover complete and partial flag combinations, and independent review
+finds no ownership or synchronization blocker.
+
+### Packet-path VRAM baseline (2026-10-15)
+
+This historical control supplies the conservative packet-path bound retained after phase-image
+sharing. Compose now uses the qualified bulk host-argument configuration above. Availability and minimum-free
+figures in this historical control use HIP alone; they are not physical-headroom guarantees.
+
+The production `R9700Fp8Lut4` artifact was measured independently at every C1..8 on one
+gfx1201 R9700 with the selected `/opt/rocm/core-10.0` toolchain (HIP 7.15.26333),
+`max_context=262144`, prefill chunk 2048, adaptive DFlash K7, optimized proposal head, no
+Vision, 8-GiB RAM cache, 25-GiB SSD cache, and GPU power mode `auto`.
+
+The earlier startup-only calibration is superseded. Repeated `hipGraphExecUpdate` calls retain
+kernel-argument allocations on this HIP build: an independent two-graph, 1000-node reproducer
+measured 2/10/42/84/170 MiB retained after 1/8/32/64/128 updates, with exact buffer results.
+Thus the previous 42-MiB growth was NInfer-induced residency and was not a valid use of the
+64-MiB external headroom. An allowance based only on startup cannot bound that update path.
+
+Each B/K/context definition now owns an immutable executable: 65*C for this preset. Startup
+instantiates and uploads all of them, then warms the largest-frontier representative per
+family, exact B, captured K and target structural class. Serving directly selects the captured
+executable; it never updates, instantiates or uploads one. The measured graph reservation below
+has no arbitrary padding. Other selectors and qualification builds use the conservative full
+immutable-executable inventory bound; requalify the table after a graph/kernel/toolchain change.
+
+NInfer separately reserves 2 MiB of startup driver residency preceding graph preparation
+(the first synchronous HIP clear of DFlash's 8-byte completion flag),
+plus its measured lazy kernel-driver residency. The main-stream component
+is 6/6/4/4/2/2/2/2 MiB at C1..8; enabling SSD adds 2 MiB for the scatter kernel. These are
+NInfer-owned resources inside `B(M)`, in addition to the SSD's 52-MiB staging buffer and its
+2-MiB descriptor allocation bound. The existing 4-MiB bound covers physical allocation rounding
+of the runtime arenas. Neither physical rounding nor lazy driver resources consume external
+headroom. Physical allocation granularity is 2 MiB, so logical reservation bytes need not equal
+physical residency byte for byte.
+
+| C | Graph budget MiB | Late driver MiB, with SSD | Shared KV tokens | Long prompt per lane | Minimum observed free MiB |
+|---|---:|---:|---:|---:|---:|
+| 1 | 318 | 8 | 262,144 | 260,096 | 9676 |
+| 2 | 578 | 8 | 524,288 | 260,096 | 2554 |
+| 3 | 842 | 6 | 603,776 | 200,704 | 68 |
+| 4 | 1102 | 6 | 585,408 | 145,408 | 66 |
+| 5 | 1364 | 4 | 567,104 | 112,640 | 68 |
+| 6 | 1624 | 4 | 548,736 | 90,112 | 68 |
+| 7 | 1884 | 4 | 530,368 | 73,728 | 68 |
+| 8 | 2144 | 4 | 512,000 | 63,488 | 70 |
+
+For each C, a saved prefix was restored from SSD into a fresh Engine, and its next greedy token
+matched a cold run. The same Engine then ran an 8192-token prompt, a balanced long prompt near
+its shared physical capacity, and another 8192-token prompt. Every test generated 129 tokens
+per lane. Prefill-first scheduling held all C long requests decode-ready together; observed
+mapped pages covered at least all C prompts. The initial separate C1..8 checks used the
+container's mixed-forward `auto` scheduling. The explicit 2-MiB startup-driver correction was
+made after C1..4 long runs. C1..2 retained the same capped pools; C3..4 received a final
+startup/short-workload capacity recheck. Their long prompt lengths were unchanged and their
+observed mapped pages fit the final smaller pools. Their table minima are earlier long-run
+observations, conservative for those smaller pools, rather than new long-run measurements.
+No runtime graph updates or new executable instantiations occurred, and no measured cell
+consumed the 64-MiB external reserve. Allocation
+probes and periodic/boundary memory queries make these capacity checks ineligible as throughput
+measurements.
+
+At C6, the original 2418-MiB graph allowance becomes 1624 MiB. With corrected
+SSD storage and driver accounting, shared KV capacity is 548,736 tokens,
+28,928 above the original 519,808-token control. This replaces the invalid earlier claim of
+569,664 tokens. C1 and C2 reach the `C*max_context` ceiling, explaining their unused VRAM.
+
+The earlier instrument-free 1024-versus-2048 chunk sweep covered every C1..8 on the prior shared
+executable implementation, with 8192-token pure-prefill and whole-inference workloads, one
+warmup and three repetitions. C6 measured 3400.86 versus 3341.14 prefill tok/s and 47.405 versus
+47.267 whole output tok/s for 2048 versus 1024; C3 favored 1024. Those timing results remain
+under `profiles/bench/r9700-vram-qualification-20261015/`, but its startup-only capacity
+qualification is explicitly superseded. Chunk 2048 remains the deployed choice; the current
+exact graph calibration does not admit unmeasured chunk 1024.
+
+A separate uninstrumented C6 confirmation on the immutable executable implementation used
+the same 8192-token workloads, one warmup and three repetitions. Prefill measured 3395.44
+tok/s versus the earlier 3400.86 (-0.16%); whole output measured 47.435 versus 47.405 tok/s
+(+0.06%). These observed differences do not establish a throughput improvement or regression.
+The comparison is recorded in `performance-comparison.json` beside the capacity evidence.
+
+Five focused host planner/routing checks, SSD cache integration, and the immutable first-launch
+and 128-switch zero-growth GPU regression pass. Real-artifact C2 graph/eager checks retained
+exact greedy tokens for ordinary decoding and fixed-K7 DFlash. Changed-line static analysis and
+independent source/allocation review pass. Commands, environment, per-C memory observations,
+exact-token evidence and the consolidated qualification are under
+`profiles/bench/r9700-vram-runtime-budget-20261015/`.
+
+The rebuilt Compose service was also checked at C6: health, image identity, literal
+`--max-context 262144`, resolved 548,736-token capacity, greedy generation and default-temperature
+generation passed. It reported 1608 MiB graph residency against the 1624-MiB measured bound,
+with 88 MiB free at startup. The per-C bound retains the maximum observed qualification
+residency rather than subtracting this deployment's 16-MiB unused graph allowance.
+`deployment.json` records the live metrics and request checks.
+
 ### Sustained memory bound
 
 The native exact-device probe uses two 4 GiB buffers, 512 times larger than L2, and reports five

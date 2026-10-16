@@ -97,16 +97,46 @@ weights are resident:
 
 ```text
 B(M)   = persistent state + workspace + request transient + Device Graph allowance
+         + SSD restore device storage + physical allocation bounds
 B_min  = B(M_min)
 B_step = B(M_min+1) - B(M_min)
 M      = min(M_max, M_min + floor((F-R-B_min)/B_step))
 ```
 
-`F` is device memory available after weights and `R` is the configured sizing headroom
-(`--kv-capacity-headroom`, default 64 MiB). The Engine allocates no device memory after startup, so
-`R` only covers driver-side growth such as lazily allocated kernel scratch; raise it when a desktop
-or another process shares the GPU. Startup failures in automatic mode name the option. The same production layout builder supplies `B_min` and `B_step`; the
+`F` is device memory available after weights and completed RAM-cache registration: the smaller
+of HIP availability and physical VRAM total minus usage from the matching PCI device's amdgpu
+sysfs counters. Required physical counters must be readable; HIP alone can overstate the
+graphics-inclusive reserve. Startup availability uses the same query.
+`R` is the configured sizing headroom
+(`--kv-capacity-headroom`, default 64 MiB). `R` is exclusively for external GPU users and display
+activity. NInfer-owned storage and its lazy driver allocations belong in `B(M)`; the runtime
+reservation includes both. Raise `R` when a desktop or another process needs more memory.
+Startup failures in automatic mode name the option. The same production layout builder supplies `B_min` and `B_step`; the
 common resolver does not duplicate model dimensions or bytes-per-token formulas.
+
+Enabled SSD caching reserves its device restore window and per-pool scatter descriptors in
+`B(M)`. The production 16-reader window has 32 packed-page slots: G16 Text pages require 52 MiB
+of staging, plus a 2-MiB physical allocation bound for each scatter table (54 MiB with DFlash,
+56 MiB with MTP). Host file-alignment padding belongs only to the pinned host I/O window.
+This reservation is independent of physical KV page count and preserves the affine curve;
+it does not consume the external headroom.
+
+For the measured production `R9700Fp8Lut4` build at `S=262144`, adaptive DFlash K7 with
+the optimized proposal head, no Vision, and prefill chunk 2048, the target bounds the
+complete immutable Device Graph residency by its measured C1..8 inventory. This includes one
+executable for every captured profile and the lowered persistent decode definitions. Other startup
+selectors and qualification builds use the conservative immutable-executable inventory bound.
+The target separately reserves 2 MiB for startup driver residency and its measured C-specific
+lazy kernel-driver residency, including 2 MiB for the SSD scatter kernel when that tier is enabled.
+The low-residency calibration requires `DEBUG_HIP_GRAPH_CLASSIC_PATH=0`,
+`ROC_ENABLE_LARGE_BAR=0`, `ROC_SKIP_KERNEL_ARG_COPY=0`, and
+`HSA_DISABLE_FRAGMENT_ALLOCATOR=1`, as set by Compose. Immutable graph arguments reside in pinned
+host memory and cached packets replay in bulk; the same
+preset without those settings retains the conservative device-argument-pool reservation. Other presets use
+the full inventory bound. Byte-identical persistent phase images share fixed-address arenas;
+immutable executables and the startup residency guard remain in place. Startup rejects graph
+residency above the planned bound. See `docs/performance.md` for the measured cells and capacity
+qualification.
 
 The token embedding is materialized in pinned host memory, not in the device weights, so `F`
 includes its size (675,430,400 bytes for the production Q4G64 table). Persistent state includes
@@ -220,7 +250,7 @@ invalidates old reads and returns their IDs to the pool. Recycled storage is not
 new owner has written and published it.
 
 One sequence state owns independent Text and optional MTP allocations plus their publication
-objects. A retained state transfers ownership rather than sharing writable pages. The current
+objects. Ordinary reuse transfers retained ownership; disposable reads copy into independent pages. The current
 product does not implement page reference counts, copy-on-write fan-out, active offload, or shared
 writable prefixes.
 
@@ -318,8 +348,9 @@ A reusable bundle includes every state component needed to continue, not just Te
 - hidden/replay/checkpoint state; and
 - fixed DFlash cyclic state when that backend is active.
 
-The optional pinned-host tier is an exclusive FIFO of completed retained bundles not currently on
-a device lane. Capture is D2H on the copy stream and keeps source pages mapped until its event
+The optional pinned-host tier is a FIFO of completed images, with exclusive restore claims.
+Ordinary restore consumes the image; a disposable restore releases its claim and retains the
+original independently of the destination device lane. Capture is D2H on the copy stream and keeps source pages mapped until its event
 completes. Restore validates fixed codec and pool/state geometry before H2D, chooses a free
 lane/mapping, writes exact physical bytes, then orders compute after the copy event immediately
 before prefill. A later payload/checkpoint parse failure is fenced before the Program falls back
@@ -591,3 +622,21 @@ Currently tunable until the real-model gate:
 
 Changing page size, code semantics, scale type, pool grouping, page-ID model, publication ownership,
 or introducing another cache representation is an architecture change, not kernel tuning.
+
+## Disposable cache reads
+
+`ExecutionOptions.cache_write=false` forks a selected prefix into independent allocations and
+complete continuation state. It never shares writable pages, mutates source checkpoints, or
+consumes a RAM/disk original. Copy all three planes in their per-plane stored layouts, including
+partial final pages; preserve logical publication frontiers and initialize GDN, hidden state,
+position/media metadata and MTP/DFlash state at the selected frontier. Reader fences protect
+source allocations and images. A pending AMD GDN fold is materialized before copying current state.
+
+An ordinary original may migrate into a full-original RAM image before its GPU bundle is
+released, bypassing closed-turn rewrite cutting while keeping existing checkpoints. A disposable
+original cannot be offloaded. Disposable completion retains only coherent current state in VRAM;
+no future-reuse checkpoint, RAM or disk capture is created. Disposable retention precedes ordinary
+retention for lane replacement and page reclamation. A later writable continuation promotes its
+own resulting state. Cancellation drains destination readers; a committed original migration
+remains cached. The concurrent architecture defines preservation-feasible admission and failure
+classification.

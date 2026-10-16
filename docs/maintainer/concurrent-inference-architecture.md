@@ -339,10 +339,11 @@ lane 的 backing 中，但不再存在 active request control，也不计入 act
 - prefix identity 和 target-defined reusable checkpoints。
 
 `SequenceState` 不包含 stop/output/transport state，不拥有 batch row、round activations、logits、shared
-workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：retained state 不搬到另一 lane，planner 在
+workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：ordinary consuming reuse 留在同一 lane，planner 在
 所有 free lanes 中寻找可复用 continuation，选中后在同一 lane 建立新的 request control；需要 active
 capacity 时可以先驱逐其他 free lanes 上的 retained state。新 request 的 sampling、RNG、stop 和 output
-state 始终重新创建。
+state 始终重新创建。Disposable forks copy into an independently owned destination lane under
+the source-preserving transaction described in §6.4.
 
 Qwen3 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
 `[0,C)` 作为各 lane 的 current committed state；MTP 或 DFlash 引擎额外保留 slot `C` 作为 Engine-wide
@@ -353,6 +354,14 @@ GDN layers 的 convolution history 和 recurrent state。Rewrite checkpoint 本�
 启动时拥有一份 pinned host image（GDN slot image，DFlash 下加 cyclic local lane image）和一个 copy
 event；staging 不再持有该 generation 时，restore 在 compute stream 上等待该 event 后逐层 H2D。Decode round
 不在 `SequenceState` 中维护随 speculative position 变化的 state selector。
+
+The Program initializes the text and speculative backend pools' physical KV payload planes and
+every DFlash local K/V lane's complete padded payload once at startup, even when Device Graph capture
+is disabled. Tier images and disposable forks copy whole pages and complete fixed images; unused
+page tails and cyclic positions therefore contain defined bytes without extending valid frontiers
+or the live attention window. Block tables and unrelated arena storage are outside this initialization.
+The Program also initializes each complete ordinary, MTP, and DFlash decode egress frame once, so
+full-frame host transfers include defined inactive entries and padding.
 
 ### 4.4 Batch row
 
@@ -822,14 +831,16 @@ reuse frontier 之前且该位置没有快照，则本次保留合法 reuse 并�
 主动 full reset。只有 incoming prefix 不匹配任何完整 checkpoint 时才 full reset。
 
 一个 retained entry 同时只能被一个 active request 消费。多个 active requests 不共享同一份可写
-sequence state，也不使用 copy-on-write branching。Request-local RNG、sampling、stop、generation
+sequence state，也不使用 copy-on-write branching。`cache_write: false` uses independent copied state
+and a protected cache source as described below. Request-local RNG、sampling、stop、generation
 limit 和 output state 始终由新 request 创建。
 
 Retained state 占用实际 state-pool memory，但不占 active control slot，也不保留 future growth
 reservation。Active admission 优先；cache occupancy 阻塞原本可行的 request 前，先驱逐 free lanes 上的
 retained entries。VRAM retained physical state 仍留在原 lane，Planner 在 free lanes 中选择最大合法
-reuse，不在 GPU 上复制或迁移 page mapping。Equal reuse prefers a free lane with no retained
-bundle; among equal-reuse dirty free lanes it covers the least-recently-admitted retained chat
+reuse。Ordinary consuming hits do not copy or migrate GPU page mappings; disposable forks
+copy payloads into independently owned mappings. Equal reuse prefers a free lane with no retained
+bundle; among equal-reuse dirty free lanes disposable state precedes ordinary state, then it covers the least-recently-admitted retained chat
 (monotonic occupy tick assigned after the first non-throwing `advance_prefill` in
 `start_prefill_lane`), then lowest lane index. An
 optional host-RAM second tier snapshots a completed
@@ -841,6 +852,43 @@ satisfied.
 Prefix lookup 只改变 uncached prompt work 和 prospective reuse plan，不自行授予 queue priority。它可以保守地
 缩短 §5.5 的 service projection，但仍须通过相同 protected-head qualification；无论是否命中，最终 active
 request 都进入相同 prefill/decode schedule 和 compact batch formation。
+
+#### Disposable cache reads
+
+`ExecutionOptions.cache_write` defaults to true. False selects a source-preserving fork, with
+source identity and destination lane planned independently. Longest preservation-feasible reuse
+wins, with direct VRAM, RAM, and disk tie preference; full-original RAM preservation is attempted
+when direct VRAM admission cannot coexist with its source. Reclaim unrelated idle retention
+before giving up. An infeasible longer hit does not exclude a shorter feasible hit or preserving
+cold path. Active lanes keep ordinary FIFO/deadline/head-protection semantics.
+
+The family Program composes the selected current/checkpoint state into independent main/backend
+KV allocations, GDN state, hidden state, and DFlash cyclic state. Sampling and output control are
+request-local. Source mutation, page reclamation, and image/staging reuse wait through its readers;
+the single executor copy-hold owns initialization and cancellation. No page sharing or copy-on-write
+is used. The fork's durable disk association is cleared before execution.
+
+An ordinary original may be captured to RAM when its lane or pages must be freed. This capture
+bypasses preserve-off rewrite cutting and preserves the complete original resume frontier plus
+existing checkpoints. Before eviction, failed/deferred admission can release the source claim and
+roll back that capture; after eviction, the saved original is committed and cancellation cannot
+remove its only image. A fork releases successful RAM restores instead of consuming them and
+keeps RAM-to-disk bookkeeping intact. Disk restore completion keeps the inclusive durable entry.
+A disposable original cannot be offloaded. Permanently impossible preservation on an idle Engine
+returns a request-local overload; temporary active/copy/reclaim pressure queues and replans.
+
+False requests suppress future-reuse captures while retaining required execution transaction
+state. Their valid terminal state carries disposable retention. Empty eligible lanes are preferred;
+among retained victims disposable state precedes ordinary state, then admission recency and lane
+index decide. Apply the same order to destination replacement and shared-page reclamation.
+All capture entry points and both shutdown passes reject disposable persistence. A later true
+continuation sets ordinary retention for its resulting state.
+
+Restore failure disposition distinguishes invalid source, stale plan, and destination resource
+failure. Only invalid source discards/quarantines the entry. Stale disk generation/claim races
+release pins and replan; destination resource failures keep a healthy source and can cold-prefill.
+Device-integrity failures remain Engine-wide. Request logs carry the write flag; saving an original
+is billed to its triggering request, without counting it as a disposable checkpoint capture.
 
 ### 6.5 Host RAM second tier
 
@@ -892,19 +940,19 @@ further disk restore work and records a fence on the copy stream behind the copi
 the hold stays parked while DecodeRounds continue, and the drain below runs once
 `copy_hold_cancel_settled` (or membership is empty), so it no longer waits on in-flight SSD reads.
 A shutdown with such a hold parked finishes it as cancelled.
-A `CacheRestoreFailure` before prefill consumes the prompt parks the hold the same way; once it
-settles, best-effort cleanup releases the claims and drops the failed RAM/disk entry, then a retry
-cold-prefills its lane and a new request re-enters FIFO admission as a cold fallback. Any other
-request-local failure (`RequestError`, or a `CacheRestoreFailure` after prefill starts) of an
-admission, copy-hold, or generation-recovery retry drains and fails only that request (a drain
-after any `CacheRestoreFailure`, or of a cancelled failed hold, also drops the failed entry);
-other exceptions remain Engine-fatal.
+A `CacheRestoreFailure` before prefill consumes the prompt parks the hold the same way. Once it
+settles, cleanup releases the claims. An invalid source is discarded and the request falls back
+to cold prefill; a stale plan preserves the source and replans admission; an unavailable destination
+preserves the source and falls back to cold prefill. Generation recovery keeps its lane and output
+while restoring or cold-prefilling the retry. It refreshes a stale host lookup once, then cold-prefills
+if that refreshed restore is also stale. Other request-local failures drain and fail only the
+request; other exceptions remain Engine-fatal.
 If the held request is cancelled or fails before admit-complete, drain waits for those copies,
-harvests, releases unused RAM/disk claims (after a `CacheRestoreFailure` it also drops the failed
-entry, as above), and calls `evict_retained_lane` on every selected victim not yet evicted; a
-failed restore's fallback evicts them the same way.
+harvests, releases unused RAM/disk claims, discards only sources classified invalid, and calls
+`evict_retained_lane` on every selected victim not yet evicted. A failed restore releases those
+victims the same way.
 If capture succeeded, the completed D2H image is the only remaining copy. A later RAM hit
-exclusive-claims the matching host entry (pinned entries are invisible to later `plan_match`). `capture` and `unpack` record a start HIP event before the copies and a done event
+claims the matching host entry (pinned entries are invisible to later `plan_match`). `capture` and `unpack` record a start HIP event before the copies and a done event
 after them so other-lane decode can overlap the DMA. The pinned rewrite-checkpoint and ladder
 images (GDN conv/recurrent, about 150 MB per image, plus DFlash cyclic) copy host-to-host through
 `enqueue_host_copies`, a stream-ordered `hipLaunchHostFunc` callback in 4 MiB chunks, because
@@ -913,7 +961,7 @@ fence is stream-waited before and re-recorded after those copies; disk restore d
 its state stream. A RAM restore's installed ladder heads copy out of the entry on that host-copy
 stream behind only their own fences: no stream joins them and the entry's copy fence, which gates
 the lane's first prefill chunk, excludes them; a separate block fence keeps the entry's block
-allocated until they land. Consume then erases that entry wherever it
+allocated until they land. Ordinary consume then erases that entry wherever it
 sits in the FIFO and retires the host block, including after an incomplete first chunk; a throw
 before consume releases the claim and leaves the host row in place. After consume the bundle lives
 only in VRAM until a later spill recaptures it. Occupancy `used`/`entries` (human `kv-ram=` / `n=`)
@@ -924,8 +972,8 @@ occupancy looks low.
 The planner picks the larger `reusable_prompt_tokens` between VRAM and RAM; equal reuse keeps
 VRAM. VRAM `FullReset` and RAM restore both prefer a free lane with no retained bundle and cover a
 dirty lane only when no empty lane is feasible. Among those equal-reuse dirty lanes, the victim is
-the least-recently-admitted retained bundle, then lowest lane index. Page-reclaim eviction of
-other free retained lanes uses the same recency order and never captures the selected lane twice.
+disposable before ordinary retention, then the least-recently-admitted bundle and lowest lane
+index. Page-reclaim eviction of other free retained lanes uses the same order and never captures the selected lane twice.
 The admitted `RequestPlan` is the winner: RAM pass 1 keeps `evict_retained=false` even if the
 target lane is dirty, and restore captures that lane's old bundle. `GenerationResult` uses
 `prefix_reuse_source` for `none` / `vram_resident` / `host_ram` / `host_disk`; `prefix_reuse_path` still describes
@@ -1113,7 +1161,7 @@ Resident Model Runtime 是 model-instance object，不是 request object。它�
 - 一份最大容量为 `C` 的 `DecodeBatchFrame`；
 - speculative backend 启用时，一份容量为 `C` 的 all-layer ReplaySSM record arena；其固定宽度为 MTP 的
   `draft_window+1` 或 DFlash 的 resolved `dflash_verify_width`；
-- startup-captured graph definitions 和 topology executables。
+- startup-captured graph definitions 和 immutable profile executables。
 
 每个 request 的持久状态只存在于 slot control 和该 slot 当前拥有的 `SequenceState`。Model Runtime 不保存
 “current request”，也不为每个 slot 复制 workspace、round buffers 或 graph assets。
@@ -1395,25 +1443,17 @@ DFlash 不保留单独的 `B=1` concurrency route。
 shared frame、workspace 和 state-pool bases。它读取 typed controls 和 selectors，不读取 request/slot
 identity。
 
-Captured definition 和 replayable executable 不是一一对应。Exact `B` and, when adaptive drafting is
-enabled, captured K are structural keys. Within that pair, only genuinely different node topology
-requires another executable:
+Each reachable exact `B`, captured K and context profile owns one immutable executable:
 
 ```text
-exact definitions[family,B,K,profile]
-          │ exact B + target-declared profile topology class
-          ▼
-executable[family,B,K,topology class]
+Definition[family,B,K,profile] -> Executable[family,B,K,profile]
 ```
 
-不同 context profiles 若在同一 exact `B` 下具有可更新的 node topology，共享一个 executable，并在 profile
-变化时安装选中的 definition。不同 `B` 不执行 cross-B graph update；这避免 batch-dependent operator route、
-kernel 参数和 launch shape 触发 `hipGraphExecUpdate` 不兼容。资源数量因此是 exact `B` 的有限集合，而不是
-`B × context profile` 的完整笛卡尔积。
-
-Profile 在 capture 前按 configured context ceiling 截断，只有实际 reachable 的 topology classes 才实例化
-executable。Backend-specific proposal shape 只有在真实改变 Device Graph node topology 时才形成每个 exact `B`
-下的 topology class，不生成 ordinary-tail 或额外 `B=1` compatibility graph。
+Definitions keep their rewritten device storage alive for their executable's lifetime.
+The finite profile inventory is clipped to the configured context ceiling before capture.
+There is no executable update or shared installed-profile state: repeated HIP executable
+updates retain kernel-argument allocations and cannot be assigned a finite runtime budget.
+Different request identities still use the same immutable executable for the same B/K/profile.
 
 Startup 对 graph family 的准备顺序固定为：
 
@@ -1428,15 +1468,15 @@ workspace extent remains separate from this finite descriptor inventory.
    library runtime 在 stream capture 前完成 lazy materialization；
 2. 捕获全部 exact-`B`/profile definitions。Capture 只记录 HIP work，不执行 model round，也不承担
    production 数值 qualification；
-3. 每个 topology executable 由其首个 definition 实例化。该 topology 的其余 definitions 逐个通过
-   `hipGraphExecUpdate` 验证兼容性，并通过 `hipGraphUpload` 完成 executable resource materialization；
-4. 每个 executable 只 replay 一次首个 definition 作为 startup smoke。遍历其余 profiles 后，以
-   update/upload 恢复首个 installed definition，不额外 replay。
+3. Instantiate and upload every profile's executable. For each family, exact batch, captured K
+   and target structural class, smoke-launch the profile with the largest frontier. Prepare its
+   frontier and synchronize before each launch. Structural class is startup warmup metadata;
+   executable ownership remains one per profile;
+4. Reset all mutated state and controls before exposing the Program. Capture's temporary repeated
+   private-page mappings remain valid through every smoke launch.
 
-因此 startup 不为每个 definition 执行 eager warm，也不把每个 profile 的 update 当成 real-model replay
-qualification。完整算子与 route correctness 由独立测试和 real-artifact integration route 负责；production
-startup 只验证 graph inventory、update compatibility、resource materialization 和每个 executable 的一次
-可执行性。
+Startup materializes the full immutable executable inventory. Smoke is a resource/lifetime check;
+independent operator tests and real-artifact integration remain the numerical authorities.
 
 ### 9.1a `B=1` persistent lowering
 
@@ -1447,11 +1487,14 @@ GDN front / pair-conv / record、Q/K norm-RoPE）替换为一个 persistent kern
 的 per-(sequence, head) re-tiled body，宽度 >8 时保持 kernel node）、原参数和 virtual block/grid indices 执行，phase 之间是 grid barrier；输出与原 kernel nodes bitwise 相同。其余 nodes
 （verify attention、drafter、sampling、copies）保持不变，graph 仍是单链。
 
-Lowering 返回的 program storage（phase records、captured arguments、barrier words）由
-`DecodeGraphDefinition` 持有，生命周期覆盖 graph 及由其 instantiate / update 的 executables；同一
-topology 的 definitions 降低为相同 node 序列，因此 `hipGraphExecUpdate` 照常适用。Memory plan 为每个
-lowered definition 计入固定 allowance。`B>1` definitions 不降低（lowered C4/C8 更慢），见
-`docs/performance.md`。
+Lowering interns byte-identical run images (phase records, captured arguments, and a grid-barrier
+word) in startup-owned, fixed-address 2-MiB arenas. Each `DecodeGraphDefinition` retains the arenas
+its nodes reference, keeping storage alive through its immutable executable's lifetime. The startup
+index and host copies disappear after preparation; replay performs no lookup or allocation.
+Shared images require the Engine's one ordered compute stream: kernels sharing a barrier word
+must never overlap. Uploads finish on the null stream before a nonblocking compute stream can
+consume them. `B>1` definitions retain individual kernel nodes (lowered C4/C8 was slower); see
+`docs/performance.md`.
 
 ### 9.2 Dynamic active set
 
@@ -1464,13 +1507,10 @@ active set 改变时，runtime 发布新的 frame ingress 并选择匹配的预�
 [B,C,D]   -> Definition[B=3]
 ```
 
-Runtime 先选择 exact-`B` executable；若它当前安装的是同一 `B` 的另一个 context-profile definition，先执行
-whole-graph update，再 replay 一次。`B` 改变时直接选择另一个预实例化 executable。Active identity 改变但
-`B/profile` 不变时只更新 typed data，不更新 executable。Graph 不按 request identity、slot subset 或 slot
-bitmask 建 key，join、leave 和 slot reuse 不触发 capture。
-
-Installed-definition state 只由 GPU Executor 修改；update 和 replay 位于同一串行 execution lane。并发 callers
-不能直接 launch 或更新同一个 executable。
+Runtime selects the already instantiated executable for the exact B/K/context profile and
+replays it once. Active identity changes only typed ingress data; no request, slot subset or
+bitmask enters the graph key. Only the GPU Executor launches executables. Serving never calls
+HIP graph instantiate, update or upload.
 
 Paged-KV allocation、Linear Attention state ownership 和 retained-state reuse 只改变 block-table content 或
 selector values。Graph 始终绑定 pool/table-matrix base，因此这些 ownership transitions 也不形成 graph
@@ -1521,42 +1561,19 @@ eager 与 captured replay 逐位相同；以 live frontier 执行会在 16K 以�
 不得为每个 `B`、profile 或 captured definition 复制 logits、hidden、workspace 或 per-sequence state。
 Model/control ingress、forward 和 result egress 不存在 per-row device submission；跨 page 时的 table
 publication 属于 state substrate materialization。Serving 期间不 capture、instantiate 或扩展 graph family。
-MTP graph memory on ROCm 10/gfx1201 includes retained allocations from executable updates,
-not just instantiated topology count. The startup planner reserves a calibrated 46 MiB
-family term and 4 MiB per instantiate/update operation. For a topology with D definitions,
-startup performs one instantiate and, when D > 1, D updates (install subsequent profiles,
-then restore the first). Adaptive K uses the full K-specific inventory. September 21
-selective-protected probes measured 58/92 MiB for K3/C1 and K5/C4 at 1K context, and
-84/148 MiB at native context; individual operations retained at most 4 MiB. These are
-toolchain-specific allocation bounds, not performance results or general HIP guarantees.
-The observed-allocation startup guard remains mandatory.
-
-Ordinary graph preparation also retains profile-update allocations. Its calibrated
-23 MiB family plus 24 MiB per executable covers up to three definitions per topology
-(the 1024-context calibration). For each additional definition in that exact-B
-topology, reserve another 4 MiB using the existing measured ROCm update bound. Startup
-installs all definitions and restores the first, so each extra definition adds one
-update without necessarily adding an executable. Context 4096 has four definitions;
-4224 has five: C1 allowances are 51 and 55 MiB respectively, while context1024 stays
-47 MiB. The deployed selective tiled profile measured 52 MiB of complete preparation
-at context4224/P4096/G128/chunk2048. This is aggregate toolchain-specific residency,
-not isolated graph-storage measurement or a universal HIP bound; the strict observed
-allocation guard is unchanged. Eager execution reserves no graph allowance.
-
-DFlash K4/K5's calibrated 48 MiB family plus 26 MiB per exact-B/K executable likewise
-covers three definitions per topology at context1024. Each additional definition in
-that same topology reserves 4 MiB for the retained executable update, using the measured
-ROCm operation bound above. The 2026-09-23 selective-cap Q4/FP8 companion at
-C1/K4/P4096/G128/chunk2048/context4240 consumed 75 MiB, exceeding the old 74 MiB;
-its five definitions require an 82 MiB allowance. Context1024 remains 74 MiB.
-This is aggregate graph-preparation residency, not a measurement of isolated FP8
-library allocations. Fixed-K1's separately calibrated executable terms are unchanged;
-adaptive families charge their actual folded exact-B/K/topology definition inventory.
-Do not add the deficit to KV capacity, logical workspaces, or FP8 arena-rounding bounds.
-The observed-consumption guard remains fail-closed, and eager execution reserves zero.
-
-Startup graph allowance 必须计入全部 reachable exact-`B` definitions，以及每个 exact `B`、每个实际
-topology class 的一份 executable，不能沿用只覆盖 `B=1` definitions 的 reservation。
+The startup reservation includes all reachable definitions, their owned lowered storage, and one
+immutable executable per definition. Uncalibrated selectors use a conservative family allowance plus
+the measured per-executable allocation bound. Production C1..8 uses a driver-policy-specific
+measured full-inventory reservation documented in `docs/performance.md`. The low-residency
+calibration requires all four settings: `DEBUG_HIP_GRAPH_CLASSIC_PATH=0`,
+`ROC_ENABLE_LARGE_BAR=0`, `ROC_SKIP_KERNEL_ARG_COPY=0`, and
+`HSA_DISABLE_FRAGMENT_ALLOCATOR=1`. Immutable arguments reside in pinned host memory; cached
+dispatch packets replay in bulk with `DEBUG_HIP_GRAPH_BATCH_SIZE=16384`. The same preset without those
+settings retains the conservative device-argument-pool bound; other presets use the full inventory bound.
+These HIP startup settings do not change the graph inventory or the mathematical execution schedule.
+The observed-allocation startup guard remains mandatory; eager execution reserves no graphs.
+NInfer-induced lazy driver resources belong in NInfer's reservation. The configurable KV headroom is
+reserved exclusively for external GPU users and display activity.
 
 Capture/smoke 使用的 temporary Paged-KV allocation 每个有效 row 只 materialize 一个 private physical
 page，并把该 page 重复发布到 temporary block-table row。准备一次 eager/smoke 时只清零 `[0,B)` 对应的
@@ -1654,8 +1671,12 @@ Deferred Fold：DFlash chain 行若提交 `committed > 0` 且非 terminal，`res
 tail 中 fold 它，而是在 `SequenceState` 记下 `(committed, record row)`；该 lane 的 GDN slot 暂停在 round
 base 之前的状态，ledger/KV/hidden 照常推进。下一 DFlash round 把这些行写入
 `DFlashDecodeIngress::gdn_fold`（按本轮 row，含旧 record row 与 slot），target verify 对每个 GDN 层先应用
-该层 Fold（FP8 front 内融合，其他路径用 `gdn_replay_fold_layer`），再写本轮该层 records，因此 arena
-覆盖仍在消费之后，结果与 all-layer Fold 逐位相同。不在下一 round 中的 lane、tree round，以及读取或捕获
+该层 Fold。Batched chain 在 aggregate tokens >32 时使用 `gdn_replay_prepare_layer` 先发布 convolution history，并把旧的
+committed K/V/gate prefix 保存到 caller workspace；front 可以覆盖旧 records，随后
+`gated_delta_net_replay_record` 在初次读取 FP32 state 时完成 Fold、发布 committed state，再执行
+本轮未接受的 recurrence，从而省去一次 state read。较小的 forward 和读取 recurrent state 的诊断 tap 保留
+FP8 front 内融合的 Fold，其他路径用 `gdn_replay_fold_layer`。两种方式都先消费再覆盖，结果与
+all-layer Fold 逐位相同。不在下一 round 中的 lane、tree round，以及读取或捕获
 lane 状态的 Program 入口（prefill、retain、capture/restore、score、shutdown）先用 all-layer Fold
 eagerly flush；`clear_lane` 丢弃未应用的 Fold。
 

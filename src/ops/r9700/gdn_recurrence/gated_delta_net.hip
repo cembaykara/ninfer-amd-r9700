@@ -1,5 +1,6 @@
 // Native wave32 implementation of the Qwen3.8 Gated DeltaNet recurrence Tensor boundary.
 #include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/ops/gdn_replay.h"
 #include "ninfer/types.h"
 
 #include "core/device.h"
@@ -426,7 +427,8 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    hipStream_t stream, const Tensor* parent_index,
-                                   WorkspaceArena* workspace, const CacheWarm& warm) {
+                                   WorkspaceArena* workspace, const CacheWarm& warm,
+                                   const GdnRecordFold* fold) {
     const Geometry geometry =
         validate_inputs(q, k, v, g, beta, scale, out, q.ne[3], kMaximumVerifyWidth);
     if (geometry.width < 2 || ssm_states.ne[3] < 1) {
@@ -461,12 +463,45 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                        &gate_record,
                                        &out};
     if (tree) { tensors.push_back(parent_index); }
+    if (fold != nullptr) {
+        const int previous_width = fold->key.ne[2];
+        if (tree || fold->rows == nullptr || previous_width < 2 ||
+            previous_width > kMaximumVerifyWidth)
+            throw std::invalid_argument("gated_delta_net replay: invalid staged fold");
+        require_tensor(fold->key, DType::BF16, {kDim, kQHeads, previous_width, geometry.batch},
+                       "previous key");
+        require_tensor(fold->value, DType::BF16,
+                       {kDim, kValueHeads, previous_width, geometry.batch}, "previous value");
+        require_tensor(fold->gate, DType::FP32, {2, kValueHeads, previous_width, geometry.batch},
+                       "previous gate");
+        tensors.insert(tensors.end(), {&fold->key, &fold->value, &fold->gate});
+    }
     disjoint(tensors);
     if (stream == nullptr) { throw std::invalid_argument("gated_delta_net: null stream"); }
     const unsigned record_ctas =
         static_cast<unsigned>(geometry.batch * kValueHeads * kOrdinaryRowTiles);
     const dim3 record_grid(record_ctas + cache_warm_ctas(warm, kOrdinaryBlock, record_ctas));
-    if (tree) {
+    if (fold != nullptr) {
+        const detail::gated_delta_net::fold::Planes previous{
+            static_cast<const hip_bfloat16*>(fold->key.data),
+            static_cast<const hip_bfloat16*>(fold->value.data),
+            static_cast<const float*>(fold->gate.data),
+            nullptr,
+            geometry.batch,
+            fold->key.ne[2]};
+        hipLaunchKernelGGL(
+            (fold_record_kernel<true>), record_grid, dim3(kOrdinaryBlock), 0, stream,
+            static_cast<const hip_bfloat16*>(q.data), static_cast<const hip_bfloat16*>(k.data),
+            static_cast<const hip_bfloat16*>(v.data), static_cast<const float*>(g.data),
+            static_cast<const float*>(beta.data), static_cast<const float*>(ssm_states.data),
+            empty(valid_columns) ? nullptr : static_cast<const std::int32_t*>(valid_columns.data),
+            static_cast<const std::int32_t*>(initial_state_slots.data),
+            static_cast<hip_bfloat16*>(key_record.data),
+            static_cast<hip_bfloat16*>(value_record.data), static_cast<float*>(gate_record.data),
+            static_cast<hip_bfloat16*>(out.data), geometry.width, ssm_states.ne[3], scale, warm,
+            record_ctas, previous,
+            reinterpret_cast<const detail::gated_delta_net::fold::DeferredRow*>(fold->rows));
+    } else if (tree) {
         auto scope              = workspace->scope();
         const std::size_t bytes = gated_delta_net_replay_record_workspace_capacity_bytes(
             kValueHeads, geometry.batch, geometry.width);

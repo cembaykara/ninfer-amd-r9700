@@ -132,7 +132,7 @@ routing map, not a mandatory reading list:
 
 ## Upstream synchronization
 
-Upstream `experimental` is reconciled through `d5c38cda2e875aad37f49889c1f03eda1540bf20`
+Upstream `experimental` is reconciled through `62687bd37f1dfb629384630ed8c07b5cc3ef9da1`
 via custom AMD ports, not merged ancestry.
 Unsupported NVIDIA paths were excluded; decisions are in `docs/maintainer/upstream-sync.md`.
 For future syncs, review upstream changes after this baseline against current AMD behavior,
@@ -267,15 +267,19 @@ Builds need no lock: one build per agent, at most 8 jobs (the CMake Ninja job po
 on memory/I/O pressure. This supersedes older shared-host rules.
 
 For source-only development, prefer incremental CMake/Ninja builds, with 8 jobs
-(the maximum). For Compose deployment, stop the server and run
-`bash scripts/hot-patch.sh --image-only`,
-then `docker compose up -d --no-build --wait server`. The helper retains build objects and
-updates the runtime image; run relevant tests separately. First-time builder setup may be slow.
-The helper automatically loads the trusted repo `.env` and exports its settings to the builder.
-Use full image builds for Dockerfile, toolchain or runtime dependency changes;
-`docker compose up -d --build` builds the image, not the incremental hot-patch path.
-The per-agent build cap above applies to the builder too; it has no memory limit;
-Compose's 24 GiB/no-swap limit applies only to the server. Host port defaults to 8001;
+(the maximum). For Compose deployment, run `docker compose up -d` (add `--wait`
+to wait for health). Keep `COMPOSE_BAKE=false` from `.env.example` in `.env` on
+the maintainer host so a changed image recreates its container. Compose builds
+before startup and reuses a locked BuildKit
+CMake/Ninja object cache for source edits; toolchain and build-dependency changes
+reset that cache automatically. The image contains the built binaries, independent
+of the cache. First-time builds or cache pruning require a full compile. Run
+relevant tests separately. To start the existing image without a build, use
+`docker compose up -d --no-build --pull never server`. Builds need no GPU lock and
+may overlap inference; reduce concurrency on memory/I/O pressure. The per-agent
+8-job cap applies to image builds too; the builder has no memory limit.
+Compose's 24 GiB/no-swap limit applies only to the server. The service joins the external
+`proxy` network at `ninfer-r9700:8080` with no published host port;
 disk prefixes persist under `/path/to/local/cache_r9700/prefix`.
 See `docs/containers.md` for setup and validation details.
 
