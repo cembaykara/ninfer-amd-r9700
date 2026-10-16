@@ -253,6 +253,10 @@ The production adaptive-K7 preset retains the measured C-specific GPU graph inve
 | 7 | 62 | 597696 | 66.19 |
 | 8 | 62 | 589568 | 65.77 |
 
+These capacities precede the physical-residual correction in the 2026-10-16 shared-GDN
+follow-up below; that correction supersedes the C6..8 capacity values while retaining this
+graph inventory.
+
 All C1..8 cells exercise startup, fresh-Engine SSD restore with an exact cold-token check,
 and short/repeated requests, with all C lanes decode-ready. C6 and C8 additionally run near
 capacity at 100352 and 71680 prompt tokens per lane respectively. The minimum is sampled every
@@ -357,9 +361,10 @@ operator and lifetime qualification remains applicable at the reduced capacities
 column retains the HIP-measured growth used for its separate reservation. Capacity checks are
 instrumented and are not throughput evidence.
 
-The existing separate reservations remain valid: 2 MiB startup driver residency, the C-specific
-late driver values above, SSD device storage (54 MiB with DFlash), and a 4-MiB bound for physical
-arena rounding. None consumes the external 64-MiB headroom. At C6, graph allowance falls from
+That qualification used separate reservations: 2 MiB startup driver residency, the C-specific
+late driver values above, SSD device storage (54 MiB with DFlash), and a 4-MiB arena allocation
+bound. The C6..8 main-stream allowances are superseded by the physical-residual correction below.
+None consumes the external 64-MiB headroom. At C6, graph allowance fell from
 1624 to 62 MiB and shared KV grows from the prior deployment's 548736 to 605824 tokens after the physical-availability correction.
 
 The exact-capacity C8 engine reproduced a workspace allocation failure with 442 MiB reported
@@ -429,12 +434,13 @@ immutable-executable inventory bound; requalify the table after a graph/kernel/t
 NInfer separately reserves 2 MiB of startup driver residency preceding graph preparation
 (the first synchronous HIP clear of DFlash's 8-byte completion flag),
 plus its measured lazy kernel-driver residency. The main-stream component
-is 6/6/4/4/2/2/2/2 MiB at C1..8; enabling SSD adds 2 MiB for the scatter kernel. These are
+was 6/6/4/4/2/2/2/2 MiB at C1..8; the 2026-10-16 shared-GDN follow-up below corrects the
+physical residual at C6..8. Enabling SSD adds 2 MiB for the scatter kernel. These are
 NInfer-owned resources inside `B(M)`, in addition to the SSD's 52-MiB staging buffer and its
 2-MiB descriptor allocation bound. The existing 4-MiB bound covers physical allocation rounding
 of the runtime arenas. Neither physical rounding nor lazy driver resources consume external
-headroom. Physical allocation granularity is 2 MiB, so logical reservation bytes need not equal
-physical residency byte for byte.
+headroom. HIP arena accounting rounds in 2-MiB units; physical-counter residency can differ,
+so logical reservation bytes need not equal physical residency byte for byte.
 
 | C | Graph budget MiB | Late driver MiB, with SSD | Shared KV tokens | Long prompt per lane | Minimum observed free MiB |
 |---|---:|---:|---:|---:|---:|
@@ -745,6 +751,57 @@ that phase-placement difference, so it does not establish a prefill-kernel regre
 All twelve repetitions per concurrency have exact generated-token parity; C6 speculative
 statistics also match exactly. Workspace capacity/allocator peak remain 265043968/256262144
 bytes, and automatic KV capacity is unchanged by this implementation.
+
+Residency admission also exposed a pre-existing physical-budget shortfall with RAM/SSD caching
+disabled. The incumbent and candidate both resolved C8 KV to 592448 tokens and fell to about
+61.6 MiB free, despite configured 64-MiB external headroom. A C1..8 startup plus 8192,8 adaptive
+whole-inference sweep and physical/HIP phase snapshots separated this from the GDN workspace.
+At C6/C7/C8, measured aggregate physical consumption beyond logical arenas and the HIP graph
+observation was 8.744/9.980/about 10.83 MiB versus an 8-MiB reservation. HIP allocation rounding
+and physical residency differ; the snapshots do not establish an exact driver-allocation cause.
+
+The main-stream runtime bound changes from 6/6/4/4/2/2/2/2 to 6/6/4/4/2/4/4/6 MiB at C1..8,
+retaining the separate 2-MiB startup component, 4-MiB allocation bound and 2-MiB SSD scatter
+component. The increases at C6/C7/C8 are the smallest 2-MiB driver-reservation steps covering the
+observed aggregate deficit. They apply independently of RAM-cache size; two cache configurations
+do not establish a safe RAM-dependent calibration. The 64-MiB external headroom and 56/56/60/60/
+62/62/62/62-MiB graph table are unchanged. The throughput A/B above predates this independent
+capacity correction; it isolates the GDN implementation at identical KV capacity.
+
+Corrected no-cache capacity and physical minima are below. C1..5 retain their measured sweep
+entries; C6..8 are rebuilt reruns after the correction. Every cell uses max context 262144,
+adaptive DFlash K7, optimized proposal head, P2048/mixed `auto`, no warmup and one 8192,8 whole
+request per lane. Physical free is sampled every 50 ms over the complete subprocess lifetime;
+these instrumented checks are not throughput measurements.
+
+| C | Shared KV tokens, no RAM/SSD cache | Minimum physical free MiB |
+|---:|---:|---:|
+| 1 | 262144 | 9904.613 |
+| 2 | 524288 | 2783.805 |
+| 3 | 632960 | 71.301 |
+| 4 | 624896 | 67.059 |
+| 5 | 616768 | 65.539 |
+| 6 | 608576 | 66.008 |
+| 7 | 600448 | 65.223 |
+| 8 | 592256 | 66.434 |
+
+The cache-enabled probe sets public Engine options to 8192 MiB RAM and 25600 MiB SSD, matching
+Compose. It is compiled from the current benchmark driver with only those Engine options
+changed; the stock benchmark has no cache-capacity CLI flags. Production C6 resolves 605760
+shared KV tokens, with 68.578 MiB minimum physical free; C8 resolves 589440 tokens with
+69.012 MiB minimum free. Both retain 62 MiB observed/budgeted graphs. All measured allocator
+peaks remain 256262144 bytes within 265043968 bytes of workspace. The corrected runtime planner
+and its explicit C1..8 reservation assertions pass. The C8 probe uses its own fresh cache
+directory: reusing C6's directory correctly rejects the different cyclic-lane fingerprint.
+These short physical-capacity reruns do not claim a new long-context throughput result.
+
+Integration after rebasing onto the upstream decode work through `2cbd438c` passes the ordinary
+GDN FP64 qualifier, deferred fold/record qualifier, runtime planner and explicit reservation
+assertions. Rebuilt no-cache C6/C8 adaptive 8192,8 runs retain 65.926/66.344 MiB minimum physical
+free with unchanged 608576/592256 shared KV tokens and 62-MiB graphs. The prefill A/B above
+remains evidence against its stated `6f069b6c` baseline; it does not measure the separate upstream
+decode improvements. Integration records are under `profiles/bench/r9700-prefill-followup-20261016/`
+and the `merged-adaptive-capacity-c6/c8` records in the original evidence directory.
 
 The dominant GEMM hypotheses were also tested against the independent FP64 oracle and whole
 C1 prefill. Moving weight decode/store earlier than stage 3 passed the oracle but increased
