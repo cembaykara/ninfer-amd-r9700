@@ -230,7 +230,7 @@ enum class DiskUnlockedIo : std::uint8_t {
     Count,
 };
 
-inline constexpr std::uint32_t kKvDiskRestoreIoThreads = 16;
+inline constexpr std::uint32_t kKvDiskRestoreIoThreads   = 16;
 inline constexpr std::uint32_t kKvDiskRestoreWindowSlots = 2;
 
 [[nodiscard]] inline std::uint32_t disk_restore_reader_count(std::uint32_t requested) {
@@ -238,19 +238,19 @@ inline constexpr std::uint32_t kKvDiskRestoreWindowSlots = 2;
 }
 
 [[nodiscard]] inline std::uint32_t disk_restore_window_slots(std::uint32_t requested,
-                                                           std::uint32_t readers) {
+                                                             std::uint32_t readers) {
     const auto slots = requested == 0 ? 2U : requested;
     return std::clamp(readers > 1 ? std::max(slots, 2U * readers) : slots, 2U, 64U);
 }
 
 // gfx1201 hipMalloc rounds each independent device allocation to at most 2 MiB.
 // Budget both the restore window and each pool's scatter descriptor allocation.
-[[nodiscard]] inline std::size_t
-disk_restore_device_reservation_bytes(std::size_t page_bytes, std::size_t text_planes,
-                                     std::size_t backend_planes) {
+[[nodiscard]] inline std::size_t disk_restore_device_reservation_bytes(std::size_t page_bytes,
+                                                                       std::size_t text_planes,
+                                                                       std::size_t backend_planes) {
     constexpr std::size_t unit = 2ULL * 1024ULL * 1024ULL;
     const auto physical = [](std::size_t bytes) { return (bytes + unit - 1U) / unit * unit; };
-    const auto slots = disk_restore_window_slots(
+    const auto slots    = disk_restore_window_slots(
         kKvDiskRestoreWindowSlots, disk_restore_reader_count(kKvDiskRestoreIoThreads));
     return physical(std::max<std::size_t>(page_bytes, 256U) * slots) +
            physical(text_planes * sizeof(PagedKVScatterPlane)) +
