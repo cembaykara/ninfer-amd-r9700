@@ -11,6 +11,8 @@
 
 namespace ninfer::ops {
 
+struct GdnRecordFold;
+
 /**
  * Applies the Gated DeltaNet recurrence independently for each value head h. Let
  * G=value_heads/qk_heads; its Q/K head is qh=floor(h/G). Starting from S_h, for t in increasing
@@ -86,9 +88,9 @@ void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
  * Op: gated_delta_net_replay_record
  *
  * Evaluates B independent normalized Gated DeltaNet recurrences from absolute state-pool slots
- * without modifying any state. q/k are BF16 [128,Hq,T,B], v/out are BF16 [128,Hv,T,B], g/beta
- * are FP32 [Hv,T,B], and ssm_states is FP32 [128,128,Hv,S]. The ReplaySSM execution domain is
- * B=1..8 and T=2..16, with Hq=16 and Hv=48. scale is 1/sqrt(128).
+ * without publishing the current unaccepted state. q/k are BF16 [128,Hq,T,B], v/out are BF16
+ * [128,Hv,T,B], g/beta are FP32 [Hv,T,B], and ssm_states is FP32 [128,128,Hv,S]. The ReplaySSM
+ * execution domain is B=1..8 and T=2..16, with Hq=16 and Hv=48. scale is 1/sqrt(128).
  *
  * valid_columns is empty for dense rows or device I32 [B], with every caller-supplied extent in
  * [1,T]. initial_state_slots is device I32 [B] containing absolute slots in [0,S). For each valid
@@ -103,7 +105,12 @@ void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
  * slot; every other valid column j has parent in [0,j). Packed order is not time. With a
  * workspace sized by gated_delta_net_replay_record_workspace_capacity_bytes(), parent states live
  * in HBM. Tree mode requires that caller-owned workspace; sequential record allocates no arena
- * workspace.
+ * workspace. With a non-null GdnRecordFold (sequential mode only), first replay its previous
+ * committed raw records into each selected FP32 state slot, publish that committed state, then
+ * compute the current round from it. The current round still does not publish unaccepted state.
+ * The staged records must be disjoint from all current inputs, state, records and output, and
+ * their slot selectors agree with initial_state_slots. Their normalization and FP32 transition
+ * are the same as gdn_replay_fold; convolution history was published by prepare_layer already.
  */
 [[nodiscard]] std::size_t
 gated_delta_net_replay_record_workspace_capacity_bytes(std::int32_t value_heads, std::int32_t batch,
@@ -115,6 +122,7 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    hipStream_t stream, const Tensor* parent_index = nullptr,
-                                   WorkspaceArena* workspace = nullptr, const CacheWarm& warm = {});
+                                   WorkspaceArena* workspace = nullptr, const CacheWarm& warm = {},
+                                   const GdnRecordFold* fold = nullptr);
 
 } // namespace ninfer::ops

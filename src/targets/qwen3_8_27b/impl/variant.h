@@ -590,6 +590,13 @@ struct Variant {
                                                   std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t attention_output_projection_workspace_capacity_bytes(
         WeightsProfile profile, qwen3::TextPhase phase, std::int32_t first, std::int32_t last);
+
+    // At <=32 aggregate tokens the front already hosts the deferred fold. Above that
+    // boundary, fold/record fusion removes a recurrent-state read on batched DFlash chains.
+    [[nodiscard]] static constexpr bool gdn_record_fold_selected(std::int32_t tokens) noexcept {
+        return tokens > 32;
+    }
+
     [[nodiscard]] static std::size_t
     gdn_input_projection_workspace_capacity_bytes(WeightsProfile profile, qwen3::TextPhase phase,
                                                   std::int32_t first, std::int32_t last);
@@ -654,6 +661,7 @@ struct Variant {
         constexpr std::array<std::size_t, 8> main_mib{6, 6, 4, 4, 2, 2, 2, 2};
         return (2U + main_mib[concurrency - 1U] + (disk_cache_enabled ? 2U : 0U)) << 20U;
     }
+
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window);
     [[nodiscard]] static std::vector<GraphExecutionProfile>

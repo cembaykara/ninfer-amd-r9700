@@ -164,7 +164,10 @@ separate device module or caller workspace for this route.
 the independent FP64 recurrence and ordinary snapshot updates. The canonical fold
 uses the production snapshot's key-normalization tree and eight-lane dot reduction;
 its six-token prefix and five-token path must publish bit-exact ordinary FP32 state,
-with exact convolution history and unchanged input records. Build that CMake target
+with exact convolution history and unchanged input records. The batched prepare/fold-record
+route also checks independent FP64 state and outputs at B2/W6 and B6,B8/W8, permuted
+record/state slots, independent current Q/K, zero through full committed prefixes, current valid-column masks,
+old-record overwrite safety, and repeated graph execution. Build that CMake target
 and run `build-r9700/src/ninfer_r9700_gdn_replay_fold_qual`. This admission uses the
 production `NINFER_R9700_GDN_VERIFY_WAVE_QK_CANDIDATE=0` profile; it does not admit the
 separate wave-QK experiment. Whole speculative-token qualification remains required.

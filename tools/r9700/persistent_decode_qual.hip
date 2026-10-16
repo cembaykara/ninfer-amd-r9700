@@ -888,10 +888,10 @@ int main(int argc, char** argv) {
         hipStream_t stream = nullptr;
         check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
         std::vector<Outcome> outcomes;
-        for (const unsigned T : {4U, 8U}) outcomes.push_back(attention_front(T, false, stream));
+        for (const unsigned T : {1U, 4U, 8U}) outcomes.push_back(attention_front(T, false, stream));
         outcomes.push_back(attention_front(8U, true, stream));
-        for (const unsigned T : {4U, 8U}) outcomes.push_back(attention_output_mlp(T, stream));
-        for (const unsigned T : {4U, 8U}) outcomes.push_back(projections(T, stream));
+        for (const unsigned T : {1U, 4U, 8U}) outcomes.push_back(attention_output_mlp(T, stream));
+        for (const unsigned T : {1U, 4U, 8U}) outcomes.push_back(projections(T, stream));
         for (const GdnCase& c :
              {GdnCase{4, false, 4, false, 0, 0, 0}, GdnCase{4, false, 4, false, 1, 1, 0},
               GdnCase{5, true, 3, false, 0, 0, 0}, GdnCase{6, false, 6, true, 1, 6, 0},
@@ -899,7 +899,7 @@ int main(int argc, char** argv) {
               GdnCase{7, false, 7, false, 2, 4, 0}, GdnCase{8, false, 8, false, 0, 0, 0},
               GdnCase{8, false, 8, false, 1, 7, 0}, GdnCase{8, true, 8, true, 2, 8, 2}})
             outcomes.push_back(gdn_layer(c, stream));
-        for (const unsigned T : {4U, 8U}) outcomes.push_back(rope_chain(T, stream));
+        for (const unsigned T : {1U, 4U, 8U}) outcomes.push_back(rope_chain(T, stream));
         check(hipStreamDestroy(stream), "stream destroy");
 
         const bool pass =

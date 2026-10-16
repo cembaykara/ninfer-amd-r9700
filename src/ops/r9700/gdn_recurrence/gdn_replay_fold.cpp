@@ -296,4 +296,30 @@ void gdn_replay_fold_layer(const GdnLayerFold& fold, hipStream_t stream) {
         detail::gated_delta_net::replay_fold_layer_args(fold), stream);
 }
 
+void gdn_replay_prepare_layer(const GdnLayerFold& fold, GdnRecordFold& staged, hipStream_t stream) {
+    const auto args          = detail::gated_delta_net::replay_fold_layer_args(fold);
+    constexpr const char* op = "gdn_replay_prepare_layer";
+    const auto width         = args.planes.width;
+    require_tensor(staged.key, DType::BF16, {128, 16, width, args.batch}, 256, op, "key staging");
+    require_tensor(staged.value, DType::BF16, {128, 48, width, args.batch}, 256, op,
+                   "value staging");
+    require_tensor(staged.gate, DType::FP32, {2, 48, width, args.batch}, 256, op, "gate staging");
+    const auto& records = *fold.records;
+    const std::array<MemoryRange, 9> ranges{
+        tensor_range(staged.key, op),    tensor_range(staged.value, op),
+        tensor_range(staged.gate, op),   tensor_range(records.key, op),
+        tensor_range(records.value, op), tensor_range(records.gate, op),
+        tensor_range(records.conv, op),  tensor_range(fold.recurrent, op),
+        tensor_range(fold.conv, op)};
+    require_pairwise_disjoint(ranges, "gdn_replay_prepare_layer: overlapping operands");
+    if (stream == nullptr) throw std::invalid_argument("gdn_replay_prepare_layer: null stream");
+    staged.rows = fold.rows;
+    detail::gated_delta_net::launch_replay_prepare_layer(
+        args,
+        {static_cast<const hip_bfloat16*>(staged.key.data),
+         static_cast<const hip_bfloat16*>(staged.value.data),
+         static_cast<const float*>(staged.gate.data), nullptr, args.batch, width},
+        stream);
+}
+
 } // namespace ninfer::ops

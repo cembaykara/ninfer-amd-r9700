@@ -37,7 +37,7 @@ constexpr std::size_t kArenaAlign = 256ULL;
 
 // Conservative bounds for uncalibrated startup selectors. Every captured profile
 // owns an immutable executable; runtime never instantiates or updates graphs.
-constexpr std::size_t kR9700GraphExecutableBytes = 4ULL * kMiB;
+constexpr std::size_t kR9700GraphExecutableBytes            = 4ULL * kMiB;
 constexpr std::size_t kR9700PersistentDecodeDefinitionBytes = 6ULL * kMiB;
 
 enum class GdnWorkspacePath : std::uint8_t {
@@ -334,6 +334,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         auto stage = layout.scope();
         (void)workspace_recipe::gdn_control<TextConfig>(layout, last);
         (void)workspace_recipe::gdn_projection<TextConfig>(layout, last);
+        if (path == GdnWorkspacePath::ReplayRecord && plan.features.dflash() && batch_size > 1 &&
+            !dflash_tree && Variant::gdn_record_fold_selected(last)) {
+            (void)workspace_recipe::gdn_record_fold<TextConfig>(layout, dflash_verify, batch_size);
+        }
         if (path == GdnWorkspacePath::Snapshot) {
             scratch(layout, Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                                 plan.weights_profile, phase, batch_size, min_width, max_width));
@@ -916,7 +920,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             schedule::VisionContext::output_transient_bytes(merged);
     }
     if (impl->use_device_graph) {
-        std::size_t definitions = 0;
+        std::size_t definitions         = 0;
         std::size_t lowered_definitions = 0;
         for (std::uint32_t batch = 1; batch <= impl->max_concurrency; ++batch) {
             const auto count_profiles = [&](const auto& profiles) {
@@ -940,16 +944,18 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         impl->graph_definition_count = definitions;
         impl->graph_executable_count = definitions;
         const std::size_t family_bytes =
-            (impl->speculative_backend == SpeculativeBackend::None ? 23U :
-             impl->speculative_backend == SpeculativeBackend::Mtp ? 46U : 48U) * kMiB;
-        impl->graph_allowance_bytes = checked_add(
-            checked_add(family_bytes,
-                        checked_mul(definitions, kR9700GraphExecutableBytes,
-                                    "immutable graph executable allowance"),
-                        "graph family allowance"),
-            checked_mul(lowered_definitions, kR9700PersistentDecodeDefinitionBytes,
-                        "persistent decode allowance"),
-            "graph allowance with persistent decode");
+            (impl->speculative_backend == SpeculativeBackend::None  ? 23U
+             : impl->speculative_backend == SpeculativeBackend::Mtp ? 46U
+                                                                    : 48U) *
+            kMiB;
+        impl->graph_allowance_bytes =
+            checked_add(checked_add(family_bytes,
+                                    checked_mul(definitions, kR9700GraphExecutableBytes,
+                                                "immutable graph executable allowance"),
+                                    "graph family allowance"),
+                        checked_mul(lowered_definitions, kR9700PersistentDecodeDefinitionBytes,
+                                    "persistent decode allowance"),
+                        "graph allowance with persistent decode");
         if (const auto calibrated = Variant::calibrated_dflash_graph_allowance_bytes(
                 impl->weights_profile, impl->features, impl->capacity, impl->max_concurrency,
                 impl->prefill_chunk, impl->draft_window, impl->adaptive_draft)) {
@@ -960,29 +966,28 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         checked_add(
             checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
             impl->request_transient_capacity_bytes, "request transient reservation"),
-        checked_add(
-            impl->graph_allowance_bytes,
-            checked_add(Variant::runtime_allocation_overhead_bound(impl->weights_profile),
-                        Variant::runtime_driver_reservation_bytes(
-                            impl->weights_profile, impl->max_concurrency,
-                            impl->kv_disk_capacity_bytes != 0U),
-                        "sequence driver and physical allocation bounds"),
-            "sequence physical allocation bound"),
+        checked_add(impl->graph_allowance_bytes,
+                    checked_add(Variant::runtime_allocation_overhead_bound(impl->weights_profile),
+                                Variant::runtime_driver_reservation_bytes(
+                                    impl->weights_profile, impl->max_concurrency,
+                                    impl->kv_disk_capacity_bytes != 0U),
+                                "sequence driver and physical allocation bounds"),
+                    "sequence physical allocation bound"),
         "sequence graph allowance");
     if (impl->kv_disk_capacity_bytes != 0) {
-        const auto& text = impl->persistent.decoder.text_kv.storage.storage;
-        const auto* backend = impl->persistent.decoder.mtp_kv
-                                  ? &impl->persistent.decoder.mtp_kv->storage.storage
-                                  : nullptr;
+        const auto& text                  = impl->persistent.decoder.text_kv.storage.storage;
+        const auto* backend               = impl->persistent.decoder.mtp_kv
+                                                ? &impl->persistent.decoder.mtp_kv->storage.storage
+                                                : nullptr;
         const std::size_t text_page_bytes = text.payload_bytes() / text.spec.page_group_count;
         const std::size_t backend_page_bytes =
             backend != nullptr ? backend->payload_bytes() / backend->spec.page_group_count : 0U;
-        impl->device_reservation_bytes = checked_add(
-            impl->device_reservation_bytes,
-            qwen3::detail::disk_restore_device_reservation_bytes(
-                std::max(text_page_bytes, backend_page_bytes), text.planes.size(),
-                backend != nullptr ? backend->planes.size() : 0U),
-            "KV disk restore device reservation");
+        impl->device_reservation_bytes =
+            checked_add(impl->device_reservation_bytes,
+                        qwen3::detail::disk_restore_device_reservation_bytes(
+                            std::max(text_page_bytes, backend_page_bytes), text.planes.size(),
+                            backend != nullptr ? backend->planes.size() : 0U),
+                        "KV disk restore device reservation");
     }
     return impl;
 }

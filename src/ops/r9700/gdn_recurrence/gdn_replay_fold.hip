@@ -47,6 +47,39 @@ struct FoldAccess {
     GdnReplayFoldKernelRows rows;
 };
 
+// One CTA per 128-channel block. Small immutable record staging and convolution publication
+// precede projection; the large recurrent state stays untouched until the record consumer.
+__global__ __launch_bounds__(128) void replay_prepare_layer_kernel(fold::LayerArgs args,
+                                                                   fold::Planes staged) {
+    constexpr int blocks_per_row = fold::kConvChannels / fold::kStateDim;
+    const int batch              = static_cast<int>(blockIdx.x) / blocks_per_row;
+    const int head               = static_cast<int>(blockIdx.x) % blocks_per_row;
+    const auto source            = args.rows[batch];
+    if (source.columns <= 0) return;
+    const fold::Row row{
+        .record_row = source.record_row, .slot = source.slot, .columns = source.columns};
+    const int tid = static_cast<int>(threadIdx.x);
+    // publish_conv_history maps (value_head,state_tile) to this channel block.
+    fold::publish_conv_history(args.planes, args.layer, row, args.conv_layer,
+                               head / fold::kStateTiles, head % fold::kStateTiles, tid);
+    if (head >= fold::kValueHeads) return;
+    for (int token = 0; token < source.columns; ++token) {
+        const auto input     = fold::record_column(args.planes, args.layer, row, token);
+        const auto output    = static_cast<std::int64_t>(batch) * staged.width + token;
+        const auto in_value  = (input * fold::kValueHeads + head) * fold::kStateDim + tid;
+        const auto out_value = (output * fold::kValueHeads + head) * fold::kStateDim + tid;
+        const_cast<hip_bfloat16*>(staged.value)[out_value] = args.planes.value[in_value];
+        if (head % 3 == 0) {
+            const auto in_key  = (input * fold::kQkHeads + head / 3) * fold::kStateDim + tid;
+            const auto out_key = (output * fold::kQkHeads + head / 3) * fold::kStateDim + tid;
+            const_cast<hip_bfloat16*>(staged.key)[out_key] = args.planes.key[in_key];
+        }
+        if (tid < 2)
+            const_cast<float*>(staged.gate)[(output * fold::kValueHeads + head) * 2 + tid] =
+                args.planes.gate[(input * fold::kValueHeads + head) * 2 + tid];
+    }
+}
+
 template <class Geometry>
 __global__ __launch_bounds__(kWaveSize* kWavesPerBlock,
                              2) void replay_fold_kernel(FoldAccess access) {
@@ -128,6 +161,15 @@ void launch_replay_fold_layer(const fold::LayerArgs& args, hipStream_t stream) {
         replay_fold_layer_kernel,
         dim3(static_cast<unsigned>(args.batch) * fold::layer_ctas_per_row(fold::kItemThreads)),
         dim3(fold::kItemThreads), 0, stream, args);
+    HIP_CHECK(hipGetLastError());
+}
+
+void launch_replay_prepare_layer(const fold::LayerArgs& args, const fold::Planes& staged,
+                                 hipStream_t stream) {
+    hipLaunchKernelGGL(
+        replay_prepare_layer_kernel,
+        dim3(static_cast<unsigned>(args.batch) * (fold::kConvChannels / fold::kStateDim)),
+        dim3(128), 0, stream, args, staged);
     HIP_CHECK(hipGetLastError());
 }
 

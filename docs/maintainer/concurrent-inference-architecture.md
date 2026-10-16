@@ -1671,8 +1671,12 @@ Deferred Fold：DFlash chain 行若提交 `committed > 0` 且非 terminal，`res
 tail 中 fold 它，而是在 `SequenceState` 记下 `(committed, record row)`；该 lane 的 GDN slot 暂停在 round
 base 之前的状态，ledger/KV/hidden 照常推进。下一 DFlash round 把这些行写入
 `DFlashDecodeIngress::gdn_fold`（按本轮 row，含旧 record row 与 slot），target verify 对每个 GDN 层先应用
-该层 Fold（FP8 front 内融合，其他路径用 `gdn_replay_fold_layer`），再写本轮该层 records，因此 arena
-覆盖仍在消费之后，结果与 all-layer Fold 逐位相同。不在下一 round 中的 lane、tree round，以及读取或捕获
+该层 Fold。Batched chain 在 aggregate tokens >32 时使用 `gdn_replay_prepare_layer` 先发布 convolution history，并把旧的
+committed K/V/gate prefix 保存到 caller workspace；front 可以覆盖旧 records，随后
+`gated_delta_net_replay_record` 在初次读取 FP32 state 时完成 Fold、发布 committed state，再执行
+本轮未接受的 recurrence，从而省去一次 state read。较小的 forward 和读取 recurrent state 的诊断 tap 保留
+FP8 front 内融合的 Fold，其他路径用 `gdn_replay_fold_layer`。两种方式都先消费再覆盖，结果与
+all-layer Fold 逐位相同。不在下一 round 中的 lane、tree round，以及读取或捕获
 lane 状态的 Program 入口（prefill、retain、capture/restore、score、shutdown）先用 all-layer Fold
 eagerly flush；`clear_lane` 丢弃未应用的 Fold。
 

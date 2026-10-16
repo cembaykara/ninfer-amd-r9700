@@ -7,6 +7,7 @@
 #include "core/layout.h"
 
 #include "ninfer/ops/grouped_dynamic_conv.h"
+#include "ninfer/ops/gdn_replay.h"
 
 #include <cstdint>
 
@@ -106,6 +107,15 @@ struct GdnProjectionRoots {
     Tensor key;
     Tensor value;
 };
+
+template <class Config, class Allocator>
+ops::GdnRecordFold gdn_record_fold(Allocator& allocator, std::int32_t width, std::int32_t batch) {
+    return {allocator.alloc(DType::BF16,
+                            {Config::gdn_key_head_dim, Config::gdn_key_heads, width, batch}),
+            allocator.alloc(DType::BF16,
+                            {Config::gdn_value_head_dim, Config::gdn_value_heads, width, batch}),
+            allocator.alloc(DType::FP32, {2, Config::gdn_value_heads, width, batch}), nullptr};
+}
 
 template <class Config, class Allocator>
 GdnProjectionRoots gdn_projection(Allocator& allocator, std::int32_t tokens) {
