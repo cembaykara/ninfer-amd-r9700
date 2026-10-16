@@ -85,6 +85,11 @@ request together at C3, with the fixed production cache, Device Graphs, ordinary
 DFlash chain verification. It checks schema values, exact text, EOS, streaming/logprob attribution
 and a second cached-compilation pass. The frontend suite checks represented byte/escape syntax,
 Unicode lengths, special-token literals, reasoning transitions and speculative rollback.
+`ninfer_schema_grammar_test` checks finite JSON languages and next-token masks against explicit
+word sets, including both object orders. `ninfer_grammar_tokenizer_test` compares masks with
+byte-wise acceptance for duplicate, prefix-related, and Unicode token spellings. The token-grammar
+suite also checks shared-rule alternatives, recursive schemas, cache isolation and concurrent
+cold compilation with independent completed-call validators.
 
 ```bash
 flock --exclusive /ssdpool2nvme/local_llm/.ninfer-coordination/gpu.lock \

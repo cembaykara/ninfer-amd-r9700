@@ -271,6 +271,13 @@ struct DiskSnapshot {
     std::array<std::uint64_t, ninfer::kKvDiskDropReasonCount> drop_reasons{};
     double save_seconds = 0;
     double load_seconds = 0;
+    // Live disk work is independent of scheduler occupancy. Save time is the full elapsed
+    // lifetime of completed spills, not time spent blocking requests in an observer interval.
+    bool spill_active            = false;
+    bool compaction_active       = false;
+    bool restore_active          = false;
+    std::size_t pending_jobs     = 0;
+    double spill_elapsed_seconds = 0;
 };
 
 struct GpuPoolSnapshot {

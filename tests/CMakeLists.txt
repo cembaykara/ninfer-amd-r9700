@@ -114,6 +114,12 @@ ninfer_add_r9700_test(ninfer_qwen3_recovery_executor_test
   LIBRARIES ninfer_engine)
 target_compile_definitions(ninfer_qwen3_recovery_executor_test PRIVATE
   NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+ninfer_add_r9700_test(ninfer_schema_grammar_test
+  SOURCES targets/qwen3/test_schema_grammar.cpp
+  LIBRARIES ninfer_token_grammar)
+ninfer_add_r9700_test(ninfer_grammar_tokenizer_test
+  SOURCES targets/qwen3/test_grammar_tokenizer.cpp
+  LIBRARIES ninfer_token_grammar)
 ninfer_add_r9700_test(ninfer_token_grammar_test
   SOURCES targets/qwen3/test_token_grammar.cpp
   LIBRARIES ninfer_engine)
