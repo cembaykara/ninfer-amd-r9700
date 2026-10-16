@@ -350,6 +350,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                 plan.weights_profile, phase, first, last));
         }
         (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
+        if (path == GdnWorkspacePath::Prefill) {
+            scratch(layout, ops::gated_delta_net_workspace_capacity_bytes(last, true));
+        }
         if (path == GdnWorkspacePath::ReplayRecord) {
             if (dflash_tree) {
                 // Nested: gdn_mix scopes the fold alloc before gdn_normalized_output.

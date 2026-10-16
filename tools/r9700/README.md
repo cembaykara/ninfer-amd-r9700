@@ -1667,8 +1667,8 @@ won at T=2048 and T=4096, so production has one route rather than an unsupported
 seven-run selected medians at T=16/32/64/128 are 0.033244/0.054612/0.099263/0.188758 ms, reductions
 of 21.37/27.02/28.47/28.97 percent. The same public timing fixture records T=1 through T=4096.
 
-Normalized ordinary widths of 64 or more (except the T129 prefix-trace diagnostic) use the chunked
-(WY) route in `gdn_prefill_chunked.hip`, which needs no workspace: one workgroup per value head
+Normalized ordinary widths of 16 or more (except the T129 prefix-trace diagnostic) use the chunked
+(WY) route in `gdn_prefill_chunked.hip`: one workgroup per value head
 walks 64-token chunks, forming the strictly lower `A = beta_i exp(b_i - b_j) k_i.k_j`, FP32
 diagonal blocks of `(I + A)^-1`, `Z = beta (V - Gamma K S^T)`, the corrected values
 `V'_I = (I + A_II)^-1 (Z_I - sum_{J<I} A_IJ V'_J)`, `O = scale (Gamma q) S^T + (causal decayed
@@ -1677,15 +1677,37 @@ accumulation. Each wave keeps its 16 state rows as S^T WMMA accumulators, which 
 operand of the next chunk's products; a partial final chunk is masked. It replaces the former
 per-token staged recurrence (not bit-exact: FP16 operand rounding, about 5e-4 relative state error
 on long synthetic runs versus FP64, inside the Op's output/state criteria). The qualifier covers
-T=128/2048 and partial chunks at T=65 (in place), 100 and 2047, and times P2048 at about 0.87 ms
-versus 1.39 ms before.
+T=128/2048 and partial chunks at T=65 (in place), 100 and 2047. The initial chunk-route
+qualification timed P2048 at about 0.87 ms versus 1.39 ms before; the current shared-preparation
+measurements are below.
+
+For T >= 256, a chunk-parallel preparation kernel computes normalized FP16 keys, FP32 query
+normalization scales and FP32 QK/KK products once per Q/K head. Its three value heads share these
+state-independent products; per-head controls, FP16 A/P casts and the recurrent state updates
+remain in the recurrence. This preserves the existing arithmetic and cast boundaries. The Op
+requires explicit caller-owned `WorkspaceArena` storage sized by
+`gated_delta_net_workspace_capacity_bytes(T, normalize_qk)`; its scope rewinds on the ordered
+stream after enqueueing. T2048 requires 18.125 MiB transient storage. T16..255 uses the direct
+chunk route without transient storage. These keys are GDN projection scratch, not an attention
+KV-cache representation.
+
+The qualifier covers the preparation crossover at T255/256/257, partial T2047 and selected T2048
+in-place/distinct state, as well as the existing ordinary/snapshot/replay cases. The preparation
+kernel uses 51 VGPRs, 17408 bytes LDS and zero scratch. The prepared recurrence uses 256 VGPRs,
+58880 bytes LDS and 12 bytes scratch; the direct chunk specialization uses the same LDS and
+8 bytes scratch. Read these resources from the executed qualifier's embedded code object; the
+`gdn-recurrence-resources` Make target below reports the separate non-chunked kernels.
 
 Build and run with `make -C tools/r9700 build/gdn_recurrence_qual`. Compiler metadata reports the
-selected normalized ordinary kernel at 56 VGPR, 1040 bytes LDS, zero private scratch, and occupancy
+non-chunked ordinary kernel at 56 VGPR, 1040 bytes LDS, zero private scratch, and occupancy
 16; snapshot/tree remain at 58/66 VGPR and at most 1536 bytes LDS. Reproduce with
-`make -C tools/r9700 gdn-recurrence-resources`. The oracle passes with maximum BF16-output absolute
-error 7.63e-6, relative L2 error 0.001798, and FP32-state absolute error 8.42e-9. Unprofiled event
-timing was decisive, so no unavailable or intercepting PMU counter was used for selection.
+`make -C tools/r9700 gdn-recurrence-resources`. The complete public qualifier, including prepared
+chunks, passes with maximum BF16-output absolute error 1.11396e-5, relative L2 error 0.00186339,
+and FP32-state absolute error 1.52614e-5. Shared preparation reduces the public T1024/T2048
+operator screen by 6.51/4.52 percent; whole C1 prefill improves only 0.32 percent in the pooled
+median, while C6 whole inference is effectively neutral. No broad whole-inference speedup is
+claimed. The route passed gfx1201 racecheck, memcheck and initcheck. See the 2026-10-16 GDN
+follow-up in `docs/performance.md` for qualification, residency and rejected alternatives.
 
 `gdn_affine_chunk_qual` retains the rejected three-stage FP32 affine-chunk experiment for the
 ordinary normalized recurrence. It builds one dense transform and addition per value-head chunk,

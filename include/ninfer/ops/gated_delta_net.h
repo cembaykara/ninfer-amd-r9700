@@ -13,6 +13,11 @@ namespace ninfer::ops {
 
 struct GdnRecordFold;
 
+// Caller-owned transient capacity for an ordinary recurrence at this width. Zero means
+// the route uses no workspace; the caller may pass its existing nonempty arena unchanged.
+[[nodiscard]] std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t width,
+                                                                   bool normalize_qk);
+
 /**
  * Applies the Gated DeltaNet recurrence independently for each value head h. Let
  * G=value_heads/qk_heads; its Q/K head is qh=floor(h/G). Starting from S_h, for t in increasing
@@ -32,14 +37,15 @@ struct GdnRecordFold;
  * compared directly with that result; output storage rounding belongs to the Op's numerical
  * criterion, not the oracle. Recurrent implementations may apply the normalization directly;
  * private arithmetic is implementation-defined. Inputs and out do not overlap state or one
- * another. No transient storage is used. The ordinary form accepts T=1..262144; snapshot and
+ * another. Normalized ordinary prefill T>=256 uses caller-owned transient workspace.
+ * The ordinary form accepts T=1..262144; snapshot and
  * replay forms retain their fixed W=1..16 domain.
  *
  * This overload reads and writes the same `ssm_state`, publishing the state after all T tokens.
  */
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
-                     Tensor& out, hipStream_t stream);
+                     Tensor& out, WorkspaceArena& workspace, hipStream_t stream);
 
 /**
  * Distinct-state form of the same recurrence. `ssm_state_out` receives the final state;
@@ -48,7 +54,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
  */
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, const Tensor& ssm_state_in,
-                     Tensor& ssm_state_out, Tensor& out, hipStream_t stream);
+                     Tensor& ssm_state_out, Tensor& out, WorkspaceArena& workspace,
+                     hipStream_t stream);
 
 /**
  * Diagnostic ordinary recurrence form. In addition to the normal final state and output, writes
