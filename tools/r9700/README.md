@@ -1836,6 +1836,27 @@ measured 2.11/1.17 ms at the first two points. Maximum absolute oracle error was
 run the `ninfer_r9700_swa_qual` target in the R9700 CMake tree. Direct/partial/reduce use 32/32/8
 VGPR respectively, with no LDS or private scratch.
 
+## FP8 activation producers
+
+The FP8 activation producer follow-up retains packed BF16 rows across reduction for aligned
+ordinary T>=256 K5120/K17408, uses unsigned magnitude reduction for maximum/nonfinite status,
+and uses native paired E4M3 conversion in plain and fused encoders. The scale remains FP32
+`maximum / 448`; code/scale/status planes and public boundaries are unchanged. The new prefill
+kernels use 57/73 VGPRs, 40 bytes LDS and zero scratch/spills. Build the owning qualifier with
+`cmake --build build-r9700 --target ninfer_r9700_fp8_producers_qual -j8`, then run it under the
+shared GPU lease. It retains the independent FP64 producer oracle and adds exact independent
+E4M3FN code/scale/status checks, including zero/nonfinite rows, cache warming and both fixed
+widths at T255/256/257. The whole-inference comparison measured 0.96% less C1 8K-prefill wave
+latency and 0.64% less C6 fixed-K7 8K/128 whole-wave latency, with exact tokens, speculative
+statistics and unchanged KV capacity. See the FP8 follow-up in `docs/performance.md` for scope,
+commands, numerical evidence and the rejected MLP lookup rearrangement.
+
+The producer passes memcheck, initcheck and racecheck. Persistent decode passes its numerical
+qualifier, memcheck and initcheck; its release/acquire-atomic software group barriers are outside
+the LDS checker's model. The same race reports reproduce on the unchanged baseline, so do not
+report that persistent racecheck as passed. Final C6..8 no-cache and C6/C8 cache-enabled physical
+residency checks preserve the configured 64-MiB headroom and existing KV/graph budgets.
+
 ## Device checks
 
 `gpu_check/` holds the gfx1201 counterparts of compute-sanitizer memcheck, initcheck, and racecheck

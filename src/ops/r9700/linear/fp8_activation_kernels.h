@@ -121,10 +121,10 @@ quantize_activation_row(const Cta& cta, QuantizeShared& shared, std::uint32_t to
                 const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
 #pragma unroll
                 for (int w = 0; w < 4; ++w) {
+                    const float2 values{__uint_as_float(words[w] << 16) / token_scale,
+                                        __uint_as_float(words[w] & 0xffff0000U) / token_scale};
                     const std::uint32_t pair =
-                        static_cast<std::uint32_t>(encode(__uint_as_float(words[w] << 16))) |
-                        (static_cast<std::uint32_t>(encode(__uint_as_float(words[w] & 0xffff0000U)))
-                         << 8U);
+                        __hip_cvt_float2_to_fp8x2(values, __HIP_SATFINITE, __HIP_E4M3);
                     packed_codes[w / 2] |= pair << (16U * (w % 2));
                 }
             }
