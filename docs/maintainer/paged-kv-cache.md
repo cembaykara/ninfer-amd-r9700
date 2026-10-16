@@ -103,7 +103,11 @@ B_step = B(M_min+1) - B(M_min)
 M      = min(M_max, M_min + floor((F-R-B_min)/B_step))
 ```
 
-`F` is device memory available after weights and `R` is the configured sizing headroom
+`F` is device memory available after weights and completed RAM-cache registration: the smaller
+of HIP availability and physical VRAM total minus usage from the matching PCI device's amdgpu
+sysfs counters. Required physical counters must be readable; HIP alone can overstate the
+graphics-inclusive reserve. Startup availability uses the same query.
+`R` is the configured sizing headroom
 (`--kv-capacity-headroom`, default 64 MiB). `R` is exclusively for external GPU users and display
 activity. NInfer-owned storage and its lazy driver allocations belong in `B(M)`; the runtime
 reservation includes both. Raise `R` when a desktop or another process needs more memory.
