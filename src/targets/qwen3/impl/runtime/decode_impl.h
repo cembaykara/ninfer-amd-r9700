@@ -67,9 +67,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size) {
 } // namespace
 
 void capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
-                                   DecodeGraphDefinition& definition) {
+                                   DecodeGraphDefinition& definition,
+                                   ops::PersistentDecodeStorage& storage) {
     auto body = ordinary_batch_body(state, batch_size);
-    capture_graph(state, definition, batch_size, body);
+    capture_graph(state, definition, batch_size, storage, body);
 }
 
 void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,

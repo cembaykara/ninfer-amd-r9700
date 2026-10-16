@@ -32,6 +32,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -1867,8 +1869,7 @@ std::optional<std::size_t> Variant::calibrated_dflash_graph_allowance_bytes(
 #endif
     constexpr auto planes = qwen3::detail::kR9700TextKVPlaneLayouts;
     const bool qualified_build =
-        production_attention &&
-        qwen3::detail::kR9700TextKVValueGroup == 16 &&
+        production_attention && qwen3::detail::kR9700TextKVValueGroup == 16 &&
         planes.key == Fp8KInt4VPlaneLayout::TokenFastestHeadMajor &&
         planes.value == Fp8KInt4VPlaneLayout::FeatureFastestPageMajor &&
         planes.value_scale == Fp8KInt4VPlaneLayout::FeatureFastestPageMajor &&
@@ -1877,13 +1878,27 @@ std::optional<std::size_t> Variant::calibrated_dflash_graph_allowance_bytes(
         ops::r9700::linear::kQ4PrefillA4Families == 0U &&
         !ops::r9700::linear::kDFlashSmallTCandidateEnabled &&
         !ops::r9700::linear::kDFlashMlpDownT5CandidateEnabled &&
-        !ops::r9700::gdn_recurrence::kVerifyWaveQkCandidate &&
-        ops::r9700::kv::kFp8QkWmmaDecode && !ops::r9700::kv::kTextP129WmmaTailCandidate;
+        !ops::r9700::gdn_recurrence::kVerifyWaveQkCandidate && ops::r9700::kv::kFp8QkWmmaDecode &&
+        !ops::r9700::kv::kTextP129WmmaTailCandidate;
     if (!qualified_build || profile != WeightsProfile::R9700Fp8Lut4 || features.vision ||
         !features.dflash() || !features.optimized_proposal() || capacity != maximum_context ||
-        concurrency == 0U || concurrency > 8U ||
-        prefill_chunk != 2048U || draft_window != 7U || !adaptive_draft)
+        concurrency == 0U || concurrency > 8U || prefill_chunk != 2048U || draft_window != 7U ||
+        !adaptive_draft)
         return std::nullopt;
+
+    // These HIP settings avoid per-executable packet argument pools. Keep their measured
+    // inventory separate from the default packet path; it is not a general graph-size bound.
+    const auto enabled = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    };
+    if (enabled("DEBUG_HIP_GRAPH_CLASSIC_PATH") && enabled("ROC_SKIP_KERNEL_ARG_COPY") &&
+        enabled("HSA_DISABLE_FRAGMENT_ALLOCATOR")) {
+        // Shared run images and the complete C1..8 inventory on HIP 7.15.26333.
+        // profiles/bench/r9700-classic-launch-20261016/
+        constexpr std::array<std::size_t, 8> classic_graph_mib{56, 56, 60, 60, 62, 62, 62, 62};
+        return classic_graph_mib[concurrency - 1U] << 20U;
+    }
 
     // Complete immutable inventory, measured separately at every C on gfx1201.
     // profiles/bench/r9700-vram-runtime-budget-20261015/

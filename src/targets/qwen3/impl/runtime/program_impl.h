@@ -318,9 +318,7 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
                        other.topology_class == profile.topology_class &&
                        other.max_execution_frontier > profile.max_execution_frontier;
             });
-        if (has_larger_representative) {
-            continue;
-        }
+        if (has_larger_representative) { continue; }
         prepare(profile.min_execution_frontier, profile.batch_size, profile.draft_tokens);
         device.synchronize();
         profile.executable.launch(device.stream);
@@ -3602,6 +3600,7 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 void ProgramImplCore::prepare_graphs() {
     if (!use_device_graph) { return; }
     SequenceState& sequence = sequences[0];
+    ops::PersistentDecodeStorage persistent_storage;
 
     std::vector<PagedKVAllocation> text_capture_allocations;
     std::vector<PagedKVAllocation> mtp_capture_allocations;
@@ -3815,8 +3814,9 @@ void ProgramImplCore::prepare_graphs() {
                 *ordinary_host_ingress, *ordinary_host_egress, tail_hidden_store,
                 transactions.binding()};
             if (definition != nullptr) {
-                schedule::capture_ordinary_decode_batch(
-                    ordinary_state, static_cast<std::int32_t>(batch_size), *definition);
+                schedule::capture_ordinary_decode_batch(ordinary_state,
+                                                        static_cast<std::int32_t>(batch_size),
+                                                        *definition, persistent_storage);
                 transactions.close_captured();
                 return;
             }
@@ -3901,8 +3901,9 @@ void ProgramImplCore::prepare_graphs() {
                     tail_hidden_store,          text_transactions.binding(),
                     mtp_transactions.binding(), token_masks.get()};
                 if (definition != nullptr) {
-                    schedule::capture_mtp_decode_batch(
-                        mtp_state, static_cast<std::int32_t>(batch_size), k, *definition);
+                    schedule::capture_mtp_decode_batch(mtp_state,
+                                                       static_cast<std::int32_t>(batch_size), k,
+                                                       *definition, persistent_storage);
                     text_transactions.close_captured();
                     mtp_transactions.close_captured();
                     return;
@@ -3983,9 +3984,9 @@ void ProgramImplCore::prepare_graphs() {
                     calibrates_p_less_drafts()};
                 const schedule::DFlashEnvelopes envelopes = dflash_envelopes(maximum_frontier);
                 if (definition != nullptr) {
-                    schedule::capture_dflash_decode_batch(dflash_state,
-                                                          static_cast<std::int32_t>(batch_size),
-                                                          fixed_k, fixed_w, envelopes, *definition);
+                    schedule::capture_dflash_decode_batch(
+                        dflash_state, static_cast<std::int32_t>(batch_size), fixed_k, fixed_w,
+                        envelopes, *definition, persistent_storage);
                     transactions.close_captured();
                     return;
                 }
@@ -4062,8 +4063,8 @@ void ProgramImplCore::prepare_graphs() {
         zero_dflash_local_cache(state.local);
         HIP_CHECK(hipMemsetAsync(state.prefill_features.data, 0, state.prefill_features.bytes(),
                                  device.stream));
-        HIP_CHECK(hipMemsetAsync(state.prefill_positions.data, 0,
-                                 state.prefill_positions.bytes(), device.stream));
+        HIP_CHECK(hipMemsetAsync(state.prefill_positions.data, 0, state.prefill_positions.bytes(),
+                                 device.stream));
         HIP_CHECK(hipMemsetAsync(state.pending_features.data, 0, state.pending_features.bytes(),
                                  device.stream));
     }

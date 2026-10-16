@@ -48,7 +48,110 @@ The latest accepted measurements use:
 The GPU must otherwise be idle. Timings use HIP events around the claimed physical work after
 warmup. Independent exact/FP64 oracles run before performance values are admitted.
 
-### Native-context VRAM capacity (2026-10-15)
+### Classic graph residency and CPU submission (2026-10-16 UTC)
+
+Compose selects `DEBUG_HIP_GRAPH_CLASSIC_PATH=1`, `ROC_SKIP_KERNEL_ARG_COPY=1`, and
+`HSA_DISABLE_FRAGMENT_ALLOCATOR=1` on the selected HIP 7.15.26333 / ROCr 1.21 runtime,
+with other driver controls at their defaults.
+The calibrated preset remains `R9700Fp8Lut4`, C1..8, max context 262144, prefill chunk 2048,
+adaptive DFlash K7, optimized proposal head, no Vision, RAM cache 8192 MiB and SSD cache 25600 MiB.
+
+Classic replay avoids the packet path's per-executable device argument pools. Direct argument
+capture uses runtime-owned argument storage and removes a redundant CPU copy. Persistent decode
+lowering also interns byte-identical run images into fixed-address 2-MiB arenas. Definitions
+retain those arenas after the startup index is destroyed. Their shared barrier words require the
+Engine's single ordered compute stream; replay adds no allocation, interning or graph update.
+
+The previous 74-MiB value was a C6 observation, not a universal graph bound. With shared images,
+the complete immutable inventory (65*C executables) exactly matches the following per-C graph
+allowances. The low table applies only to all three settings and the qualified production preset.
+The same preset without those settings retains the prior packet-path table as a conservative
+bound; it is not a newly minimized measurement of that path. Other presets and qualification
+builds use the full conservative inventory bound. Requalify when kernels, inventory or the HIP toolchain change.
+The observed-allocation startup guard remains mandatory.
+
+| C | Graph MiB, observed = budget | Late driver MiB, including SSD | Shared KV tokens | Long prompt qualification per lane | Minimum physical free MiB |
+|---|---:|---:|---:|---:|---:|
+| 1 | 56 | 8 | 262,144 | 65,536 | 9835.754 |
+| 2 | 56 | 8 | 524,288 | 65,536 | 2970.883 |
+| 3 | 60 | 6 | 630,144 | 65,536 | 74.203 |
+| 4 | 60 | 6 | 622,016 | 65,536 | 71.723 |
+| 5 | 62 | 4 | 613,952 | 65,536 | 68.695 |
+| 6 | 62 | 4 | 605,824 | 100,352 | 67.668 |
+| 7 | 62 | 4 | 597,696 | 65,536 | 67.016 |
+| 8 | 62 | 4 | 589,568 | 71,680 | 66.715 |
+
+All physical KV storage is allocated before the workload, and startup warms every captured
+B/K/target structural class at its largest frontier. The initial HIP-availability campaign
+restored an SSD prefix and ran 8K/long/8K prompts at every C, generating 129 tokens per lane.
+Long prompts used 64K at C1..5/C7 and near-capacity lengths at C6/C8, with all C lanes decode-ready.
+
+Deployment exposed a limitation of that counter: HIP reported 70 MiB available at startup,
+while physical free VRAM was about 16 MiB after HTTP smoke requests. Those readings occur at
+different times and do not establish the exact source of the gap. An isolated fresh-HIP process
+also showed a different counter relationship, so no fixed offset or exact driver cause is assumed.
+Sizing now waits for RAM-cache registration and uses the smaller of HIP availability and the
+matching PCI device's graphics-inclusive amdgpu total-minus-used counter. Startup availability
+uses the same query; the required sysfs counters must be readable.
+
+The table records corrected automatic capacities and physical runtime minima from a second,
+independent 50-ms sampler. Every C repeats startup, SSD restoration with its next greedy token
+exact against a cold run, and short requests. C6/C8 also repeat near-capacity long requests.
+The other long-prompt entries refer to the first campaign's larger physical pools; their graph,
+operator and lifetime qualification remains applicable at the reduced capacities. The late-driver
+column retains the HIP-measured growth used for its separate reservation. Capacity checks are
+instrumented and are not throughput evidence.
+
+The existing separate reservations remain valid: 2 MiB startup driver residency, the C-specific
+late driver values above, SSD device storage (54 MiB with DFlash), and a 4-MiB bound for physical
+arena rounding. None consumes the external 64-MiB headroom. At C6, graph allowance falls from
+1624 to 62 MiB and shared KV grows from the prior deployment's 548736 to 605824 tokens after the physical-availability correction.
+
+The exact-capacity C8 engine reproduced a workspace allocation failure with 442 MiB reported
+free. Allocating workspace first then reached an SSD staging allocation failure with 124 MiB
+reported free. Disabling ROCr's fragment allocator resolves the reproduced failures with the
+original allocation order and the same capacity; no ordering workaround or extra reserve is
+retained. The exact allocator failure mechanism is not established by this comparison.
+
+The unprofiled launch probe alternates two 1000-node integer graphs with a 512-byte payload plus
+an output pointer per node. Five repetitions retain exact output and zero late VRAM growth.
+Median submission-thread CPU time falls from 1049.80 to
+696.86 microseconds per graph (33.62% less).
+This is CPU submission work, not total process CPU or whole-model throughput.
+
+Separate uninstrumented model runs use one warmup and three repetitions, without concurrent
+compilation. The baseline also uses classic replay and disables ROCr's fragment allocator;
+the candidate adds direct argument capture. C1 fixes K7; C6 uses the deployed adaptive policy
+and automatic KV capacity. Controlled C1 and C6 fixed-K7 runs have exact greedy token parity;
+C6 fixed-K7 also checks that both policies resolve the same physical KV capacity. Adaptive C6 continuations are not
+exactly repeatable even within the unchanged baseline: both policies produce the same two observed
+129-token continuation variants across workloads, with the first divergent token at index 73. Their measured draft-length schedules
+differ, but the aggregate reports do not establish the causal transition. Adaptive results are
+throughput observations, not exact-token parity evidence. The table uses
+per-repetition medians; the raw reports retain means and deviations. One short C1 baseline
+repetition was slower, so its mean difference does not establish a speed gain.
+
+| Measurement | Classic median | Direct-argument median | Observed change |
+|---|---:|---:|---:|
+| C1 fixed K7 pp128+tg512, decode tok/s | 90.119 | 90.085 | -0.04% |
+| C1 fixed K7 pp8192+tg512, decode tok/s | 224.489 | 224.537 | +0.02% |
+| C6 adaptive max K7 8192/256, isolated decode tok/s | 653.468 | 620.092 | -5.11% |
+| C6 adaptive max K7 8192/128, whole output tok/s | 47.147 | 47.027 | -0.25% |
+| C6 fixed K7 8192/256, isolated decode tok/s | 665.719 | 661.953 | -0.57% |
+| C6 fixed K7 8192/128, whole output tok/s | 46.522 | 47.278 | +1.63% |
+
+The CPU saving does not imply an equal inference-speed gain. Report means, deviations, commands,
+exact-token checks, per-C memory evidence and primary runtime source references are retained in
+`profiles/bench/r9700-classic-launch-20261016/`. The 19-case exact graph transformation checks
+pass in packet and classic modes, real-artifact C2 graph/eager parity passes for ordinary/MTP/
+DFlash, planner checks cover complete and partial flag combinations, and independent review
+finds no ownership or synchronization blocker.
+
+### Packet-path VRAM baseline (2026-10-15)
+
+This historical control supplies the conservative packet-path bound retained after phase-image
+sharing. Compose now uses the qualified classic configuration above. Availability and minimum-free
+figures in this historical control use HIP alone; they are not physical-headroom guarantees.
 
 The production `R9700Fp8Lut4` artifact was measured independently at every C1..8 on one
 gfx1201 R9700 with the selected `/opt/rocm/core-10.0` toolchain (HIP 7.15.26333),

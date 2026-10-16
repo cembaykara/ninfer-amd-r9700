@@ -1487,11 +1487,14 @@ GDN front / pair-conv / record、Q/K norm-RoPE）替换为一个 persistent kern
 的 per-(sequence, head) re-tiled body，宽度 >8 时保持 kernel node）、原参数和 virtual block/grid indices 执行，phase 之间是 grid barrier；输出与原 kernel nodes bitwise 相同。其余 nodes
 （verify attention、drafter、sampling、copies）保持不变，graph 仍是单链。
 
-Lowering 返回的 program storage（phase records、captured arguments、barrier words）由
-`DecodeGraphDefinition` owns this storage for both its graph and its immutable executable.
-The memory plan charges each
-lowered definition 计入固定 allowance。`B>1` definitions 不降低（lowered C4/C8 更慢），见
-`docs/performance.md`。
+Lowering interns byte-identical run images (phase records, captured arguments, and a grid-barrier
+word) in startup-owned, fixed-address 2-MiB arenas. Each `DecodeGraphDefinition` retains the arenas
+its nodes reference, keeping storage alive through its immutable executable's lifetime. The startup
+index and host copies disappear after preparation; replay performs no lookup or allocation.
+Shared images require the Engine's one ordered compute stream: kernels sharing a barrier word
+must never overlap. Uploads finish on the null stream before a nonblocking compute stream can
+consume them. `B>1` definitions retain individual kernel nodes (lowered C4/C8 was slower); see
+`docs/performance.md`.
 
 ### 9.2 Dynamic active set
 
@@ -1558,13 +1561,17 @@ eager 与 captured replay 逐位相同；以 live frontier 执行会在 16K 以�
 不得为每个 `B`、profile 或 captured definition 复制 logits、hidden、workspace 或 per-sequence state。
 Model/control ingress、forward 和 result egress 不存在 per-row device submission；跨 page 时的 table
 publication 属于 state substrate materialization。Serving 期间不 capture、instantiate 或扩展 graph family。
-The startup reservation includes all reachable definitions, their owned lowered storage,
-and one immutable executable per definition. Uncalibrated selectors use a conservative
-family allowance plus the measured per-executable allocation bound. Production C1..8
-uses the measured full-inventory reservation documented in `docs/performance.md`.
+The startup reservation includes all reachable definitions, their owned lowered storage, and one
+immutable executable per definition. Uncalibrated selectors use a conservative family allowance plus
+the measured per-executable allocation bound. Production C1..8 uses a driver-policy-specific
+measured full-inventory reservation documented in `docs/performance.md`. The low-residency
+calibration requires all three settings: `DEBUG_HIP_GRAPH_CLASSIC_PATH=1`,
+`ROC_SKIP_KERNEL_ARG_COPY=1`, and `HSA_DISABLE_FRAGMENT_ALLOCATOR=1`. The same preset without those
+settings retains the conservative packet-path bound; other presets use the full inventory bound.
+These HIP startup settings do not change the graph inventory or the mathematical execution schedule.
 The observed-allocation startup guard remains mandatory; eager execution reserves no graphs.
-NInfer-induced lazy driver resources belong in NInfer's reservation. The configurable KV
-headroom is reserved exclusively for external GPU users and display activity.
+NInfer-induced lazy driver resources belong in NInfer's reservation. The configurable KV headroom is
+reserved exclusively for external GPU users and display activity.
 
 Capture/smoke 使用的 temporary Paged-KV allocation 每个有效 row 只 materialize 一个 private physical
 page，并把该 page 重复发布到 temporary block-table row。准备一次 eager/smoke 时只清零 `[0,B)` 对应的
