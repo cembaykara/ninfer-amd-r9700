@@ -131,7 +131,7 @@ class ServeCorpusTest(unittest.TestCase):
 
         start = {
             "artifact_type": "ninfer_serve_request_log",
-            "schema_version": 23,
+            "schema_version": 24,
             "event": "server_start",
             "server_instance_id": "server",
             "engine": {
@@ -190,10 +190,10 @@ class ServeCorpusTest(unittest.TestCase):
             with self.assertRaisesRegex(CampaignError, "prefill chunk differs"):
                 load_existing_records(path, {spec.key: spec}, 1, 16, "dense")
 
-    def test_request_log_v23_identity_is_accepted(self) -> None:
+    def test_request_log_v24_identity_is_accepted(self) -> None:
         current = {
             "artifact_type": "ninfer_serve_request_log",
-            "schema_version": 23,
+            "schema_version": 24,
             "event": "server_start",
         }
         require_server_log_identity(current, "server_start")

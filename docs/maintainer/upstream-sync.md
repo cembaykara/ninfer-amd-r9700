@@ -1,15 +1,15 @@
 # Upstream synchronization record
 
-Upstream is the RTX 5090/CUDA NInfer `experimental` branch. It is reconciled into this R9700
+Upstream is the RTX 5090/CUDA `dylanbrodiefafard/ninfer` repository’s `experimental` branch. It is reconciled into this R9700
 repository by custom AMD ports, not merged ancestry; `AGENTS.md` states the sync rule.
 
 ## Baseline
 
-Reconciled through upstream `17c504c98f263f29a29b1c0115925f02b9941a22` (2026-10-12), advanced
-from `d5c38cda` (2026-10-09), `6e5b576e` (2026-10-06), `f0d3922e` (2026-10-04), `945515ea` (2026-10-04), `48eb0b01` (2026-10-03), `593c2d0c` (2026-10-03),
+Reconciled through upstream `62687bd37f1dfb629384630ed8c07b5cc3ef9da1` (2026-10-16), advanced
+from `17c504c9` (2026-10-12), `d5c38cda` (2026-10-09), `6e5b576e` (2026-10-06), `f0d3922e` (2026-10-04), `945515ea` (2026-10-04), `48eb0b01` (2026-10-03), `593c2d0c` (2026-10-03),
 `574a8d91` (2026-10-02), `f7f70d89` (2026-10-02), `9639c32f` (2026-09-30), `34c7119b` (2026-09-28) and
 `e04fad3728573a0109236929f5d473475a8657f2` (2026-09-21, AMD ports `7187d95d`, `2eab0a50`,
-`49c896dd`) by the dispositions below. The next sync reviews upstream changes after `17c504c9`
+`49c896dd`) by the dispositions below. The next sync reviews upstream changes after `62687bd3`
 against current AMD behavior.
 
 ## Ported features (`c450798c..e04fad37`)
@@ -436,3 +436,55 @@ identities are replaced by native qualifiers and the explicit production artifac
 helper and benchmark-only fixture changes are excluded. No performance claim, upstream ancestry merge,
 master promotion or deployment is part of this sync. Evidence:
 `profiles/bench/r9700-upstream-sync-20261012/`.
+
+
+## `17c504c9..62687bd3` (4 upstream commits, reconciled 2026-10-16)
+
+- `9edf680bac3598dcd857903a576c681b5bcbbac3`: excluded CUDA/NVFP4 prefill-tail fix and
+  associated CUDA fixtures. AMD's native FP8-K/INT4-V attention already writes semantic zero
+  for inactive query rows, including partial tiles; it does not use the affected NVFP4 kernel.
+- `6c7e2ccee630dd39a5b00123c371a64587420662`: ported the pinned build-copy grammar patches
+  for shared property rules, direct subset/reference transitions, one normalization after nested
+  schema assembly, and exact tokenizer byte-prefix metadata. Completed-call validators use an
+  independent cached byte-only compiler, with one joined cold-build worker under the frontend's
+  compiler lock. Vocabulary-mask compilation uses sixteen host threads. Native tests retain
+  AMD's canonical additional-key, assertion, Unicode, special-byte and speculative-state checks,
+  and add finite-language/mask oracles, recursive schemas, cache isolation and concurrent cold
+  preparation. The NVIDIA workload's throughput and memory figures are not AMD evidence.
+- `a736c1c3cef8a55e74636287f3ed29d1181f88b2`: already resolved by AMD `eb63b0f8`, pulled
+  before this reconciliation. Every captured profile owns an immutable executable and startup
+  instantiates/uploads it once; the graph-update API and runtime update path are removed.
+  Consequently workspace-address changes never update multidimensional memcpy nodes. The
+  upstream raw-copy kernel, graph-update tests and CUDA timing are not imported into this
+  different graph ownership model. Existing HIP pitched copies remain.
+- `62687bd37f1dfb629384630ed8c07b5cc3ef9da1`: ported pre-preparation events and full
+  synchronous preparation wall time for Chat, Responses and Anthropic; disk spill/compaction/
+  restore activity, pending-job count and active-session age through nonblocking snapshots,
+  RuntimeStats, periodic logs, JSONL and both metrics encodings. Completed spill lifetime is
+  labeled `spill_completed`, separately from request blocking time. AMD's host-to-device disk
+  transfer time and device-page fields remain. The local request-log schema advances 23 to 24
+  in every active consumer; upstream's 19-to-20 identity belongs to its separate contract.
+  Held-spill, log lifecycle/flush, timing and metrics regressions are adapted to native tests.
+
+Verification: warnings-as-errors Release build; 11 focused host tests covering exact grammar
+languages/masks, frontend, recovery executor, public headers, three serving schemas, request
+logs and metrics; 27 Python corpus/NIAH report-consumer checks with Python 3.11; changed-line
+clang-tidy reports zero diagnostics. The real Qwen tokenizer probe with eight tools passes
+1,736,525 mask-versus-byte-acceptance comparisons, including framing boundaries, unordered
+arguments and speculative rollback (read's `path` is named `filePath` in the probe fixture to
+match its declared test input). Cold compilation took 217 ms on this host; no A/B speedup or
+inference-throughput claim is made. Evidence: `profiles/bench/r9700-upstream-sync-20261015/`.
+GPU verification completed on 2026-10-16 under the shared lock: the production R9700 C3
+constrained-generation fixture passes ordinary decode, MTP and captured DFlash, including
+streaming/logprobs and cached preparation. The native disk-cache suite passes after adapting the
+telemetry test to the actual publication boundary: held preparation reports active work with
+zero session age, the installed session reports positive age, and completed spills leave idle
+work flags with lifetime counters preserved. The corrected test also passes clang-tidy with
+zero diagnostics. Final results are in `gpu.log` (real-model result) and `disk-recheck.log`
+(corrected disk-cache suite); the initial disk test's session-age assertion was a test-port
+error and required no production change. Source whitespace checks pass; unified-patch context
+lines retain their required leading space. The baseline advances to `62687bd3`; all four source
+commits are dispositioned above. Before push, this sync was rebased onto AMD `69e2178c`;
+the combined warnings-as-errors Release build, 11 focused host tests and production-artifact
+constrained-generation GPU test pass (`rebase-build.log`, `rebase-host.log`, `rebase-gpu.log`).
+This reconciliation creates no upstream ancestry merge, master promotion or deployment.

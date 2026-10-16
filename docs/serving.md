@@ -467,6 +467,12 @@ XML-looking text inside a string are preserved. For schemas admitting both a raw
 string and a JSON value, the lossless raw-string interpretation is preferred when
 the complete argument object satisfies the schema.
 
+Grammar compilation shares property rules and builds reference-only subset transitions directly.
+Tokenizer prefix metadata follows byte prefixes, including duplicate and Unicode spellings.
+Completed-call validators consume UTF-8 bytes without model-vocabulary masks. The resident frontend
+caches both immutable grammars; matcher state stays private to each request. A joined worker builds
+byte validators alongside vocabulary masks on a cold preparation.
+
 With declared tools, the free-text region after reasoning reserves the protocol prefixes
 `</invoke`, `</parameter`, `</function`, `</tool_call`, `<invoke`, `<parameter`, and
 `<function`. The prefix `<tool_call` must continue into a canonical declared call.
@@ -1049,14 +1055,15 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v23 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v24 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
 | Event | Contents |
 |---|---|
 | `server_start` | target/weights identity and artifact (including `mapped_host_bytes`, the weights held in pinned host memory), resolved Engine, compile-bound Text-prefill/XAttention identity, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, pinned-host KV RAM capacity/occupancy, Device Graph observed/allowance bytes, HIP/GPU environment, and redacted argv |
-| `request_start` | protocol, resolved sampler and seed (including `p_less`), thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `request_prepare` | parsed request ID/protocol, body size, message/tool counts, and handler parse/context-assembly time; emitted before synchronous preparation begins |
+| `request_start` | completed synchronous `timings_seconds.synchronous_prepare`, protocol, resolved sampler and seed (including `p_less`), thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram` / `host_disk`), `context_checkpoint` (`restored_tokens` / `captured_tokens`), this request's unrounded phase clocks, `recovery` totals (including the true `cycle_exclusions`), complete speculative-decoding counters, `tool_call_count`, and `ignored_qwen_tool_call_names` (empty unless a tools-off completion contained parseable Qwen `<tool_call>` markup). Process KV occupancy and lifetime tier counters are not on this event |
 | `recovery` | one line per published Engine recovery event: `request.id`, `kind`, raw `cause` (including the exhausted detail), attempts, cycle exclusions, discarded tool calls and reasoning tokens, generated tokens, and remaining tokens |
@@ -1099,7 +1106,8 @@ parseable Qwen `<tool_call>` markup also writes a `warning` line naming the igno
 the request's `tools` / `tool_choice` / `tool_history` shape; the same names are in
 `request_done.result.ignored_qwen_tool_call_names`. OpenAI Responses, OpenAI Chat, and
 Anthropic generation requests receive a request ID when they enter synchronous preparation.
-Successful preparation produces `request_start`; a preparation failure produces `request_rejected`
+A `request_prepare` event precedes synchronous preparation. Successful preparation produces
+`request_start`; a preparation failure produces `request_rejected`
 without a matching start. Later generation failures produce `request_error`. Schema/model
 validation rejections before preparation and token-count-only calls are not measurement requests
 and do not receive request IDs.
@@ -1112,7 +1120,25 @@ and DFlash this is the accepted committed output, not draft or rejected tokens.
 `running`, `prefilling`, `decode_ready`, and `waiting` fields are the Engine scheduler snapshot at
 the end of the interval. Fully idle zero intervals are omitted. The JSONL `throughput` event keeps
 the raw token and round deltas as well as derived rates; downstream measurement should prefer those
-raw values.
+raw values. Disk `work` identifies active spill preparation/session, compaction, and restore targets;
+`pending` counts queued disk jobs. An active spill session reports `spill_age` in seconds (zero
+while preparation has not installed a session). These are background cache activities, independent
+of scheduler request occupancy. Active disk work keeps the periodic report visible, including its
+transition to idle. `spill_completed` is the sum of full lifetimes of spills completed during the
+interval, so it can exceed the interval and does not measure time blocking requests. The JSONL
+`timings_seconds.kv_disk_save` and cumulative metric `ninfer_kv_disk_save_seconds_total` have the
+same completed-spill lifetime semantics. JSONL scheduler fields and both metrics encodings expose
+`spill_active`, `compaction_active`, `restore_active`, `pending_jobs`, and `spill_elapsed_seconds`
+(with a `kv_disk_` prefix in JSONL and `ninfer_kv_disk_` in Prometheus).
+
+The preparation line is emitted after JSON/protocol parsing and, for Responses, context assembly;
+`parse` measures that handler work. It does not timestamp network arrival or body reception.
+The submitted line reports `prepare_sync`, the full `service.prepare` call including synchronous
+submission and tool-grammar compilation. JSONL records this as `timings_seconds.synchronous_prepare`;
+it is a separate wall clock from `request_done` phase accounting and must not be added to its phases.
+Disk snapshots use a nonblocking observer: if the disk index mutex is busy, the most recent snapshot
+is retained, so work flags and age may temporarily be stale. A gap with no preparation line can precede
+handler processing; these logs alone cannot attribute such a gap to a client or the network.
 
 ## Execution behavior
 

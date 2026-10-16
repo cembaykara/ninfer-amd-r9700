@@ -772,6 +772,13 @@ struct RuntimeStats {
     std::size_t kv_disk_capacity_bytes = 0;
     std::size_t kv_disk_used_bytes     = 0;
     std::size_t kv_disk_entry_count    = 0;
+    // Live disk work is independent of scheduler occupancy. Save time is the full elapsed
+    // lifetime of completed spills, not time spent blocking requests in an observer interval.
+    bool kv_disk_spill_active            = false;
+    bool kv_disk_compaction_active       = false;
+    bool kv_disk_restore_active          = false;
+    std::size_t kv_disk_pending_jobs     = 0;
+    double kv_disk_spill_elapsed_seconds = 0;
     // Host wall from the last SSD byte of a disk restore until its page and state H2D
     // complete, summed over the process. Folded from harvested per-request copy seconds.
     double kv_disk_h2d_seconds = 0;
