@@ -168,6 +168,34 @@ inline PhaseStreams fp8lut4_streams(const linear::Fp8Lut4Weight& first,
     return streams;
 }
 
+// T1 projects 32 rows per CTA instead of SmallT's 16. Its next CTA overwrites only
+// the codebook before the first barrier; the prior CTA has finished reading it.
+template <bool Accumulate, bool SiluPair>
+struct Fp8Lut4T1 : CapturedGrid {
+    static constexpr bool lds_reuse_safe = true;
+    static constexpr auto kernel =
+        &linear::fp8lut4_kernels::fp8lut4_t1_kernel<Accumulate, SiluPair>;
+    static constexpr std::uint32_t launch_threads = 32U * linear::fp8lut4_kernels::kGemvSplit;
+    static constexpr std::uint32_t threads        = launch_threads;
+    using Shared                                  = linear::fp8lut4_kernels::T1Shared;
+
+    template <class Params>
+    static PhaseStreams streams(const Params& params) {
+        const auto& a = slot_value<0>(params);
+        auto result   = fp8lut4_streams(a.weight, a.second);
+        for (auto& part : result.parts)
+            for (auto& range : part) range.bytes *= 2U;
+        result.split /= 2U;
+        return result;
+    }
+
+    template <class Cta>
+    __device__ static void run(const Cta& cta, Shared& shared,
+                               const linear::fp8lut4_kernels::KernelArgs& a) {
+        linear::fp8lut4_kernels::t1_body<Accumulate, SiluPair>(cta, shared, a);
+    }
+};
+
 // T <= 16 (one token tile): a single-sequence verification width is at most 8.
 template <bool kAccumulate, bool kSiluPair>
 struct Fp8Lut4SmallT {
@@ -392,7 +420,8 @@ struct QkNormRope : CapturedGrid {
 using linear::fp8_small_t_kernels::Epilogue;
 // The kernels of a single-sequence decode graph (verification width at most 8).
 using Entries =
-    std::tuple<Fp8Lut4SmallT<false, false>, Fp8Lut4SmallT<true, false>, Fp8Lut4SmallT<false, true>,
+    std::tuple<Fp8Lut4T1<false, false>, Fp8Lut4T1<true, false>, Fp8Lut4T1<false, true>,
+               Fp8Lut4SmallT<false, false>, Fp8Lut4SmallT<true, false>, Fp8Lut4SmallT<false, true>,
                Fp8SmallT<Epilogue::Store>, Fp8SmallT<Epilogue::PairSplit>,
                Fp8SmallT<Epilogue::Residual>, QuantizeActivation, QuantizeNormalized, QuantizeGated,
                QuantizeGatedRmsNorm, GdnNormalizedFront, GdnPairConvRecord<4U>,
@@ -539,8 +568,10 @@ __device__ __forceinline__ void prefetch_code(std::uint32_t entry, std::uint64_t
 // (a touched dword fills its line, core/cache_warm.h), until the barrier opens: the wait of a
 // block a phase leaves idle, or that finishes early, overlaps the next phase's memory stream. A
 // pure cache hint: the loaded values are discarded.
+// Bind the next entry by reference: its LDS word is published only by the first barrier
+// below. Passing by value would read the new phase slot before its writer synchronizes.
 __device__ __forceinline__ void grid_barrier(std::uint64_t* arrivals, const PhaseStreams& next,
-                                             std::uint32_t next_entry) {
+                                             const std::uint32_t& next_entry) {
     __shared__ std::uint32_t open;
     __shared__ std::uint64_t target;
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");

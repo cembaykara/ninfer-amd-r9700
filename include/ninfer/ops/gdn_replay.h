@@ -83,4 +83,28 @@ struct GdnLayerFold {
  */
 void gdn_replay_fold_layer(const GdnLayerFold& fold, hipStream_t stream);
 
+// Immutable packed records of a deferred layer fold, staged before a new round can overwrite
+// its record rows. Row b holds the previous row selected by rows->row[b].record_row, with
+// BF16 key [128,16,T,B], BF16 value [128,48,T,B], FP32 gate [2,48,T,B]. Only the committed
+// prefix is defined. A zero-column row touches no records or state. The rows remain device
+// resident and stream ordered until gated_delta_net_replay_record consumes this value.
+struct GdnRecordFold {
+    Tensor key;
+    Tensor value;
+    Tensor gate;
+    const GdnDeferredFoldRows* rows = nullptr;
+};
+
+/**
+ * Op: gdn_replay_prepare_layer
+ *
+ * Copies the committed raw K/V/{g,beta} prefixes selected by fold into caller-owned staging,
+ * and publishes tail_3(old convolution history || committed convolution records). The FP32
+ * recurrent state is unchanged. Staging must be disjoint from all source records and state;
+ * no allocation is performed. The subsequent replay_record with this GdnRecordFold finishes
+ * the recurrent fold before computing the current round, with exactly the ordinary fold's
+ * state transition. This preserves old record lifetimes independently of current output rows.
+ */
+void gdn_replay_prepare_layer(const GdnLayerFold& fold, GdnRecordFold& staged, hipStream_t stream);
+
 } // namespace ninfer::ops

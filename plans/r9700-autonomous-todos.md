@@ -19,6 +19,17 @@ FP8LUT4 artifact was admitted; it remains in git history.
 
 ## Live items
 
+- [ ] `DECODE-PROFILE-FIXES` **Blocked on privileged KFD caller tracing.** T1 hosting,
+  the measured >32-token GDN fold/record crossover and phase-metadata publication ordering
+  are implemented and verified. Final decode time reductions: 8.13% at C1/P8192,
+  7.31% at C1/P65536, and 1.29% at C6/P8192/K7. Three attention candidates were
+  rejected by physical timing. The remaining 0.6–0.9-second spikes are KFD USERPTR
+  queue evictions; unprofiled wait/memory-policy controls do not remove them. Tracefs is
+  root-only, perf is restricted and sudo requires a password. Ready follow-up:
+  `profiles/bench/r9700-decode-fixes-20261016/trace_userptr_root.sh`.
+  Evidence and checker limitations are in `docs/performance.md`. No clock, voltage,
+  power, allocator or runtime-environment policy change was retained.
+
 - [x] `LONGCTX-PREFILL` Long-context (32K-240K) prefill, closed 2026-09-27: 128K attribution
   (attention 47%, FP8LUT4 GEMMs 44%), attention ablations, paired-wave split rejected at Layer 0,
   staging latency unhideable on gfx1201 at the 240-VGPR budget, chunk 4096 mixed (default 2048).

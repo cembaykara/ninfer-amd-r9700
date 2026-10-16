@@ -48,6 +48,155 @@ The latest accepted measurements use:
 The GPU must otherwise be idle. Timings use HIP events around the claimed physical work after
 warmup. Independent exact/FP64 oracles run before performance values are admitted.
 
+### Decode optimization profile at 512 through 64K context (2026-10-16)
+
+Fresh characterization of `6f069b6c`, the production `r9700-fp8lut4` artifact, fixed G16
+FP8-K/INT4-V/FP16-scale cache, chunk 2048, and the Compose bulk host-argument graph environment.
+Each unprofiled point discards one repetition and measures three greedy corpus P+G128 requests
+under `auto`. These are diagnostic baselines, not an optimization A/B; some points have a slow
+repetition, with the full ranges retained in the report. No clock, voltage or power-policy
+setting was changed.
+
+| C1 prompt tokens | Plain decode median ms/token | DFlash K7 median ms/round, including fallback | Plain attention kernel ms/graph | DFlash attention kernel ms/graph |
+|---:|---:|---:|---:|---:|
+| 512 | 27.997 | 29.293 | 0.368 | 0.392 |
+| 8,192 | 28.480 | 30.211 | 0.766 | 1.034 |
+| 32,768 | 30.045 | 32.067 | 2.316 | 2.835 |
+| 65,536 | 31.618 | 33.998 | 3.932 | 4.742 |
+
+The first two timing columns are unprofiled. Attention columns are consumer-plus-merge duration
+sums from matching P+G128 traces and support attribution only. Attention rises from about 1.4%
+to 13.3% of plain kernel time and 14.3% of DFlash kernel time. C1 target projection cost stays
+nearly constant: plain FP8LUT4 T1 projections take about 21.1 ms/graph; DFlash persistent target
+phases take about 25.1 ms/graph and its Q4 drafter projections about 2.4 ms/graph. The persistent
+bucket includes several Ops; this trace does not resolve its internal phases or establish current
+physical HBM saturation. Output throughput across contexts also changes with acceptance and is
+not an isolated measure of context overhead.
+
+The C6/P8192/G128 compact decode point measures 572.6 aggregate output tok/s median on this
+greedy corpus. Its matching trace contains 25 B6, two B5 and one B3 graphs. Across those graphs,
+GDN replay folding takes 2.96 ms and recurrence recording 2.51 ms per graph; all GDN state/front
+work totals 6.02 ms, about 13.6% of kernel duration. The B6 class alone totals 44.83 ms of kernel
+duration, including 6.08 ms GDN state/front and 4.94 ms attention. These are kernel sums, not
+unprofiled physical round timings or application sampling throughput.
+
+Candidates identified by this initial profile (follow-up decisions below):
+
+- **Batched GDN state traffic:** reconstruct committed recurrent state at the next record's
+  initial-state load to avoid another state read. Preserve early convolution-state publication,
+  FP32 state evolution and old/new replay-record lifetimes. Merely moving the fold into the
+  front removes no state traffic. This needs a new complete-boundary oracle and timing decision.
+- **Long-context attention access:** improve the physical K/V access pattern or remove repeated
+  traffic while preserving the three planes and QK/PV arithmetic. The logical Text-cache minimum
+  is 26,624 bytes per context token, or 1.745 GB at 64K. At the previously measured 636 GB/s read
+  probe, an ideal single pass alone costs 2.74 ms, before partials, compute, barriers and read
+  amplification. This is an optimistic traffic floor, not a new bandwidth measurement or an
+  achievable latency. Prior rejected rings, vector-load substitutions and chunk-count sweeps
+  need a new mechanism before repetition.
+- **Plain T1 persistent hosting:** `fp8lut4_t1_kernel` is absent from the persistent registry;
+  about 245 invocations/token remain separate launches and interrupt hosted producer/projection
+  runs. Hosting the exact T1 body could reduce boundaries without reducing weight traffic.
+  Register/occupancy and streaming effects still require qualification and whole-decode timing;
+  the earlier failed B>1 lowering must not be treated as a promoted solution.
+
+All 27 baseline repetitions repeat their tokens exactly within each workload, and all nine
+matching-geometry traces reproduce baseline tokens exactly. Initial G32 traces changed capacity
+and short-context trajectories; they are preliminary diagnostics, not the final attribution.
+Known dependent nodes have overlapping timestamps in the ROCm graph traces. The classic control
+also retains such overlap for plain decode, while its summed kernel time differs from bulk by
+less than 0.05% at both short C1 points, with exact tokens. The cause is not established.
+Replay dispatch counts are reconciled by graph/node occurrence and dispatch order; no causal
+gap, idle-fraction or stall claim is made from those timestamps. This initial study changed no
+kernel or production route. It did not cover mixed rounds, tools, HTTP, adaptive p-less acceptance or
+concurrent 64K contexts.
+
+Evidence, exact commands, ranges, per-symbol/grid attribution and control checks:
+`profiles/bench/r9700-decode-opportunities-20261016/report.txt`, `analysis.json`,
+`manifest.json`, `matched-manifest.json`, and `trace-controls.json`.
+
+### Decode profile follow-up (2026-10-16)
+
+The follow-up retains the exact T1 FP8LUT4 arithmetic in a shared CTA body and hosts its
+Store, residual and SiLU-pair entries in the existing persistent decode dispatcher. The
+C1/P8192/G128 ordinary-decode A/B uses six balanced processes, each with one discarded and
+three measured repetitions. Paired candidate/control ratios are 0.91654, 0.91587 and 0.91631;
+the median reduction is **8.37%** (3.6454 to 3.3398 seconds per 128 tokens). Generated tokens
+are exact. The independent FP64 Linear qualifier and all 23 exact persistent-lowering
+scenarios pass. The persistent kernel uses 238 VGPRs, 22,504 LDS bytes and no scratch/spills.
+
+Batched DFlash chain verification above 32 aggregate tokens preserves old committed raw records
+in caller workspace,
+publishes convolution history before projection, then folds FP32 recurrent state at the next
+record consumer's initial load. This removes one state read without publishing current
+unaccepted recurrence state. The independent FP64 fold/recurrence oracle, exact ordinary
+state/history/record comparison, permuted slots, partial prefixes and graph replays pass at
+B2/W6 and B6,B8/W8. The fused record kernel uses 56 VGPRs, 18,560 LDS bytes and no spills.
+The isolated C6/P8192/K7 A/B (six balanced processes, discarded warmup plus three repetitions)
+reduces decode time by 1.15%, with exact tokens. Both arms of that mechanism comparison used
+the same subsequently rejected attention candidate; final production comparisons are recorded
+in the evidence directory. The finite crossover retains the existing front Fold through 32
+aggregate tokens: forcing the new route at C2/C3/C4 K7 or C6 K3 slows decode by 1.1–1.3%.
+Above that boundary, the C8/K7 comparison reduces decode by 1.72%, with exact tokens.
+
+The final persistent kernel also binds the next phase entry by reference and reads it only after
+the phase-slot publication barrier. Its previous by-value argument read LDS before the writer
+synchronized; this could select a stale instruction-prefetch entry. The final native 23-scenario
+exact-buffer qualification passes. The final same-session three-repetition A/Bs are:
+
+| Workload, G128 | Control median decode seconds | Final median decode seconds | Time reduction |
+|---|---:|---:|---:|
+| C1 plain, P8192 | 3.63709 | 3.34141 | 8.13% |
+| C1 plain, P65536 | 4.03783 | 3.74278 | 7.31% |
+| C1 DFlash K7, P512 | 1.40741 | 1.40521 | 0.16% (neutral) |
+| C6 DFlash K7, P8192 | 1.34016 | 1.32283 | 1.29% |
+
+The short points discard one warmup; the 64K point measures three complete P+G requests without
+a discarded repetition. All retained tokens match the control exactly. Fixed-K7 C6 eager and
+C5 mixed-forward-256 whole requests also match original tokens exactly. Adaptive C7 graph
+control/final tokens match; adaptive eager selects different timing-dependent draft-width
+histories and differs even in the original build, so cross-mode adaptive exact-token parity
+is not claimed.
+
+Standalone T1 race checking passes 2,085 workgroups with zero hazards; the staged GDN fold/record
+qualifier passes 168,384 workgroups with zero hazards. The persistent checker no longer reports
+the phase-publication read. It still reports shared-memory hazards across the scheduler's atomic
+wave-group barriers, which that checker explicitly does not model. Those barriers were reviewed
+against their release/acquire protocol, and exact lowering/graph replay passes; the whole
+persistent race-check run is **limited**, not a clean sanitizer pass. No suppression or weakened
+checker was added. Final persistent resources remain 238 VGPRs, 100 SGPRs, 22,504 LDS bytes,
+and zero private scratch/spills.
+
+Long-context attention retained its existing physical layout and consumer. A full BF16 K-page
+staging candidate slows C1/P65536/K7 decode by 5.55%; a double-buffered raw-FP8 K-page candidate
+slows it by 4.60% and C6/P8192/K7 by 2.86%. Both passed the independent FP64 oracle and exact
+model tokens, but are rejected on whole-decode timing. A 16-token physical K tile keeps the
+original arithmetic and LDS footprint; nine balanced event pairs at 64K show ratios 0.97784
+for T1 and 0.99583 for T8. The latter is only 0.42% of the attention operator, below a material
+whole-round gain for the DFlash bottleneck, so the format change is rejected. No alternate
+cache format or candidate dispatch remains in production. The attention qualifier now accepts
+`--long-context 65536` for direct T1/T8 FP64, fragmented-page, publication and graph checks.
+
+**Unresolved latency spike:** repeated 512+1536-token runs reproduce roughly 0.6–0.9-second
+rounds. KFD traces align these with `EVICT_USERPTR` intervals and repeated restore retries,
+while individual traced kernels remain below 2.4 ms. Spin waiting does not remove the pause.
+The profiler inserts registered system-memory queue rings, so memory-policy decisions were
+also checked without profiler interception: corrected production defaults reach 745/708 ms,
+`HSA_USE_SVM=0` reaches 758 ms, and combined legacy/GTT settings with ordinary-RAM I/O staging
+still reach 168 and 428 ms. The I/O-staging control reaches 896 ms. Tokens remain exact. No
+allocator, I/O staging, synchronization-policy or environment-setting challenger is retained.
+These results do not establish a qualified production mitigation or the specific invalidation
+caller. Further diagnosis needs privileged kernel caller-stack tracing: `perf_event_paranoid=4`,
+root-only tracefs permissions and unavailable passwordless sudo block that step here. The scoped
+`trace_userptr_root.sh` in the evidence directory is syntax-checked and ready for that follow-up;
+it has not been executed. It holds the GPU lease and cleans up its private trace instance and
+uniquely named probes without changing power, VM, driver or firmware policy.
+
+Commands, paired samples, numerical and resource evidence are retained under
+`profiles/bench/r9700-decode-fixes-20261016/`. Measurements use the same production artifact,
+fixed three-plane cache, physical PCI device and bulk graph environment as the initial profile,
+with `auto` checked before and after GPU work. No clock, voltage or power-policy changes were
+made. Temporary candidates and per-round timing diagnostics are not production code.
+
 ### Bulk graph submission with host arguments (2026-10-16 UTC)
 
 Compose now selects `DEBUG_HIP_GRAPH_CLASSIC_PATH=0`, `ROC_ENABLE_LARGE_BAR=0`,

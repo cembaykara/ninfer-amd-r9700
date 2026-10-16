@@ -5,6 +5,7 @@
 #include "core/cache_warm.h"
 #include "ninfer/types.h"
 #include "ops/r9700/gdn_recurrence/gdn_verify_profile.h"
+#include "ops/r9700/gdn_recurrence/gdn_replay_fold_impl.h"
 #include "ops/r9700/persistent/persistent_cta.h"
 
 #include <hip/hip_bfloat16.h>
@@ -149,14 +150,15 @@ struct RecordShared {
     float controls[kMaximumVerifyWidth][2];
 };
 
-template <bool Tree, class Cta>
+template <bool Tree, bool Fold = false, class Cta>
 __device__ __forceinline__ void
 record_body(const Cta& cta, RecordShared& shared, const hip_bfloat16* q, const hip_bfloat16* k,
             const hip_bfloat16* v, const float* g, const float* beta, const float* states,
             const std::int32_t* valid_columns, const std::int32_t* initial_slots,
             const std::int32_t* parent_index, float* tree_states, hip_bfloat16* key_record,
             hip_bfloat16* value_record, float* gate_record, hip_bfloat16* output, int width,
-            int slots, float scale, const CacheWarm& warm, unsigned work_ctas) {
+            int slots, float scale, const CacheWarm& warm, unsigned work_ctas,
+            const fold::Planes& previous = {}, const fold::DeferredRow* fold_rows = nullptr) {
     const std::uint32_t block = cta.block().x;
     if (block >= work_ctas) {
         warm_cache(warm, block - work_ctas, cta.grid().x - work_ctas, cta.thread(), cta.threads());
@@ -188,6 +190,47 @@ record_body(const Cta& cta, RecordShared& shared, const hip_bfloat16* q, const h
     if (initial < 0 || initial >= slots || valid < 1 || valid > width) { return; }
     load_state_row(states, static_cast<std::size_t>(initial) * slot_stride + state_head, value_row,
                    sublane, local);
+    if constexpr (Fold) {
+        static_assert(!Tree);
+        const auto source = fold_rows[batch];
+        // Previous records are immutable caller staging. All row tiles may finish independently
+        // before the current head publishes its new records; no cross-CTA record race exists.
+        for (int token = wave; token < source.columns; token += kWaves) {
+            const auto column   = static_cast<std::size_t>(batch) * previous.width + token;
+            const auto key_base = (column * kQHeads + q_head) * kDim;
+            stage_token_qk_wave(previous.key, previous.key, key_base, staged_k[token],
+                                staged_k[token], lane);
+            staged_v[token][lane] =
+                static_cast<float>(previous.value[(column * kValueHeads + value_head) * kDim +
+                                                  row_tile * kOrdinaryRowsPerBlock + lane]);
+            if (lane == 0) {
+                controls[token][0] = expf(previous.gate[(column * kValueHeads + value_head) * 2]);
+                controls[token][1] = previous.gate[(column * kValueHeads + value_head) * 2 + 1];
+            }
+        }
+        cta.sync();
+        for (int token = 0; token < source.columns; ++token) {
+            float state_key = 0.0F;
+#pragma unroll
+            for (int item = 0; item < kKeysPerThread; ++item)
+                state_key =
+                    fmaf(local[item], staged_k[token][sublane + item * kThreadsPerRow], state_key);
+            state_key         = group_sum(state_key);
+            const float alpha = controls[token][0];
+            const float delta =
+                controls[token][1] * (staged_v[token][tile_row] - alpha * state_key);
+#pragma unroll
+            for (int item = 0; item < kKeysPerThread; ++item)
+                local[item] = fmaf(delta, staged_k[token][sublane + item * kThreadsPerRow],
+                                   alpha * local[item]);
+        }
+        if (source.columns > 0)
+            store_state_row(const_cast<float*>(states),
+                            static_cast<std::size_t>(initial) * slot_stride + state_head, value_row,
+                            sublane, local);
+        // Reuse the same LDS for the current round only after all waves finish folding.
+        cta.sync();
+    }
     for (int token = wave; token < valid; token += kWaves) {
         const std::size_t column  = static_cast<std::size_t>(batch) * width + token;
         const std::size_t qk_base = (column * kQHeads + q_head) * kDim;
@@ -355,6 +398,20 @@ __global__ __launch_bounds__(kOrdinaryBlock, 1) void record_kernel(
     record_body<Tree>(r9700::persistent::LaunchCta{}, shared, q, k, v, g, beta, states,
                       valid_columns, initial_slots, parent_index, tree_states, key_record,
                       value_record, gate_record, output, width, slots, scale, warm, work_ctas);
+}
+
+template <bool Fold>
+__global__ __launch_bounds__(kOrdinaryBlock, 1) void fold_record_kernel(
+    const hip_bfloat16* q, const hip_bfloat16* k, const hip_bfloat16* v, const float* g,
+    const float* beta, const float* states, const std::int32_t* valid_columns,
+    const std::int32_t* initial_slots, hip_bfloat16* key_record, hip_bfloat16* value_record,
+    float* gate_record, hip_bfloat16* output, int width, int slots, float scale, CacheWarm warm,
+    unsigned work_ctas, fold::Planes previous, const fold::DeferredRow* rows) {
+    __shared__ RecordShared shared;
+    record_body<false, Fold>(r9700::persistent::LaunchCta{}, shared, q, k, v, g, beta, states,
+                             valid_columns, initial_slots, nullptr, nullptr, key_record,
+                             value_record, gate_record, output, width, slots, scale, warm,
+                             work_ctas, previous, rows);
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net::recurrence
