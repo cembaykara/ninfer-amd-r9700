@@ -126,8 +126,14 @@ the optimized proposal head, no Vision, and prefill chunk 2048, the target bound
 complete immutable Device Graph residency by its measured C1..8 inventory. This includes one
 executable for every captured profile and the lowered persistent decode definitions. Other startup
 selectors and qualification builds use the conservative immutable-executable inventory bound.
-The target separately reserves 2 MiB for startup driver residency and its measured C-specific
-lazy kernel-driver residency, including 2 MiB for the SSD scatter kernel when that tier is enabled.
+The target separately reserves 2 MiB for startup driver residency and a C-specific main-stream
+bound of 6/6/4/4/2/4/4/6 MiB at C1..8, plus 2 MiB for the SSD scatter kernel when enabled.
+The main-stream bound covers both lazy kernel residency and the measured aggregate physical
+residual beyond logical arenas, HIP graph accounting and the separate 4-MiB arena allocation
+bound. The C6/C7/C8 physical-counter correction is owned by NInfer, not external headroom;
+its attribution and qualification are recorded in the 2026-10-16 GDN follow-up in
+`docs/performance.md`. Physical and HIP graph deltas differ, so the residual is not claimed to
+identify an exact driver allocation.
 The low-residency calibration requires `DEBUG_HIP_GRAPH_CLASSIC_PATH=0`,
 `ROC_ENABLE_LARGE_BAR=0`, `ROC_SKIP_KERNEL_ARG_COPY=0`, and
 `HSA_DISABLE_FRAGMENT_ALLOCATOR=1`, as set by Compose. Immutable graph arguments reside in pinned
