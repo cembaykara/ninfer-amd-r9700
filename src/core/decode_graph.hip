@@ -76,7 +76,8 @@ void DecodeGraphDefinition::capture(hipStream_t stream, const std::function<void
     graph_ = graph;
 }
 
-void DecodeGraphDefinition::rewrite(const std::function<DeviceBuffer(hipGraph_t)>& rewriter) {
+void DecodeGraphDefinition::rewrite(
+    const std::function<std::vector<std::shared_ptr<DeviceArena>>(hipGraph_t)>& rewriter) {
     if (!ready()) { throw std::logic_error("cannot rewrite an empty HIP Graph definition"); }
     storage_ = rewriter(graph_);
 }
@@ -85,7 +86,7 @@ bool DecodeGraphDefinition::ready() const noexcept { return graph_ != nullptr; }
 
 void DecodeGraphDefinition::reset() noexcept {
     destroy_graph(graph_);
-    storage_ = DeviceBuffer{};
+    storage_.clear();
 }
 
 DecodeGraphExecutable::~DecodeGraphExecutable() { reset(); }

@@ -825,7 +825,54 @@ bool hosted(hipGraphNode_t node, Hosted& out) {
 
 } // namespace
 
-DeviceBuffer persistent_decode_lower(hipGraph_t graph) {
+struct PersistentDecodeStorage::Impl {
+    struct Image {
+        std::vector<std::uint8_t> bytes;
+        std::uint64_t hash;
+        std::shared_ptr<DeviceArena> arena;
+        std::uint8_t* base;
+    };
+
+    std::vector<Image> images;
+    std::shared_ptr<DeviceArena> current;
+
+    const Image& intern(std::vector<std::uint8_t> bytes) {
+        std::uint64_t hash = 14695981039346656037ULL;
+        for (const std::uint8_t byte : bytes) {
+            hash ^= byte;
+            hash *= 1099511628211ULL;
+        }
+        for (const Image& image : images) {
+            if (image.hash == hash && image.bytes == bytes) return image;
+        }
+        constexpr std::size_t kChunkBytes = 2U << 20U;
+        constexpr std::size_t kAlignment  = 256U;
+        const std::size_t next =
+            current ? (current->used() + kAlignment - 1U) / kAlignment * kAlignment : 0U;
+        if (!current || next + bytes.size() > current->capacity()) {
+            const std::size_t capacity =
+                (bytes.size() + kChunkBytes - 1U) / kChunkBytes * kChunkBytes;
+            current = std::make_shared<DeviceArena>(capacity);
+        }
+        const DeviceSpan slice = current->alloc_bytes(bytes.size(), kAlignment);
+        HIP_CHECK(hipMemcpy(slice.data, bytes.data(), bytes.size(), hipMemcpyHostToDevice));
+        // Pageable H2D may return before the null-stream DMA finishes. Graph consumers use a
+        // nonblocking compute stream, so finish the upload before exposing the image.
+        HIP_CHECK(hipStreamSynchronize(nullptr));
+        images.push_back({std::move(bytes), hash, current, static_cast<std::uint8_t*>(slice.data)});
+        return images.back();
+    }
+};
+
+PersistentDecodeStorage::PersistentDecodeStorage() : impl_(std::make_unique<Impl>()) {}
+
+PersistentDecodeStorage::~PersistentDecodeStorage()                                  = default;
+PersistentDecodeStorage::PersistentDecodeStorage(PersistentDecodeStorage&&) noexcept = default;
+PersistentDecodeStorage&
+PersistentDecodeStorage::operator=(PersistentDecodeStorage&&) noexcept = default;
+
+PersistentDecodeImageOwners persistent_decode_lower(hipGraph_t graph,
+                                                    PersistentDecodeStorage& images) {
     if (graph == nullptr) throw std::invalid_argument("persistent_decode_lower: null graph");
     const std::vector<hipGraphNode_t> chain = chain_nodes(graph);
 
@@ -850,7 +897,7 @@ DeviceBuffer persistent_decode_lower(hipGraph_t graph) {
         if (end - index >= 2U) runs.push_back(Run{index, end - index});
         index = end;
     }
-    if (runs.empty()) return DeviceBuffer{};
+    if (runs.empty()) return {};
 
     // Device image: the barrier words, then one PhaseSlot record per phase.
     const auto& table       = entries();
@@ -882,9 +929,6 @@ DeviceBuffer persistent_decode_lower(hipGraph_t graph) {
                 records[index - 1U].streams = records[index].streams;
         }
     }
-    DeviceBuffer storage(image.size());
-    storage.copy_from_host(image.data(), image.size());
-
     int device = 0;
     HIP_CHECK(hipGetDevice(&device));
     int wgps = 0;
@@ -897,10 +941,18 @@ DeviceBuffer persistent_decode_lower(hipGraph_t graph) {
                                " persistent blocks per WGP are resident, expected " +
                                std::to_string(kBlocksPerWgp));
 
-    auto* base              = static_cast<std::uint8_t*>(storage.data());
+    PersistentDecodeImageOwners owners;
     std::size_t first_phase = 0;
     for (const Run& run : runs) {
-        Program program{reinterpret_cast<const PhaseSlot*>(base + kPhaseOffset) + first_phase,
+        std::vector<std::uint8_t> run_image(kPhaseOffset + run.count * sizeof(PhaseSlot), 0U);
+        std::memcpy(run_image.data() + kPhaseOffset, records + first_phase,
+                    run.count * sizeof(PhaseSlot));
+        const auto& stored = images.impl_->intern(std::move(run_image));
+        auto* base         = stored.base;
+        if (std::find(owners.begin(), owners.end(), stored.arena) == owners.end()) {
+            owners.push_back(stored.arena);
+        }
+        Program program{reinterpret_cast<const PhaseSlot*>(base + kPhaseOffset),
                         reinterpret_cast<std::uint64_t*>(base),
                         static_cast<std::uint32_t>(run.count),
                         static_cast<std::uint32_t>(launches[run.first].entry)};
@@ -930,7 +982,7 @@ DeviceBuffer persistent_decode_lower(hipGraph_t graph) {
             HIP_CHECK(hipGraphDestroyNode(chain[index]));
         if (successor != nullptr) HIP_CHECK(hipGraphAddDependencies(graph, &node, &successor, 1U));
     }
-    return storage;
+    return owners;
 }
 
 } // namespace ninfer::ops

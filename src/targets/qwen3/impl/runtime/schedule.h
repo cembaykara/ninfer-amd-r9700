@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/persistent_decode.h"
 #include "ninfer/ops/bidirectional_gqa_attention.h"
 #include "ninfer/ops/kv_cache_append_prefix.h"
 #include "ninfer/ops/swa.h"
@@ -224,14 +225,16 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 // ordinary ingress, share one model schedule, publish continuation hidden by selector, and leave
 // through one compact egress transfer.
 void capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
-                                   DecodeGraphDefinition& definition);
+                                   DecodeGraphDefinition& definition,
+                                   ops::PersistentDecodeStorage& storage);
 void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
                            DecodeGraphExecutable* executable);
 
 // Executes one exact-B MTP verification/alignment/proposal transaction. Each row may carry a
 // different current and next proposal extent while the model traversal remains batched.
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                              DecodeGraphDefinition& definition);
+                              DecodeGraphDefinition& definition,
+                              ops::PersistentDecodeStorage& storage);
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                       DecodeGraphExecutable* executable);
 
@@ -247,7 +250,8 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
                            ops::KVCacheAppendPrefixExecutionEnvelope envelope);
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, std::uint32_t verify_width,
-                                 DFlashEnvelopes envelopes, DecodeGraphDefinition& definition);
+                                 DFlashEnvelopes envelopes, DecodeGraphDefinition& definition,
+                                 ops::PersistentDecodeStorage& storage);
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          std::uint32_t verify_width, DFlashEnvelopes envelopes,
                          DecodeGraphExecutable* executable);

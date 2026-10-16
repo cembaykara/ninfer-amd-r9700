@@ -28,10 +28,13 @@ void run_prepared(Context& state, DecodeGraphExecutable* executable, Body&& body
 // even with its wide phases hosted; docs/performance.md).
 template <class Context, class Body>
 void capture_graph(Context& state, DecodeGraphDefinition& definition, std::int32_t batch_size,
-                   Body&& body) {
+                   ops::PersistentDecodeStorage& storage, Body&& body) {
     state.execution.work.reset();
     definition.capture(state.execution.device.stream, body);
-    if (batch_size == 1) definition.rewrite(ops::persistent_decode_lower);
+    if (batch_size == 1) {
+        definition.rewrite(
+            [&](hipGraph_t graph) { return ops::persistent_decode_lower(graph, storage); });
+    }
 }
 
 } // namespace ninfer::targets::qwen3::detail::NINFER_QWEN3_RUNTIME_NS::schedule

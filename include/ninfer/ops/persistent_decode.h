@@ -4,7 +4,30 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <memory>
+#include <vector>
+
 namespace ninfer::ops {
+
+using PersistentDecodeImageOwners = std::vector<std::shared_ptr<DeviceArena>>;
+
+// Startup storage for byte-identical lowered phase images. Definitions retain shared ownership
+// of their image after this construction-time owner is destroyed.
+class PersistentDecodeStorage {
+public:
+    PersistentDecodeStorage();
+    ~PersistentDecodeStorage();
+    PersistentDecodeStorage(PersistentDecodeStorage&&) noexcept;
+    PersistentDecodeStorage& operator=(PersistentDecodeStorage&&) noexcept;
+    PersistentDecodeStorage(const PersistentDecodeStorage&)            = delete;
+    PersistentDecodeStorage& operator=(const PersistentDecodeStorage&) = delete;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    friend PersistentDecodeImageOwners persistent_decode_lower(hipGraph_t,
+                                                               PersistentDecodeStorage&);
+};
 
 /**
  * Op: persistent_decode_lower
@@ -24,11 +47,14 @@ namespace ninfer::ops {
  *
  * The graph is a single chain (each node has at most one dependency and one dependent); other
  * nodes (copies, fills, kernels the persistent kernel does not host) stay as they are. Returns the
- * device storage the rewritten nodes reference (phase tables, captured arguments and the grid
+ * shared device arenas the rewritten nodes reference (phase tables, captured arguments and grid
  * barrier word); the caller keeps it alive with the graph and every executable instantiated from
- * or updated with it. Executables of graphs lowered from identical node sequences can be updated
- * from one another.
+ * it. Byte-identical runs share a phase image within the supplied startup owner; images are
+ * packed into fixed-address arenas. Graphs sharing an image must execute on one ordered stream
+ * without overlap, because their grid-barrier counter is shared too. The represented phases and
+ * their order are unchanged.
  */
-[[nodiscard]] DeviceBuffer persistent_decode_lower(hipGraph_t graph);
+[[nodiscard]] PersistentDecodeImageOwners persistent_decode_lower(hipGraph_t graph,
+                                                                  PersistentDecodeStorage& images);
 
 } // namespace ninfer::ops
