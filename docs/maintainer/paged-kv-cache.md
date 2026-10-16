@@ -128,9 +128,11 @@ executable for every captured profile and the lowered persistent decode definiti
 selectors and qualification builds use the conservative immutable-executable inventory bound.
 The target separately reserves 2 MiB for startup driver residency and its measured C-specific
 lazy kernel-driver residency, including 2 MiB for the SSD scatter kernel when that tier is enabled.
-The low-residency calibration requires `DEBUG_HIP_GRAPH_CLASSIC_PATH=1`,
-`ROC_SKIP_KERNEL_ARG_COPY=1`, and `HSA_DISABLE_FRAGMENT_ALLOCATOR=1`, as set by Compose; the same
-preset without those settings retains the conservative packet-path reservation. Other presets use
+The low-residency calibration requires `DEBUG_HIP_GRAPH_CLASSIC_PATH=0`,
+`ROC_ENABLE_LARGE_BAR=0`, `ROC_SKIP_KERNEL_ARG_COPY=0`, and
+`HSA_DISABLE_FRAGMENT_ALLOCATOR=1`, as set by Compose. Immutable graph arguments reside in pinned
+host memory and cached packets replay in bulk; the same
+preset without those settings retains the conservative device-argument-pool reservation. Other presets use
 the full inventory bound. Byte-identical persistent phase images share fixed-address arenas;
 immutable executables and the startup residency guard remain in place. Startup rejects graph
 residency above the planned bound. See `docs/performance.md` for the measured cells and capacity

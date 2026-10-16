@@ -1565,9 +1565,11 @@ The startup reservation includes all reachable definitions, their owned lowered 
 immutable executable per definition. Uncalibrated selectors use a conservative family allowance plus
 the measured per-executable allocation bound. Production C1..8 uses a driver-policy-specific
 measured full-inventory reservation documented in `docs/performance.md`. The low-residency
-calibration requires all three settings: `DEBUG_HIP_GRAPH_CLASSIC_PATH=1`,
-`ROC_SKIP_KERNEL_ARG_COPY=1`, and `HSA_DISABLE_FRAGMENT_ALLOCATOR=1`. The same preset without those
-settings retains the conservative packet-path bound; other presets use the full inventory bound.
+calibration requires all four settings: `DEBUG_HIP_GRAPH_CLASSIC_PATH=0`,
+`ROC_ENABLE_LARGE_BAR=0`, `ROC_SKIP_KERNEL_ARG_COPY=0`, and
+`HSA_DISABLE_FRAGMENT_ALLOCATOR=1`. Immutable arguments reside in pinned host memory; cached
+dispatch packets replay in bulk with `DEBUG_HIP_GRAPH_BATCH_SIZE=16384`. The same preset without those
+settings retains the conservative device-argument-pool bound; other presets use the full inventory bound.
 These HIP startup settings do not change the graph inventory or the mathematical execution schedule.
 The observed-allocation startup guard remains mandatory; eager execution reserves no graphs.
 NInfer-induced lazy driver resources belong in NInfer's reservation. The configurable KV headroom is

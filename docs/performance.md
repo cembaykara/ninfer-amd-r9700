@@ -48,9 +48,115 @@ The latest accepted measurements use:
 The GPU must otherwise be idle. Timings use HIP events around the claimed physical work after
 warmup. Independent exact/FP64 oracles run before performance values are admitted.
 
-### Classic graph residency and CPU submission (2026-10-16 UTC)
+### Bulk graph submission with host arguments (2026-10-16 UTC)
 
-Compose selects `DEBUG_HIP_GRAPH_CLASSIC_PATH=1`, `ROC_SKIP_KERNEL_ARG_COPY=1`, and
+Compose now selects `DEBUG_HIP_GRAPH_CLASSIC_PATH=0`, `ROC_ENABLE_LARGE_BAR=0`,
+`ROC_SKIP_KERNEL_ARG_COPY=0`, `HSA_DISABLE_FRAGMENT_ALLOCATOR=1`, and
+`DEBUG_HIP_GRAPH_BATCH_SIZE=16384`. On HIP 7.15.26333 / ROCr 1.21 this places immutable
+executable arguments in pinned host memory while retaining cached AQL packet replay.
+It removes the classic path's per-node command creation without restoring its predecessor's
+large device argument pools. `ROC_ENABLE_LARGE_BAR=0` controls the runtime allocation policy;
+it does not change the card's BAR configuration. Shared fixed-address phase images remain intact.
+
+The checked-in `ninfer_r9700_graph_launch_bench` alternates two immutable graphs with distinct
+512-byte by-value payloads and an output pointer per node. An independent integer oracle checks
+initialization, capture, warmup and every repetition. Seven repetitions each submit 100 graphs,
+with synchronization outside each submission-thread CPU interval. The host is a Ryzen 9 7950X3D;
+GPU power policy is `auto`, with no simultaneous build or GPU workload.
+
+| Nodes per graph | Classic submission CPU, us | Bulk host-argument submission CPU, us | Reduction |
+|---:|---:|---:|---:|
+| 1 | 3.35 | 2.46 | 26.4% |
+| 1000 | 1024.34 | 14.61 | 98.6% |
+| 4096 | 4717.60 | 44.34 | 99.1% |
+
+These are median calling-thread CPU times, not GPU execution time or token throughput.
+Synchronized wall time for 1000 nodes was 3825.81 versus 3696.64 us; for 4096 nodes it was
+15001.6 versus 14964.9 us. Both include synchronization. The largest observed model graph has
+1020 nodes, including 1008 kernel nodes. Packet batch caps 256/1024/4096/16384 passed the same
+exact oracle. The selected cap, 16384, won at 4096 nodes; 1024 was slightly faster at 1000 nodes
+(13.51 versus 14.61 us). This does not establish a unique winner at every graph size. Direct doorbell and alternate
+kernel-argument memory controls gave no reliable additional benefit in pinned-core forward/reverse
+controls and retain their defaults. This is a measured reduction, not a claim of zero remaining
+runtime overhead.
+
+Normal argument copying is required. `ROC_SKIP_KERNEL_ARG_COPY=1` failed the 4096-node oracle
+and also produced a launch failure in a subsequent check; the normal-copy route passed at all
+three sizes with both host and device argument pools. The selected mode also passed all 19
+persistent-phase cases and exact graph/eager generated-token checks for ordinary, MTP and
+DFlash inference at C2. No kernel arithmetic or model precision changed.
+
+Raw scope-separated evidence is under `profiles/bench/r9700-graph-submit-20261016/qualified/`:
+`submission-matrix.json`, `submission-provenance.json`, `pinned-submission.json`,
+`phase-qual.json`, and `functional.json`. The provenance records the inherited normal-copy,
+host-argument environment as well as each matrix row's overrides.
+
+The production adaptive-K7 preset retains the measured C-specific GPU graph inventory:
+
+| C | Graph budget / observed, MiB | Shared KV tokens | Minimum physical/HIP free, MiB |
+|---:|---:|---:|---:|
+| 1 | 56 | 262144 | 9835.71 |
+| 2 | 56 | 524288 | 2970.71 |
+| 3 | 60 | 630144 | 73.90 |
+| 4 | 60 | 622016 | 71.28 |
+| 5 | 62 | 613952 | 68.13 |
+| 6 | 62 | 605824 | 66.98 |
+| 7 | 62 | 597696 | 66.19 |
+| 8 | 62 | 589568 | 65.77 |
+
+All C1..8 cells exercise startup, fresh-Engine SSD restore with an exact cold-token check,
+and short/repeated requests, with all C lanes decode-ready. C6 and C8 additionally run near
+capacity at 100352 and 71680 prompt tokens per lane respectively. The minimum is sampled every
+50 ms and checked at synchronized phase boundaries; it is not a proof against unsampled
+external allocations. The 64-MiB external headroom remains physically available. These are
+instrumented memory checks, not throughput measurements. `physical-manifest.json` records the
+commands, actual graph bytes, resolved KV and observed driver growth. The fixed startup inventory
+guard remains mandatory. Host argument pools consume pinned host RAM rather than device VRAM.
+
+Uninstrumented whole-model comparisons use fixed DFlash K7, optimized proposal head, P2048,
+max context 262144, an 8192-token prompt, one warmup and three repetitions. Isolated decode measures
+256 post-prefill decode tokens per lane; whole inference includes the first prefill token plus
+128 decode tokens per lane. Both policies use
+automatic KV sizing. Every generated greedy token matches across policies at C1 and C6.
+
+| Workload | Previous classic | Bulk host arguments | Change |
+|---|---:|---:|---:|
+| C1 isolated decode tok/s | 192.368 | 192.404 | +0.02% |
+| C1 whole output tok/s | 39.275 | 39.267 | -0.02% |
+| C6 isolated decode tok/s | 661.820 | 668.690 | +1.04% |
+| C6 whole output tok/s | 45.737 | 47.282 | +3.38% |
+
+C6 resolved KV capacities were 593856 / 593856 tokens (classic / bulk).
+
+`model-performance.json` and the individual reports retain throughput dispersion and commands.
+C6 whole-inference standard deviations were 1.621 / 0.019 tok/s (classic / bulk), so the
+observed +3.38% whole-inference difference does not establish a repeatable speedup by itself.
+This compares submission policies at fixed K; production adaptive length can change its draft
+schedule with timing, so unchanged adaptive runs need not produce identical continuations.
+The prior adaptive-repeatability limitation remains in force. These results establish the
+submission-CPU reduction and measured model behavior, not a universal minimum launch cost.
+
+A separate instrumented C6 fixed-K7 whole run (8192/128, max context 16384) measured
+CPU time strictly inside each real `hipGraphLaunch`, discarding the first two calls per
+executable. Across 32 / 32 retained calls (classic / bulk), weighted mean
+submission CPU was 767.89 / 25.89 us.
+These instrumented runs establish submission attribution, not throughput.
+`model-submit-profile.json` retains node counts, call counts and per-executable CPU ranges;
+the read-only interposer source is retained beside it.
+
+The rebuilt Compose container passed health, image/argument verification, greedy HTTP and default
+sampling checks. It resolved 605824 KV tokens with graph observed/budget 62/62 MiB, 67.07 MiB
+available after startup and 67.04 MiB physically free after requests. Host cgroup peak was
+18.29 GiB under the unchanged 24-GiB/no-swap limit. The container was then stopped and this
+session's GPU lease released; the queued owner immediately acquired it. `deployment.json` and
+`lock-released.json` record the checks and handoff.
+
+### Previous classic graph residency and CPU submission (2026-10-16 UTC)
+
+The following measurements describe the preceding classic-replay revision. Its memory results
+remain a historical control; the active Compose submission policy is described above.
+
+That revision selected `DEBUG_HIP_GRAPH_CLASSIC_PATH=1`, `ROC_SKIP_KERNEL_ARG_COPY=1`, and
 `HSA_DISABLE_FRAGMENT_ALLOCATOR=1` on the selected HIP 7.15.26333 / ROCr 1.21 runtime,
 with other driver controls at their defaults.
 The calibrated preset remains `R9700Fp8Lut4`, C1..8, max context 262144, prefill chunk 2048,
@@ -150,7 +256,7 @@ finds no ownership or synchronization blocker.
 ### Packet-path VRAM baseline (2026-10-15)
 
 This historical control supplies the conservative packet-path bound retained after phase-image
-sharing. Compose now uses the qualified classic configuration above. Availability and minimum-free
+sharing. Compose now uses the qualified bulk host-argument configuration above. Availability and minimum-free
 figures in this historical control use HIP alone; they are not physical-headroom guarantees.
 
 The production `R9700Fp8Lut4` artifact was measured independently at every C1..8 on one

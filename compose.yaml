@@ -13,9 +13,11 @@ services:
         rocm: ${NINFER_ROCM_CONTEXT:-/opt/rocm/core-10.0}
         python311: ${NINFER_PYTHON_CONTEXT:?Set the self-contained Python 3.11 root in .env}
     environment:
-      DEBUG_HIP_GRAPH_CLASSIC_PATH: "1"
-      ROC_SKIP_KERNEL_ARG_COPY: "1"
+      DEBUG_HIP_GRAPH_CLASSIC_PATH: "0"
+      ROC_ENABLE_LARGE_BAR: "0"
+      ROC_SKIP_KERNEL_ARG_COPY: "0"
       HSA_DISABLE_FRAGMENT_ALLOCATOR: "1"
+      DEBUG_HIP_GRAPH_BATCH_SIZE: "16384"
     devices:
       - /dev/kfd:/dev/kfd
       - ${NINFER_DRM_RENDER_NODE:-/dev/dri/renderD128}:${NINFER_DRM_RENDER_NODE:-/dev/dri/renderD128}

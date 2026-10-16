@@ -20,16 +20,16 @@ is 32768 tokens. The 262144-token context limit includes prompt and output and i
 literal `--max-context` argument in `compose.yaml`.
 The server option for adaptive length is `--adaptive-draft`, not `--adaptive-token`.
 
-Compose sets `DEBUG_HIP_GRAPH_CLASSIC_PATH=1`, `ROC_SKIP_KERNEL_ARG_COPY=1`, and
-`HSA_DISABLE_FRAGMENT_ALLOCATOR=1` for the selected HIP 7.15 runtime. Classic graph replay avoids a
-separate device argument pool for each executable; direct argument capture removes a redundant CPU
-argument copy while retaining runtime-owned argument storage. Disabling ROCr's fragment allocator
-prevents the reproduced startup allocation failure at the qualified capacity. The measured
-low-residency budget applies only to these settings and the qualified production preset. Native
-launches of the same qualified preset without these settings retain the conservative packet-path
-budget; other presets use the full inventory bound. See `docs/performance.md` for per-concurrency
-residency and the measured speed tradeoff. Requalify these driver settings and budgets when the HIP
-toolchain or captured kernels change.
+Compose selects bulk packet replay with `DEBUG_HIP_GRAPH_CLASSIC_PATH=0`,
+`ROC_ENABLE_LARGE_BAR=0`, `ROC_SKIP_KERNEL_ARG_COPY=0`,
+`HSA_DISABLE_FRAGMENT_ALLOCATOR=1`, and `DEBUG_HIP_GRAPH_BATCH_SIZE=16384` on the
+selected HIP 7.15 runtime. The runtime places immutable graph arguments in pinned host memory
+and submits cached dispatch packets in bulk. Normal argument copying is required: skipping it
+failed the large-graph exact-output check. Disabling ROCr's fragment allocator prevents the
+reproduced startup allocation failure at the qualified capacity. The low-residency budget requires
+the first four settings and the qualified production preset; the batch cap controls submission
+cost. Other settings retain the conservative inventory bound. See `docs/performance.md` for
+residency, capacity and speed evidence. Requalify when the HIP toolchain or captured kernels change.
 Automatic sizing also reads the matching PCI device's amdgpu VRAM counters under `/sys` and
 uses the smaller of physical and HIP availability. The counters must remain readable inside
 the container so the external 64-MiB headroom is backed by physical availability.
