@@ -703,6 +703,101 @@ kernel, scheduling or container configuration was changed by this diagnostic. Th
 legacy whole-profile analyzer rejects benchmark schema 24 and C6; the retained standalone SQL
 analysis validates measured-region containment and uses explicit stage associations instead.
 
+## FP8 activation preparation follow-up (2026-10-16)
+
+The next bounded prefill experiment targets activation preparation on top of the shared-GDN
+implementation and upstream persistent-decode/deferred-GDN update. The production artifact remains
+`qwen3.8-27b/r9700-fp8lut4`; the FP8-K/INT4-V/FP16-scale cache, scheduling, precision boundaries,
+clocks and 300-W power cap are unchanged. The R9700 runs in `auto`, with Release ROCm 10 / HIP
+7.15 / AMDClang 23 and the canonical graph environment above.
+
+For ordinary T>=256 rows of K5120 or K17408, the producer retains packed BF16 inputs across the
+row reduction instead of loading them twice. Sign-cleared BF16 magnitude bits admit one unsigned
+maximum that also detects nonfinite rows. The shared fused producer encoder likewise reduces
+unsigned FP32 magnitude bits. Both preserve the existing FP32 `maximum / 448` scale and zero-row
+policy. Native two-value saturated E4M3 conversion replaces two scalar conversions: ISA inspection
+confirms four packed conversion instructions per eight values, rather than eight packed
+instructions with duplicated inputs. Smaller/other plain rows keep the existing resident body.
+There is no added global workspace or changed activation image format.
+
+Unprofiled owning-Op event measurements use seven groups of twenty launches after four warmups.
+The exact-code fixture has the same represented inputs before and after; baseline ranges below
+span its two surrounding invocations. These are producer latencies, not whole-inference gains.
+
+| Plain activation shape | Baseline range | Selected producer |
+|---|---:|---:|
+| T1024, K5120 | 0.041526–0.042966 ms | 0.029520 ms |
+| T2048, K5120 | 0.052462–0.052786 ms | 0.037320 ms |
+| T1024, K17408 | 0.070962–0.071230 ms | 0.047480 ms |
+| T2048, K17408 | 0.198428–0.198668 ms | 0.187270 ms |
+
+The fused T2048 RMSNorm producer measured 0.065786 ms versus 0.079276–0.081022 ms, and GDN gated
+RMSNorm measured 0.095034 ms versus 0.108738–0.110659 ms. Attention-output gating was effectively
+neutral at this width. The new K5120/K17408 prefill specializations use 57/73 VGPRs, 40 bytes LDS
+and zero private scratch or spills. The memory-traffic lower bound drops from two BF16 reads
+plus one code write (five bytes/value) to one read plus one write (three); this does not establish
+an HBM-traffic saving because the second baseline read can hit cache.
+
+Whole-inference comparison uses max context 262144, automatic KV, P2048, mixed `auto`, one warmup
+and three repetitions per invocation, without profiling or concurrent builds. C1 uses ordinary
+8192-token prefill; C6 uses fixed DFlash K7, optimized proposal head and an 8192,128 fresh-prompt
+whole wave per lane. Two invocations per implementation yield six pooled repetitions:
+
+| Scope | Baseline median | Selected median | Observed latency reduction |
+|---|---:|---:|---:|
+| C1 8192-token prefill wave | 2.375835 s | 2.352935 s | 0.96% |
+| C6 8192,128 whole wave | 16.293090 s | 16.188519 s | 0.64% |
+
+All generated tokens, C6 speculative statistics and automatic KV capacities match. C1
+baseline/selected ranges were
+2.371986–2.396011 / 2.350651–2.366054 s; C6 ranges were 16.258738–16.300633 /
+16.159915–16.198480 s. These support a small improvement on these workloads, not a general
+maximum-performance claim. Paired conversion alone was not a reliable whole-inference gain.
+A separate balanced comparison removes paired conversion from the otherwise selected producer.
+Its pooled C1/C6 medians change from 2.370090/16.228088 s to 2.361603/16.187690 s
+(0.36/0.25% reduction); C1 includes a 2.493601-s candidate outlier. The independent C6 comparison
+also favors retaining the native paired conversion, without establishing a universal gain.
+
+An isolated C6 decode regression check uses `-pg 8192,128 --isolate-prompt-decode` with the same
+fixed-K7 settings, balanced order, warmup and repetition count. Pooled decode-service medians
+were 1.473705 s baseline and 1.470841 s selected (about 0.19% lower), with identical tokens and
+speculative statistics. This establishes no observed decode regression on the tested workload.
+
+Final-source no-cache residency checks repeat startup plus an adaptive-DFlash 8192,8 whole
+request per lane at C6/C7/C8. Physical free is sampled every 50 ms with the same HIP allocation
+probe used above. Minimum free is 65.938/65.152/66.359 MiB; shared KV remains
+608576/600448/592256 tokens, observed graphs stay at 62 MiB, and workspace capacity stays
+265043968 bytes. The existing 64-MiB external headroom and runtime reservations cover the
+additional kernel code without a budget change. These instrumented runs are memory checks,
+not throughput evidence.
+
+Cache-enabled probes use the Compose-equivalent public Engine options (8192 MiB RAM,
+25600 MiB SSD) with separate per-concurrency cache directories. C6/C8 retain 605760/589440
+shared KV tokens and reach 68.523/68.934 MiB minimum free; observed graphs remain 62 MiB.
+
+Final-source producer and persistent qualifiers pass normally, with guard-page memcheck and
+allocation-poison initcheck. The producer also passes LDS racecheck; clang-tidy reports zero
+diagnostics. Persistent racecheck is limited by the existing `PhaseCta::group_sync` protocol:
+it uses workgroup release/acquire atomics, while checker epochs advance only at hardware
+workgroup barriers. An instrumented exact-HEAD baseline reproduces all 15 reported source sites,
+hazard kinds and per-site counts (519120776 total) identically. Neither report names changed
+encoder code; all 23 numerical scenarios pass in both. This is the documented unsupported
+synchronization model, not a passing persistent racecheck result. No checker suppression or
+product synchronization change was made. Independent review found no material implementation,
+numerical-contract or evidence concern.
+
+The alternative MLP codebook lookup interleaved nibble selectors before table lookup, preserving
+decoded bytes while shortening the codebook-result dependency. It passed the independent FP64
+Linear/SiLU oracle at real T1024/T2048 gate/up and down shapes, but neither plain down nor actual
+fused SiLU gate/up showed a reliable timing benefit in balanced comparisons. It is discarded.
+
+Numerical evidence includes the existing independent FP64 producer oracle and complete exact
+code/scale/status checks against the independent E4M3FN encoder at both plain widths. The latter
+cover zero, NaN, positive/negative infinity and T255/256/257 dispatch boundaries. Temporary
+baseline comparisons also matched complete fused producer images, with/without cache warming,
+and persistent-decode qualification passed. Evidence and exact commands are under
+`profiles/bench/r9700-prefill-followup-20261016/`.
+
 ## Shared GDN chunk preparation (2026-10-16)
 
 The follow-up optimization above targets state-independent work inside GDN rather than changing
