@@ -1886,18 +1886,20 @@ std::optional<std::size_t> Variant::calibrated_dflash_graph_allowance_bytes(
         !adaptive_draft)
         return std::nullopt;
 
-    // These HIP settings avoid per-executable packet argument pools. Keep their measured
-    // inventory separate from the default packet path; it is not a general graph-size bound.
-    const auto enabled = [](const char* name) {
+    // Packet replay keeps immutable kernel arguments in pinned host pools when the runtime
+    // does not use large BAR. This avoids per-executable VRAM pools and per-node submission.
+    const auto setting = [](const char* name, const char* expected) {
         const char* value = std::getenv(name);
-        return value != nullptr && std::strcmp(value, "1") == 0;
+        return value != nullptr && std::strcmp(value, expected) == 0;
     };
-    if (enabled("DEBUG_HIP_GRAPH_CLASSIC_PATH") && enabled("ROC_SKIP_KERNEL_ARG_COPY") &&
-        enabled("HSA_DISABLE_FRAGMENT_ALLOCATOR")) {
+    if (setting("DEBUG_HIP_GRAPH_CLASSIC_PATH", "0") && setting("ROC_ENABLE_LARGE_BAR", "0") &&
+        setting("ROC_SKIP_KERNEL_ARG_COPY", "0") &&
+        setting("HSA_DISABLE_FRAGMENT_ALLOCATOR", "1")) {
         // Shared run images and the complete C1..8 inventory on HIP 7.15.26333.
-        // profiles/bench/r9700-classic-launch-20261016/
-        constexpr std::array<std::size_t, 8> classic_graph_mib{56, 56, 60, 60, 62, 62, 62, 62};
-        return classic_graph_mib[concurrency - 1U] << 20U;
+        // profiles/bench/r9700-graph-submit-20261016/
+        constexpr std::array<std::size_t, 8> host_argument_graph_mib{56, 56, 60, 60,
+                                                                     62, 62, 62, 62};
+        return host_argument_graph_mib[concurrency - 1U] << 20U;
     }
 
     // Complete immutable inventory, measured separately at every C on gfx1201.

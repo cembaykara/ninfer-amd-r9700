@@ -432,15 +432,16 @@ void qualify_host_dflash_graph_allowance() {
     // These constants come from independent physical measurements, not a model
     // of executable counts. Keep the production capacity regression explicit.
     constexpr std::array<std::size_t, 8> graph_mib{318, 578, 842, 1102, 1364, 1624, 1884, 2144};
-    constexpr std::array<std::size_t, 8> classic_graph_mib{56, 56, 60, 60, 62, 62, 62, 62};
-    const auto enabled = [](const char* name) {
+    constexpr std::array<std::size_t, 8> host_argument_graph_mib{56, 56, 60, 60, 62, 62, 62, 62};
+    const auto setting = [](const char* name, const char* expected) {
         const char* value = std::getenv(name);
-        return value != nullptr && std::strcmp(value, "1") == 0;
+        return value != nullptr && std::strcmp(value, expected) == 0;
     };
-    const auto& measured_graph_mib = enabled("DEBUG_HIP_GRAPH_CLASSIC_PATH") &&
-                                             enabled("ROC_SKIP_KERNEL_ARG_COPY") &&
-                                             enabled("HSA_DISABLE_FRAGMENT_ALLOCATOR")
-                                         ? classic_graph_mib
+    const auto& measured_graph_mib = setting("DEBUG_HIP_GRAPH_CLASSIC_PATH", "0") &&
+                                             setting("ROC_ENABLE_LARGE_BAR", "0") &&
+                                             setting("ROC_SKIP_KERNEL_ARG_COPY", "0") &&
+                                             setting("HSA_DISABLE_FRAGMENT_ALLOCATOR", "1")
+                                         ? host_argument_graph_mib
                                          : graph_mib;
     constexpr std::array<std::size_t, 8> main_driver_mib{6, 6, 4, 4, 2, 2, 2, 2};
 #if defined(NINFER_R9700_XATTENTION_QUALIFICATION)
