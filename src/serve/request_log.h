@@ -213,7 +213,8 @@ std::string format_request_prepare_json(const std::string& server_instance_id,
                                         std::uint64_t timestamp_unix_ms,
                                         const RequestPreparationLogContext& context);
 std::string format_request_start_json(const std::string& server_instance_id,
-                                      std::uint64_t timestamp, const RequestLogContext& context);
+                                      std::uint64_t timestamp_unix_ms,
+                                      const RequestLogContext& context);
 std::string format_request_rejected_json(const std::string& server_instance_id,
                                          std::uint64_t timestamp,
                                          const RequestRejectionLogContext& context);
