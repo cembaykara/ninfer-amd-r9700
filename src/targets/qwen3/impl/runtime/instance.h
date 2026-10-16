@@ -95,24 +95,5 @@ inline std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t ca
     return Variant::dflash_graph_profiles(capacity, draft_window, batch_size, verify_width);
 }
 
-inline std::uint32_t speculative_graph_stride(std::uint32_t capacity, std::uint32_t max_concurrency,
-                                              std::span<const std::uint32_t> ks,
-                                              SpeculativeBackend backend,
-                                              std::uint32_t storage_width) {
-    std::uint32_t maximum = 0;
-    for (const auto k : ks) {
-        for (std::uint32_t batch = 1; batch <= max_concurrency; ++batch) {
-            const auto profiles =
-                backend == SpeculativeBackend::Mtp
-                    ? mtp_graph_profiles(capacity, k)
-                    : dflash_graph_profiles(capacity, k, batch,
-                                            dflash_captured_verify_width(k, storage_width));
-            for (const auto& profile : profiles) {
-                maximum = std::max(maximum, profile.topology_class);
-            }
-        }
-    }
-    return max_concurrency * (maximum + 1U);
-}
 
 } // namespace ninfer::targets::qwen3::detail::NINFER_QWEN3_RUNTIME_NS

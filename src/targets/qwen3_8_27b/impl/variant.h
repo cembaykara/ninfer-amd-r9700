@@ -6,6 +6,8 @@
 #include "ops/r9700/linear/fp8_activation.h"
 #include "targets/qwen3_8_27b/impl/config.h"
 #include "targets/qwen3_8_27b/impl/load/bindings.h"
+#include <array>
+
 #include <ninfer/targets/qwen3/decoder_state.h>
 #include <ninfer/targets/qwen3/runtime.h>
 
@@ -588,6 +590,13 @@ struct Variant {
                                                   std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t attention_output_projection_workspace_capacity_bytes(
         WeightsProfile profile, qwen3::TextPhase phase, std::int32_t first, std::int32_t last);
+
+    // At <=32 aggregate tokens the front already hosts the deferred fold. Above that
+    // boundary, fold/record fusion removes a recurrent-state read on batched DFlash chains.
+    [[nodiscard]] static constexpr bool gdn_record_fold_selected(std::int32_t tokens) noexcept {
+        return tokens > 32;
+    }
+
     [[nodiscard]] static std::size_t
     gdn_input_projection_workspace_capacity_bytes(WeightsProfile profile, qwen3::TextPhase phase,
                                                   std::int32_t first, std::int32_t last);
@@ -640,11 +649,30 @@ struct Variant {
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);
+
+    // NInfer-owned driver residency: 2 MiB precedes graph preparation, then lazy
+    // kernel residency remains after immutable graph warmup.
+    // The main-stream high-water varies with C; SSD scatter adds its own residency.
+    [[nodiscard]] static constexpr std::size_t
+    runtime_driver_reservation_bytes(WeightsProfile profile, std::uint32_t concurrency,
+                                     bool disk_cache_enabled) noexcept {
+        if (profile != WeightsProfile::R9700Fp8Lut4 || concurrency == 0U || concurrency > 8U)
+            return 0U;
+        constexpr std::array<std::size_t, 8> main_mib{6, 6, 4, 4, 2, 2, 2, 2};
+        return (2U + main_mib[concurrency - 1U] + (disk_cache_enabled ? 2U : 0U)) << 20U;
+    }
+
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window);
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     dflash_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
                           std::uint32_t batch_size, std::uint32_t verify_width);
+
+    [[nodiscard]] static std::optional<std::size_t>
+    calibrated_dflash_graph_allowance_bytes(WeightsProfile profile, qwen3::StartupFeatures features,
+                                            std::uint32_t capacity, std::uint32_t concurrency,
+                                            std::uint32_t prefill_chunk, std::uint32_t draft_window,
+                                            bool adaptive_draft);
 };
 
 } // namespace ninfer::targets::qwen3_8_27b::detail

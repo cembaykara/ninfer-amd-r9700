@@ -363,13 +363,15 @@ std::size_t node_count(hipGraph_t graph) {
 }
 
 struct GraphSet {
-    hipGraph_t captured = nullptr, lowered = nullptr;
-    hipGraphExec_t captured_exec = nullptr, lowered_exec = nullptr;
-    ninfer::DeviceBuffer storage; // must outlive the lowered graph and executable
+    hipGraph_t captured = nullptr, lowered = nullptr, peer = nullptr;
+    hipGraphExec_t captured_exec = nullptr, lowered_exec = nullptr, peer_exec = nullptr;
+    ninfer::ops::PersistentDecodeImageOwners storage, peer_storage;
 
     ~GraphSet() {
+        if (peer_exec != nullptr) (void)hipGraphExecDestroy(peer_exec);
         if (lowered_exec != nullptr) (void)hipGraphExecDestroy(lowered_exec);
         if (captured_exec != nullptr) (void)hipGraphExecDestroy(captured_exec);
+        if (peer != nullptr) (void)hipGraphDestroy(peer);
         if (lowered != nullptr) (void)hipGraphDestroy(lowered);
         if (captured != nullptr) (void)hipGraphDestroy(captured);
     }
@@ -398,7 +400,20 @@ Outcome qualify(Scenario& s, std::size_t launches, std::size_t expected_lowered,
                                                   " nodes, expected " + std::to_string(launches) +
                                                   " launches");
         check(hipGraphClone(&graphs.lowered, graphs.captured), "hipGraphClone");
-        graphs.storage  = ninfer::ops::persistent_decode_lower(graphs.lowered);
+        check(hipGraphClone(&graphs.peer, graphs.captured), "clone shared-image peer");
+        {
+            ninfer::ops::PersistentDecodeStorage images;
+            graphs.storage = ninfer::ops::persistent_decode_lower(graphs.lowered, images);
+            std::size_t used_before_peer = 0;
+            for (const auto& arena : graphs.storage) used_before_peer += arena->used();
+            graphs.peer_storage = ninfer::ops::persistent_decode_lower(graphs.peer, images);
+            require(graphs.storage == graphs.peer_storage,
+                    "identical phases did not share their device image");
+            std::size_t used_after_peer = 0;
+            for (const auto& arena : graphs.peer_storage) used_after_peer += arena->used();
+            require(used_before_peer == used_after_peer,
+                    "identical phases consumed additional arena storage");
+        } // Definition owners retain the image after the startup owner is gone.
         outcome.lowered = node_count(graphs.lowered);
         require(outcome.lowered < outcome.captured && outcome.lowered == expected_lowered,
                 "lowered to " + std::to_string(outcome.lowered) + " nodes, expected " +
@@ -407,6 +422,8 @@ Outcome qualify(Scenario& s, std::size_t launches, std::size_t expected_lowered,
               "instantiate captured");
         check(hipGraphInstantiate(&graphs.lowered_exec, graphs.lowered, nullptr, nullptr, 0),
               "instantiate lowered");
+        check(hipGraphInstantiate(&graphs.peer_exec, graphs.peer, nullptr, nullptr, 0),
+              "instantiate shared-image peer");
         const auto run = [&](hipGraphExec_t exec) {
             s.restore(stream);
             check(hipGraphLaunch(exec, stream), "hipGraphLaunch");
@@ -416,11 +433,15 @@ Outcome qualify(Scenario& s, std::size_t launches, std::size_t expected_lowered,
         const Snapshot reference       = run(graphs.captured_exec);
         const Snapshot reference_again = run(graphs.captured_exec);
         const Snapshot lowered         = run(graphs.lowered_exec);
+        const Snapshot peer            = run(graphs.peer_exec);
         const Snapshot lowered_again   = run(graphs.lowered_exec);
+        const Snapshot peer_again      = run(graphs.peer_exec);
         outcome.detail  = s.unwritten_outputs(reference) +
                           s.differences(reference, reference_again, "captured run-to-run") +
                           s.differences(reference, lowered, "captured vs lowered") +
+                          s.differences(reference, peer, "captured vs shared-image peer") +
                           s.differences(lowered, lowered_again, "lowered run-to-run") +
+                          s.differences(peer, peer_again, "shared-image peer run-to-run") +
                           s.constants_unchanged();
         outcome.pass    = outcome.detail.empty();
         outcome.buffers = s.compared_buffers();
@@ -433,7 +454,7 @@ Outcome qualify(Scenario& s, std::size_t launches, std::size_t expected_lowered,
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::cout << (outcome.pass ? "PASS " : "FAIL ") << outcome.name << ": " << outcome.captured
               << " launches -> " << outcome.lowered << " node(s), " << outcome.buffers
-              << " buffers (" << outcome.bytes / 1024U << " KiB) compared bitwise x3, "
+              << " buffers (" << outcome.bytes / 1024U << " KiB) compared bitwise x5, "
               << outcome.seconds << " s" << (outcome.pass ? "" : "\n  ") << outcome.detail << '\n';
     return outcome;
 }
@@ -867,10 +888,10 @@ int main(int argc, char** argv) {
         hipStream_t stream = nullptr;
         check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
         std::vector<Outcome> outcomes;
-        for (const unsigned T : {4U, 8U}) outcomes.push_back(attention_front(T, false, stream));
+        for (const unsigned T : {1U, 4U, 8U}) outcomes.push_back(attention_front(T, false, stream));
         outcomes.push_back(attention_front(8U, true, stream));
-        for (const unsigned T : {4U, 8U}) outcomes.push_back(attention_output_mlp(T, stream));
-        for (const unsigned T : {4U, 8U}) outcomes.push_back(projections(T, stream));
+        for (const unsigned T : {1U, 4U, 8U}) outcomes.push_back(attention_output_mlp(T, stream));
+        for (const unsigned T : {1U, 4U, 8U}) outcomes.push_back(projections(T, stream));
         for (const GdnCase& c :
              {GdnCase{4, false, 4, false, 0, 0, 0}, GdnCase{4, false, 4, false, 1, 1, 0},
               GdnCase{5, true, 3, false, 0, 0, 0}, GdnCase{6, false, 6, true, 1, 6, 0},
@@ -878,7 +899,7 @@ int main(int argc, char** argv) {
               GdnCase{7, false, 7, false, 2, 4, 0}, GdnCase{8, false, 8, false, 0, 0, 0},
               GdnCase{8, false, 8, false, 1, 7, 0}, GdnCase{8, true, 8, true, 2, 8, 2}})
             outcomes.push_back(gdn_layer(c, stream));
-        for (const unsigned T : {4U, 8U}) outcomes.push_back(rope_chain(T, stream));
+        for (const unsigned T : {1U, 4U, 8U}) outcomes.push_back(rope_chain(T, stream));
         check(hipStreamDestroy(stream), "stream destroy");
 
         const bool pass =

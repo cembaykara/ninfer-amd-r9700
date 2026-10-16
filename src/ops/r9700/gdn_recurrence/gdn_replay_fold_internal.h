@@ -28,6 +28,8 @@ struct alignas(16) GdnReplayFoldKernelRows {
 // standalone kernel and fused consumers (the FP8 GDN front).
 [[nodiscard]] fold::LayerArgs replay_fold_layer_args(const GdnLayerFold& layer_fold);
 void launch_replay_fold_layer(const fold::LayerArgs& args, hipStream_t stream);
+void launch_replay_prepare_layer(const fold::LayerArgs& args, const fold::Planes& staged,
+                                 hipStream_t stream);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,

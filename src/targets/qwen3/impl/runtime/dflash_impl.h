@@ -1061,9 +1061,10 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
 
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, std::uint32_t verify_width,
-                                 DFlashEnvelopes envelopes, DecodeGraphDefinition& definition) {
+                                 DFlashEnvelopes envelopes, DecodeGraphDefinition& definition,
+                                 ops::PersistentDecodeStorage& storage) {
     auto body = dflash_decode_batch_body(state, batch_size, k, verify_width, envelopes, false);
-    capture_graph(state, definition, batch_size, body);
+    capture_graph(state, definition, batch_size, storage, body);
 }
 
 void dflash_mixed_batch(DFlashBatchContext& state, DFlashMixedOwner& owner, std::int32_t batch_size,

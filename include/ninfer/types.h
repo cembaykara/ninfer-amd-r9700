@@ -73,7 +73,8 @@ enum class KvDiskCompress : std::uint8_t {
 };
 
 // Automatic KV sizing leaves this much device memory free. The Engine allocates everything at
-// startup, so it only covers driver-side growth (lazy per-kernel scratch) and other GPU users.
+// startup and budgets its own lazy driver residency separately. This reserve is
+// exclusively for other GPU users and display activity.
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 64ULL * 1024ULL * 1024ULL;
 
 struct KvCapacityPolicy {
@@ -259,6 +260,7 @@ struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    bool cache_write                      = true;
     bool capture_context_checkpoint       = false;
 };
 
@@ -413,6 +415,7 @@ struct PromptInput {
 };
 
 enum class RequestErrorKind : std::uint8_t {
+    CacheWriteConflict,
     InvalidToolSchema,
     InvalidOutputConstraint,
     ContextLengthExceeded,
@@ -769,6 +772,13 @@ struct RuntimeStats {
     std::size_t kv_disk_capacity_bytes = 0;
     std::size_t kv_disk_used_bytes     = 0;
     std::size_t kv_disk_entry_count    = 0;
+    // Live disk work is independent of scheduler occupancy. Save time is the full elapsed
+    // lifetime of completed spills, not time spent blocking requests in an observer interval.
+    bool kv_disk_spill_active            = false;
+    bool kv_disk_compaction_active       = false;
+    bool kv_disk_restore_active          = false;
+    std::size_t kv_disk_pending_jobs     = 0;
+    double kv_disk_spill_elapsed_seconds = 0;
     // Host wall from the last SSD byte of a disk restore until its page and state H2D
     // complete, summed over the process. Folded from harvested per-request copy seconds.
     double kv_disk_h2d_seconds = 0;

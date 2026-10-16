@@ -91,7 +91,9 @@ int main() {
         }
         ninfer::DecodeGraphDefinition graph;
         graph.capture(device.stream, [&] {
-            HIP_CHECK(hipMemsetAsync(buffer.data(), 0x4c, buffer.size(), device.stream));
+            for (int node = 0; node < 1000; ++node) {
+                HIP_CHECK(hipMemsetAsync(buffer.data(), 0x4c, buffer.size(), device.stream));
+            }
         });
         ninfer::DecodeGraphExecutable executable;
         executable.instantiate(graph);
@@ -105,19 +107,53 @@ int main() {
                 return 1;
             }
         }
-        ninfer::DecodeGraphDefinition updated_graph;
-        updated_graph.capture(device.stream, [&] {
-            HIP_CHECK(hipMemsetAsync(buffer.data(), 0x5a, buffer.size(), device.stream));
+        ninfer::DecodeGraphDefinition alternate_graph;
+        alternate_graph.capture(device.stream, [&] {
+            for (int node = 0; node < 1000; ++node) {
+                HIP_CHECK(hipMemsetAsync(buffer.data(), 0x5a, buffer.size(), device.stream));
+            }
         });
-        executable.update(updated_graph);
-        executable.launch(device.stream);
+        ninfer::DecodeGraphExecutable second_executable;
+        second_executable.instantiate(alternate_graph);
+        second_executable.upload(device.stream);
         device.synchronize();
+        std::size_t free_before_first_launch = 0, launch_total = 0;
+        HIP_CHECK(hipMemGetInfo(&free_before_first_launch, &launch_total));
+        second_executable.launch(device.stream);
+        device.synchronize();
+        std::size_t free_after_first_launch = 0;
+        HIP_CHECK(hipMemGetInfo(&free_after_first_launch, &launch_total));
+        if (free_after_first_launch < free_before_first_launch) {
+            std::cerr << "uploaded immutable graph first launch grew device residency\n";
+            return 1;
+        }
         buffer.copy_to_host(copied.data(), sizeof(copied));
         for (const auto word : copied) {
             if (word != 0x5a5a5a5aU) {
-                std::cerr << "HIP graph update wrote wrong bytes\n";
+                std::cerr << "immutable HIP graph selection wrote wrong bytes\n";
                 return 1;
             }
+        }
+        std::size_t free_before_switch = 0, total_bytes = 0;
+        HIP_CHECK(hipMemGetInfo(&free_before_switch, &total_bytes));
+        for (int iteration = 0; iteration < 128; ++iteration) {
+            auto& selected = iteration % 2 == 0 ? executable : second_executable;
+            selected.launch(device.stream);
+            device.synchronize();
+            buffer.copy_to_host(copied.data(), sizeof(copied));
+            const std::uint32_t expected = iteration % 2 == 0 ? 0x4c4c4c4cU : 0x5a5a5a5aU;
+            for (const auto word : copied) {
+                if (word != expected) {
+                    std::cerr << "immutable graph switching wrote wrong bytes\n";
+                    return 1;
+                }
+            }
+        }
+        std::size_t free_after_switch = 0;
+        HIP_CHECK(hipMemGetInfo(&free_after_switch, &total_bytes));
+        if (free_after_switch < free_before_switch) {
+            std::cerr << "warmed immutable graph switching grew device residency\n";
+            return 1;
         }
         device.order_copy_after_compute();
         device.synchronize_all();

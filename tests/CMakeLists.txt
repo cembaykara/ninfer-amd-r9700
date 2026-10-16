@@ -114,6 +114,12 @@ ninfer_add_r9700_test(ninfer_qwen3_recovery_executor_test
   LIBRARIES ninfer_engine)
 target_compile_definitions(ninfer_qwen3_recovery_executor_test PRIVATE
   NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+ninfer_add_r9700_test(ninfer_schema_grammar_test
+  SOURCES targets/qwen3/test_schema_grammar.cpp
+  LIBRARIES ninfer_token_grammar)
+ninfer_add_r9700_test(ninfer_grammar_tokenizer_test
+  SOURCES targets/qwen3/test_grammar_tokenizer.cpp
+  LIBRARIES ninfer_token_grammar)
 ninfer_add_r9700_test(ninfer_token_grammar_test
   SOURCES targets/qwen3/test_token_grammar.cpp
   LIBRARIES ninfer_engine)
@@ -388,4 +394,10 @@ ninfer_add_r9700_test(ninfer_r9700_output_constraint_real_test
   SOURCES targets/qwen3_8_27b/test_output_constraint_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_r9700_output_constraint_real_test PROPERTIES
+  LABELS "r9700;real" SKIP_RETURN_CODE 77 TIMEOUT 600 RESOURCE_LOCK r9700_device)
+
+ninfer_add_r9700_test(ninfer_r9700_engine_cache_write_real_test
+  SOURCES targets/qwen3_8_27b/test_engine_cache_write_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_r9700_engine_cache_write_real_test PROPERTIES
   LABELS "r9700;real" SKIP_RETURN_CODE 77 TIMEOUT 600 RESOURCE_LOCK r9700_device)

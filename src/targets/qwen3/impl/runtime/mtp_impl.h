@@ -405,9 +405,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 }
 
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                              DecodeGraphDefinition& definition) {
+                              DecodeGraphDefinition& definition,
+                              ops::PersistentDecodeStorage& storage) {
     auto body = mtp_decode_batch_body(state, batch_size, k);
-    capture_graph(state, definition, batch_size, body);
+    capture_graph(state, definition, batch_size, storage, body);
 }
 
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,

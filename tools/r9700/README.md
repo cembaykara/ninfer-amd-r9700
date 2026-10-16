@@ -164,7 +164,10 @@ separate device module or caller workspace for this route.
 the independent FP64 recurrence and ordinary snapshot updates. The canonical fold
 uses the production snapshot's key-normalization tree and eight-lane dot reduction;
 its six-token prefix and five-token path must publish bit-exact ordinary FP32 state,
-with exact convolution history and unchanged input records. Build that CMake target
+with exact convolution history and unchanged input records. The batched prepare/fold-record
+route also checks independent FP64 state and outputs at B2/W6 and B6,B8/W8, permuted
+record/state slots, independent current Q/K, zero through full committed prefixes, current valid-column masks,
+old-record overwrite safety, and repeated graph execution. Build that CMake target
 and run `build-r9700/src/ninfer_r9700_gdn_replay_fold_qual`. This admission uses the
 production `NINFER_R9700_GDN_VERIFY_WAVE_QK_CANDIDATE=0` profile; it does not admit the
 separate wave-QK experiment. Whole speculative-token qualification remains required.
@@ -1817,3 +1820,24 @@ VGPR respectively, with no LDS or private scratch.
 (guard-page allocations, poisoned allocations, and LDS race instrumentation of the device bitcode).
 `scripts/gpu-check.sh memcheck|initcheck|racecheck` runs them over the `gpucheck` qualifier set;
 semantics and limits are in [`docs/maintainer/code-quality.md`](../../docs/maintainer/code-quality.md#device-checks).
+
+## Graph submission benchmark
+
+Build `ninfer_r9700_graph_launch_bench` in `build-r9700` and run under the GPU lease:
+
+```sh
+flock --exclusive /ssdpool2nvme/local_llm/.ninfer-coordination/gpu.lock \
+  env DEBUG_HIP_GRAPH_CLASSIC_PATH=0 ROC_ENABLE_LARGE_BAR=0 \
+  ROC_SKIP_KERNEL_ARG_COPY=0 HSA_DISABLE_FRAGMENT_ALLOCATOR=1 \
+  DEBUG_HIP_GRAPH_BATCH_SIZE=16384 \
+  build-r9700/src/ninfer_r9700_graph_launch_bench --nodes 1000 --graphs 2
+```
+
+Use `--nodes 1`, `1000`, and `4096` to check launch scaling. Each node has a 512-byte
+by-value payload and one output pointer. The independent integer oracle checks capture, warmup,
+and every timed repetition; alternating immutable graphs use distinct arguments. Initialization
+and capture checks are ordered on the compute stream. JSON reports submission-thread CPU,
+enqueue wall time, synchronized wall time, process CPU, and signed residency deltas separately.
+Submission CPU excludes synchronization; synchronized wall time is not GPU-only timing.
+Do not use `ROC_SKIP_KERNEL_ARG_COPY=1` for bulk replay: the large-graph check failed on the
+qualified runtime. Model phase parity and whole-inference timings remain separate admission gates.

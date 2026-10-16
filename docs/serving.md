@@ -89,7 +89,7 @@ The endpoint supports:
 - the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
-- the vendor `ninfer` object (`capture_context_checkpoint`).
+- the vendor `ninfer` object (`cache_write`, `capture_context_checkpoint`).
 
 The request `model` is informational: NInfer runs one resident model, so it serves that model
 regardless of the identifier and echoes the requested value back (llama.cpp-compatible). The
@@ -154,6 +154,37 @@ chat (`E == 0`) is the same quiet no-op. `true` on a server started without `--s
 or with `--no-prefix-reuse` returns HTTP 400 `context_checkpoint_unavailable` before the
 request is enqueued. Anthropic Messages does not accept this object.
 `POST /v1/responses/input_tokens` allows `ninfer` only when omitted or JSON `null`.
+
+`ninfer.cache_write` is a strict boolean defaulting to `true`. Set it to `false` for a disposable
+turn that may read cached state without consuming or overwriting the original chat:
+
+```json
+{ "ninfer": { "cache_write": false } }
+```
+
+A VRAM hit copies the selected prefix and complete continuation state into an independent lane.
+A RAM/disk hit restores without consuming the source. If keeping the ordinary VRAM source
+prevents admission, the Engine attempts to save its full state and existing checkpoints to RAM
+before freeing its lane; this preserves the original, not the disposable result. All active
+lanes cause normal queueing. If an otherwise idle Engine cannot preserve the source using a
+separate lane, configured RAM capacity, or a preserving cold-prefill path, the request returns
+HTTP 429 `server_overloaded` with a capacity explanation. A disposable source itself is never
+saved to RAM to make another disposable turn possible.
+
+The disposable result can remain in VRAM for an exact continuation. It is evicted before ordinary
+retention when a lane or shared pages are needed and never goes to RAM/disk, including at idle
+or shutdown. It captures no context ladder, turn-rollback, or turn/response rewrite checkpoint;
+existing checkpoints may be read, and execution snapshots required for speculation/recovery
+remain. Edited or rerendered follow-ups may therefore need prefill. A later `cache_write: true`
+continuation can make its own resulting state normally cacheable. Originals remain subject to
+ordinary cache eviction after initialization; this option does not permanently pin or purge them.
+
+Combining `cache_write: false` with `capture_context_checkpoint: true` returns HTTP 400
+`cache_write_conflict`, parameter `ninfer.capture_context_checkpoint`, before enqueue or streaming:
+`capture_context_checkpoint=true requires cache_write=true because it creates a retained context checkpoint.`
+Saving an original may increase RAM/disk capture counters and copy time, but the disposable
+request reports zero captured context-checkpoint tokens. Request-log schema 19 records
+`request.cache_write` on generation and preparation-rejection events.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk, an empty `choices` usage trailer, and `[DONE]`. The finish chunk and trailer
@@ -435,6 +466,12 @@ Only those framing bytes are removed; indentation, trailing newlines and literal
 XML-looking text inside a string are preserved. For schemas admitting both a raw
 string and a JSON value, the lossless raw-string interpretation is preferred when
 the complete argument object satisfies the schema.
+
+Grammar compilation shares property rules and builds reference-only subset transitions directly.
+Tokenizer prefix metadata follows byte prefixes, including duplicate and Unicode spellings.
+Completed-call validators consume UTF-8 bytes without model-vocabulary masks. The resident frontend
+caches both immutable grammars; matcher state stays private to each request. A joined worker builds
+byte validators alongside vocabulary masks on a cold preparation.
 
 With declared tools, the free-text region after reasoning reserves the protocol prefixes
 `</invoke`, `</parameter`, `</function`, `</tool_call`, `<invoke`, `<parameter`, and
@@ -956,6 +993,10 @@ scrape_configs:
 | generation | `ninfer_generation_requests_total{protocol,result,stream,thinking,tools}`, TTFT / end-to-end / inter-token latency histograms, phase and per-request KV copy histograms, prompt/completion/reasoning/computed-prefill token histograms, prefill and decode tok/s histograms, finish reasons, tool calls, ignored tool markup, media requests, and token-count requests |
 | HTTP | `ninfer_http_requests_total{method,protocol,route,status}`, `ninfer_http_request_duration_seconds{protocol,route}`, `ninfer_http_in_flight_requests`, `ninfer_api_errors_total{code}` over a closed code set, and Responses store records/bytes and caps |
 
+The two `available_after_*` memory values are startup snapshots, not live free-memory counters.
+They use the smaller of HIP availability and graphics-inclusive physical free VRAM from the
+matching PCI device's amdgpu counters. The after-weights snapshot also follows RAM-cache registration.
+
 | Question | Signal |
 |---|---|
 | In flight? | `ninfer_http_in_flight_requests` vs `ninfer_scheduler_running_requests` vs `ninfer_scheduler_waiting_requests` |
@@ -1014,14 +1055,15 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v22 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v24 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
 | Event | Contents |
 |---|---|
 | `server_start` | target/weights identity and artifact (including `mapped_host_bytes`, the weights held in pinned host memory), resolved Engine, compile-bound Text-prefill/XAttention identity, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, pinned-host KV RAM capacity/occupancy, Device Graph observed/allowance bytes, HIP/GPU environment, and redacted argv |
-| `request_start` | protocol, resolved sampler and seed (including `p_less`), thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `request_prepare` | parsed request ID/protocol, body size, message/tool counts, and handler parse/context-assembly time; emitted before synchronous preparation begins |
+| `request_start` | completed synchronous `timings_seconds.synchronous_prepare`, protocol, resolved sampler and seed (including `p_less`), thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram` / `host_disk`), `context_checkpoint` (`restored_tokens` / `captured_tokens`), this request's unrounded phase clocks, `recovery` totals (including the true `cycle_exclusions`), complete speculative-decoding counters, `tool_call_count`, and `ignored_qwen_tool_call_names` (empty unless a tools-off completion contained parseable Qwen `<tool_call>` markup). Process KV occupancy and lifetime tier counters are not on this event |
 | `recovery` | one line per published Engine recovery event: `request.id`, `kind`, raw `cause` (including the exhausted detail), attempts, cycle exclusions, discarded tool calls and reasoning tokens, generated tokens, and remaining tokens |
@@ -1064,7 +1106,8 @@ parseable Qwen `<tool_call>` markup also writes a `warning` line naming the igno
 the request's `tools` / `tool_choice` / `tool_history` shape; the same names are in
 `request_done.result.ignored_qwen_tool_call_names`. OpenAI Responses, OpenAI Chat, and
 Anthropic generation requests receive a request ID when they enter synchronous preparation.
-Successful preparation produces `request_start`; a preparation failure produces `request_rejected`
+A `request_prepare` event precedes synchronous preparation. Successful preparation produces
+`request_start`; a preparation failure produces `request_rejected`
 without a matching start. Later generation failures produce `request_error`. Schema/model
 validation rejections before preparation and token-count-only calls are not measurement requests
 and do not receive request IDs.
@@ -1077,7 +1120,25 @@ and DFlash this is the accepted committed output, not draft or rejected tokens.
 `running`, `prefilling`, `decode_ready`, and `waiting` fields are the Engine scheduler snapshot at
 the end of the interval. Fully idle zero intervals are omitted. The JSONL `throughput` event keeps
 the raw token and round deltas as well as derived rates; downstream measurement should prefer those
-raw values.
+raw values. Disk `work` identifies active spill preparation/session, compaction, and restore targets;
+`pending` counts queued disk jobs. An active spill session reports `spill_age` in seconds (zero
+while preparation has not installed a session). These are background cache activities, independent
+of scheduler request occupancy. Active disk work keeps the periodic report visible, including its
+transition to idle. `spill_completed` is the sum of full lifetimes of spills completed during the
+interval, so it can exceed the interval and does not measure time blocking requests. The JSONL
+`timings_seconds.kv_disk_save` and cumulative metric `ninfer_kv_disk_save_seconds_total` have the
+same completed-spill lifetime semantics. JSONL scheduler fields and both metrics encodings expose
+`spill_active`, `compaction_active`, `restore_active`, `pending_jobs`, and `spill_elapsed_seconds`
+(with a `kv_disk_` prefix in JSONL and `ninfer_kv_disk_` in Prometheus).
+
+The preparation line is emitted after JSON/protocol parsing and, for Responses, context assembly;
+`parse` measures that handler work. It does not timestamp network arrival or body reception.
+The submitted line reports `prepare_sync`, the full `service.prepare` call including synchronous
+submission and tool-grammar compilation. JSONL records this as `timings_seconds.synchronous_prepare`;
+it is a separate wall clock from `request_done` phase accounting and must not be added to its phases.
+Disk snapshots use a nonblocking observer: if the disk index mutex is busy, the most recent snapshot
+is retained, so work flags and age may temporarily be stale. A gap with no preparation line can precede
+handler processing; these logs alone cannot attribute such a gap to a client or the network.
 
 ## Execution behavior
 

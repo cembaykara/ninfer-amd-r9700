@@ -381,7 +381,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
             "prefill after restore recomputed the restored prefix");
     require(prefix_equals(program.sequences[0].ledger, spliced_ids),
             "prefill after restore lost the spliced prompt");
-    program.consume_ram_entry(entry_id);
+    program.finish_ram_restore(entry_id, ninfer::runtime::CacheReadIntent::Consume);
     std::cout << "restored hit reused=" << restored.summary.reused_prompt_tokens
               << " suffix=" << restored.processed << '\n';
     exercise_decoded_retries(program, frontend, input, request);

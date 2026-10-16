@@ -85,9 +85,29 @@ request together at C3, with the fixed production cache, Device Graphs, ordinary
 DFlash chain verification. It checks schema values, exact text, EOS, streaming/logprob attribution
 and a second cached-compilation pass. The frontend suite checks represented byte/escape syntax,
 Unicode lengths, special-token literals, reasoning transitions and speculative rollback.
+`ninfer_schema_grammar_test` checks finite JSON languages and next-token masks against explicit
+word sets, including both object orders. `ninfer_grammar_tokenizer_test` compares masks with
+byte-wise acceptance for duplicate, prefix-related, and Unicode token spellings. The token-grammar
+suite also checks shared-rule alternatives, recursive schemas, cache isolation and concurrent
+cold compilation with independent completed-call validators.
 
 ```bash
 flock --exclusive /ssdpool2nvme/local_llm/.ninfer-coordination/gpu.lock \
   env NINFER_R9700_WEIGHTS=/ssdpool2nvme/local_llm/models/qwen3.8-27b-r9700-fp8lut4/qwen3.8-27b-r9700-fp8lut4.ninfer \
   ctest --test-dir build-r9700 -R '^ninfer_r9700_output_constraint_real_test$' --output-on-failure
+```
+
+## Disposable cache-write Engine integration
+
+`ninfer_r9700_engine_cache_write_real_test` checks `cache_write=false` source-preserving
+current/checkpoint reuse and writable continuation at C1/C2, ordinary/MTP/DFlash, capacity
+rejection, original RAM migration, disposable promotion, concurrent original/fork requests,
+disk cancellation and shutdown. The native RAM qualifier independently checks exact bytes for
+all three cache planes with mixed layouts and fragmented page mappings. Run the real fixture
+with the same explicit production artifact and GPU lease as the other R9700 Engine tests:
+
+```bash
+flock --exclusive /ssdpool2nvme/local_llm/.ninfer-coordination/gpu.lock \
+  env NINFER_R9700_WEIGHTS=/ssdpool2nvme/local_llm/models/qwen3.8-27b-r9700-fp8lut4/qwen3.8-27b-r9700-fp8lut4.ninfer \
+  ctest --test-dir build-r9700 -R '^ninfer_r9700_engine_cache_write_real_test$' --output-on-failure
 ```

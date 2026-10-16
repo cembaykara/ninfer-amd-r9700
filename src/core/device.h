@@ -32,6 +32,9 @@ struct DeviceContext {
     void bind_to_current_thread() const;
     void bind_to_current_thread_noexcept() const noexcept;
     [[nodiscard]] std::size_t total_vram() const noexcept;
+    // Conservative HIP/graphics-inclusive physical availability for this PCI device.
+    // Required Linux amdgpu counters must be readable and valid; no HIP-only fallback.
+    [[nodiscard]] std::size_t available_vram() const;
     void synchronize() const;
     void synchronize_all() const;
     void order_copy_after_compute() const;

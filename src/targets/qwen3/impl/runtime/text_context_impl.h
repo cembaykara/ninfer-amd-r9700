@@ -1314,6 +1314,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, int text_laye
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         GdnReplayRecordLayer persistent_records;
         GdnReplayRecordLayer live_records;
+        std::optional<ops::GdnRecordFold> record_fold;
         const bool pack_replay = gdn_state_action_ == GdnStateAction::RecordForReplay &&
                                  replay_records_ != nullptr && width != replay_records_->spec.width;
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
@@ -1322,8 +1323,19 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, int text_laye
             }
             persistent_records =
                 replay_records_->layer(gidx, active_sequence_row_, active_sequence_batch_);
-            live_records                                      = persistent_records;
-            const std::optional<ops::GdnLayerFold> layer_fold = deferred_gdn_layer_fold(gidx);
+            live_records                                = persistent_records;
+            std::optional<ops::GdnLayerFold> layer_fold = deferred_gdn_layer_fold(gidx);
+            constexpr bool observes_state               = requires {
+                tap.capture_gdn_recurrent_state_batch(text_layer, state_.recurrent[0],
+                                                      *active_linear_state_slots_, s);
+            };
+            if (!observes_state && record_front && layer_fold && active_sequence_batch_ > 1 &&
+                Variant::gdn_record_fold_selected(T) && active_parent_index_ == nullptr) {
+                record_fold = workspace_recipe::gdn_record_fold<TextConfig>(
+                    work_, replay_records_->spec.width, active_sequence_batch_);
+                ops::gdn_replay_prepare_layer(*layer_fold, *record_fold, s);
+                layer_fold.reset();
+            }
             if (layer_fold && !record_front) ops::gdn_replay_fold_layer(*layer_fold, s);
             if (pack_replay) {
                 // LLD Capture/run: GDN requires record.ne[2]==q.ne[2]; pack only when they differ.
@@ -1401,7 +1413,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, int text_laye
                 q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states, valid,
                 *active_linear_state_slots_, live_records.key, live_records.value,
                 live_records.gate, out_batch, s, active_parent_index_, &work_,
-                Variant::gdn_recurrence_warm(*w.out_proj, T));
+                Variant::gdn_recurrence_warm(*w.out_proj, T),
+                record_fold ? &*record_fold : nullptr);
             if (pack_replay) {
                 qwen3::pack_replay_record_layer(persistent_records, live_records, s);
             }

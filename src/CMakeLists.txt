@@ -804,6 +804,13 @@ ninfer_r9700_internal_includes(ninfer_r9700_persistent_decode_qual)
 set_target_properties(ninfer_r9700_persistent_decode_qual PROPERTIES HIP_ARCHITECTURES gfx1201)
 target_link_libraries(ninfer_r9700_persistent_decode_qual PRIVATE ninfer_r9700_core hip::host)
 
+# CPU submission and synchronized completion of immutable graph replay, with an integer oracle.
+add_executable(ninfer_r9700_graph_launch_bench
+  ${PROJECT_SOURCE_DIR}/tools/r9700/graph_launch_bench.hip)
+ninfer_r9700_internal_includes(ninfer_r9700_graph_launch_bench)
+set_target_properties(ninfer_r9700_graph_launch_bench PROPERTIES HIP_ARCHITECTURES gfx1201)
+target_link_libraries(ninfer_r9700_graph_launch_bench PRIVATE ninfer_r9700_core hip::host)
+
 # Qualify the fused DFlash drafter Q/K norm, RoPE and V split.
 add_executable(ninfer_r9700_dflash_qkv_norm_rope_qual
   ${PROJECT_SOURCE_DIR}/tools/r9700/dflash_qkv_norm_rope_qual.hip)
