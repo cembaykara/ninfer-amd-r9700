@@ -148,11 +148,11 @@ int main(int argc, char** argv) {
                "       ninfer_r9700_engine_cache_cancel_qual ARTIFACT.ninfer --disk-dir "
                "NEW_DIRECTORY\n"
                "Manual real-model check: ordinary greedy C1, 16-token requests, "
-               "1 GiB RAM cache.\n"
+               "8 GiB RAM cache.\n"
                "Cancellation starts after the first nonempty stream delta; "
                "its exact GPU phase is not forced.\n"
                "Disk mode instead checks durable restart/HostDisk reuse against cold output;\n"
-               "uses 1 GiB RAM + 1 GiB SSD and retains the new directory.\n";
+               "uses 8 GiB RAM + 1 GiB SSD and retains the new directory.\n";
         return argc == 2 ? 0 : 2;
     }
     try {
