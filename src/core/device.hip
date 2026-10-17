@@ -2,9 +2,12 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <mutex>
+#include <system_error>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -37,19 +40,62 @@ void destroy_event(hipEvent_t& event) noexcept {
     }
 }
 
-std::size_t read_vram_counter(const std::string& path) {
+std::size_t read_amdgpu_memory_counter(const std::string& path) {
     std::ifstream input(path);
     std::string text;
     std::string extra;
     if (!(input >> text) || (input >> extra) || input.bad()) {
-        throw std::runtime_error("cannot read required amdgpu VRAM counter: " + path);
+        throw std::runtime_error("cannot read required amdgpu memory counter: " + path);
     }
     std::size_t value = 0;
     const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
     if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
-        throw std::runtime_error("invalid amdgpu VRAM counter: " + path);
+        throw std::runtime_error("invalid amdgpu memory counter: " + path);
     }
     return value;
+}
+
+std::string amdgpu_memory_root(int device) {
+    char pci_id[64]{};
+    const hipError_t pci_error = hipDeviceGetPCIBusId(pci_id, sizeof(pci_id), device);
+    if (pci_error != hipSuccess) {
+        throw std::runtime_error(hip_error_message("hipDeviceGetPCIBusId", pci_error));
+    }
+    const std::string_view identity(pci_id);
+    const char* cursor   = identity.data();
+    const char* end      = cursor + identity.size();
+    const auto component = [&](unsigned int maximum, char delimiter) {
+        unsigned int value = 0;
+        const auto parsed  = std::from_chars(cursor, end, value, 16);
+        if (parsed.ec != std::errc{} || value > maximum ||
+            (delimiter == '\0' ? parsed.ptr != end
+                               : parsed.ptr == end || *parsed.ptr != delimiter)) {
+            throw std::runtime_error("invalid HIP PCI device identity: " + std::string(pci_id));
+        }
+        cursor = parsed.ptr + (delimiter == '\0' ? 0 : 1);
+        return value;
+    };
+    const unsigned int domain   = component(0xffffU, ':');
+    const unsigned int bus      = component(0xffU, ':');
+    const unsigned int slot     = component(0x1fU, '.');
+    const unsigned int function = component(7U, '\0');
+    char canonical_pci_id[32]{};
+    std::snprintf(canonical_pci_id, sizeof(canonical_pci_id), "%04x:%02x:%02x.%x", domain, bus,
+                  slot, function);
+    return std::string("/sys/bus/pci/devices/") + canonical_pci_id + "/";
+}
+
+void configure_host_memory_policy() {
+    static std::once_flag configured;
+    std::call_once(configured, [] {
+        // Fixed gfx1201 policy: driver-backed host memory and normal unified VA.
+        // Set before the first HIP call; these options are consumed by ROCr init.
+        if (::setenv("HSA_USERPTR_FOR_PAGED_MEM", "0", 1) != 0 ||
+            ::setenv("HSA_USE_SVM", "1", 1) != 0) {
+            throw std::system_error(errno, std::generic_category(),
+                                    "configure R9700 host-memory policy");
+        }
+    });
 }
 
 } // namespace
@@ -62,6 +108,7 @@ void hip_check(hipError_t error, const char* expr, const char* file, int line) {
 }
 
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
+    configure_host_memory_policy();
     int count        = 0;
     hipError_t error = hipGetDeviceCount(&count);
     if (error != hipSuccess) {
@@ -198,42 +245,30 @@ std::size_t DeviceContext::available_vram() const {
     if (memory_error != hipSuccess) {
         throw std::runtime_error(hip_error_message("hipMemGetInfo", memory_error));
     }
-    char pci_id[64]{};
-    const hipError_t pci_error = hipDeviceGetPCIBusId(pci_id, sizeof(pci_id), device);
-    if (pci_error != hipSuccess) {
-        throw std::runtime_error(hip_error_message("hipDeviceGetPCIBusId", pci_error));
-    }
-    const std::string_view identity(pci_id);
-    const char* cursor   = identity.data();
-    const char* end      = cursor + identity.size();
-    const auto component = [&](unsigned int maximum, char delimiter) {
-        unsigned int value = 0;
-        const auto parsed  = std::from_chars(cursor, end, value, 16);
-        if (parsed.ec != std::errc{} || value > maximum ||
-            (delimiter == '\0' ? parsed.ptr != end
-                               : parsed.ptr == end || *parsed.ptr != delimiter)) {
-            throw std::runtime_error("invalid HIP PCI device identity: " + std::string(pci_id));
-        }
-        cursor = parsed.ptr + (delimiter == '\0' ? 0 : 1);
-        return value;
-    };
-    const unsigned int domain   = component(0xffffU, ':');
-    const unsigned int bus      = component(0xffU, ':');
-    const unsigned int slot     = component(0x1fU, '.');
-    const unsigned int function = component(7U, '\0');
-    char canonical_pci_id[32]{};
-    std::snprintf(canonical_pci_id, sizeof(canonical_pci_id), "%04x:%02x:%02x.%x", domain, bus,
-                  slot, function);
-    const std::string root = std::string("/sys/bus/pci/devices/") + canonical_pci_id + "/";
-    const std::size_t physical_total = read_vram_counter(root + "mem_info_vram_total");
-    const std::size_t physical_used  = read_vram_counter(root + "mem_info_vram_used");
+    const std::string root           = amdgpu_memory_root(device);
+    const std::size_t physical_total = read_amdgpu_memory_counter(root + "mem_info_vram_total");
+    const std::size_t physical_used  = read_amdgpu_memory_counter(root + "mem_info_vram_used");
     if (physical_total == 0 || physical_used > physical_total) {
-        throw std::runtime_error("inconsistent amdgpu VRAM counters for " +
-                                 std::string(canonical_pci_id));
+        throw std::runtime_error("inconsistent amdgpu VRAM counters for " + root);
     }
     // KFD/HIP availability can exclude graphics allocations. External headroom must
     // remain physically available to other GPU users, not just to KFD allocations.
     return std::min(hip_free, physical_total - physical_used);
+}
+
+std::size_t available_pinned_host_memory() {
+    int device             = 0;
+    const hipError_t error = hipGetDevice(&device);
+    if (error != hipSuccess) {
+        throw std::runtime_error(hip_error_message("hipGetDevice for GTT capacity", error));
+    }
+    const std::string root  = amdgpu_memory_root(device);
+    const std::size_t total = read_amdgpu_memory_counter(root + "mem_info_gtt_total");
+    const std::size_t used  = read_amdgpu_memory_counter(root + "mem_info_gtt_used");
+    if (total == 0 || used > total) {
+        throw std::runtime_error("inconsistent amdgpu GTT counters for " + root);
+    }
+    return total - used;
 }
 
 void DeviceContext::synchronize() const {

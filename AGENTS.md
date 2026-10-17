@@ -253,6 +253,12 @@ HIP build is `build-r9700/`; profiler output is under `profiles/rocprof/` and `p
 hardware is one AMD Radeon AI PRO R9700, `gfx1201`, wave32, with the selected ROCm 10 toolchain
 under `/opt/rocm`.
 Engine, CLI, serve, and PPL use the one fixed FP8-K/INT4-V cache and expose no cache dtype selector.
+Before its first HIP call, `DeviceContext` fixes process-local ROCr host allocation to
+`HSA_USERPTR_FOR_PAGED_MEM=0` and normal SVM/unified addressing (`HSA_USE_SVM=1`). Pinned
+host arenas use HIP/GTT backing; direct artifact and disk-cache reads use ordinary-RAM staging.
+RAM KV, checkpoints, mapped weights and runtime pinned buffers share the driver GTT budget.
+This policy changes no host compaction sysctl; requested RAM capacity fails clearly if it
+cannot be allocated rather than silently shrinking or falling back to USERPTR memory.
 Use the selected Python 3.11 interpreter explicitly; do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified
 "latest" name; large artifacts, source checkpoints, and profiler outputs are local prerequisites,

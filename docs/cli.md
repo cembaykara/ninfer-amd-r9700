@@ -297,7 +297,7 @@ so it is not part of the device weights. It does not probe
 allocations or resize the pool at request time. The single-request
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
-Checkpoint images live in one pinned host slab that startup allocates, prefaults, and registers
+Checkpoint images live in one driver-backed HIP/GTT pinned host slab allocated at startup
 outside `--kv-ram-capacity`: each lane's turn (rewrite) checkpoint image of the GDN state
 (146.8 MiB on Qwen3.8-27B, plus 40 MiB of DFlash local K/V), and with MTP or DFlash a pool of
 context-checkpoint heads (the same image plus the hidden row) for prefill-ladder and
@@ -319,6 +319,11 @@ otherwise it costs one H2D before the suffix prefill.
 `--kv-ram-capacity N` is a separate pinned-host budget in MiB for completed prefix bundles. It is
 not a token capacity, does not enlarge the GPU pool, and defaults to `off`. `N` must be a positive
 decimal integer; `0` is rejected. Construction fails if the host pin cannot be allocated.
+The fixed host-memory policy uses driver-backed GTT allocations with normal unified addressing;
+it changes no system-wide compaction setting. The RAM tier shares the GTT budget with checkpoint
+slabs, mapped weights, transfer staging and runtime host buffers. Host RAM availability alone does
+not guarantee admission; startup reports the requested allocation and remaining GTT budget when
+that budget is insufficient. Requested capacity is never silently reduced.
 `--kv-disk-capacity N` is a third-tier SSD budget in MiB of unique object bytes. It requires
 `--kv-ram-capacity > 0` and `--kv-disk-location PATH`. Location without capacity is an error.
 `--kv-disk-compress zstd` compresses new GDN/hidden/cyclic blobs only; KV pages are never
