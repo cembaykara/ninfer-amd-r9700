@@ -5,12 +5,14 @@
 // token with a nonfinite input, at small and prefill widths. Each producer is also run with a
 // CacheWarm (core/cache_warm.h) and must publish a byte-identical image.
 #include "ops/r9700/linear/fp8_activation.h"
+#include "qualification_device_guard.h"
 #include "../../tests/ops/fp8_int4_kv_oracle.h"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -19,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 namespace {
 
@@ -322,16 +325,95 @@ void run(std::uint32_t tokens, bool poison, Rng& rng, hipStream_t stream) {
     }
 }
 
+void check_plain_exact(std::uint32_t T, std::uint32_t K, hipStream_t stream) {
+    std::vector<hip_bfloat16> x(std::size_t(T) * K);
+    for (unsigned t = 0; t < T; ++t)
+        for (unsigned k = 0; k < K; ++k) {
+            const unsigned raw = ((k * 37U + t * 101U) % 0x43e1U) | ((k & 1U) ? 0x8000U : 0U);
+            float value        = std::bit_cast<float>(raw << 16U) * std::ldexp(1.0F, int(t % 8U));
+            if (k == 0) value = 448.0F * std::ldexp(1.0F, int(t % 8U));
+            if (t == 0) value = std::copysign(0.0F, value);
+            if (t == 1 && k == K / 3) value = NAN;
+            if (t == 2 && k == K / 2) value = INFINITY;
+            if (t == 3 && k == K / 4) value = -INFINITY;
+            x[std::size_t(t) * K + k] = hip_bfloat16(value);
+        }
+    Device<hip_bfloat16> dx(x.size());
+    dx.upload(x);
+    Image image(T, K);
+    auto launch = [&] {
+        check(linear::fp8_quantize_activation({dx.data, image.workspace}, stream), "plain exact");
+    };
+    launch();
+    check(hipStreamSynchronize(stream), "sync exact");
+    std::vector<std::uint8_t> codes(image.workspace.code_bytes);
+    check(hipMemcpy(codes.data(), image.workspace.codes, codes.size(), hipMemcpyDeviceToHost),
+          "exact codes");
+    std::vector<float> scales(T);
+    std::vector<unsigned> flags(T);
+    check(
+        hipMemcpy(scales.data(), image.workspace.scales, T * sizeof(float), hipMemcpyDeviceToHost),
+        "read scales");
+    check(hipMemcpy(flags.data(), image.workspace.status, T * sizeof(unsigned),
+                    hipMemcpyDeviceToHost),
+          "read flags");
+    // The row maxima are 448 times a power of two, so the scale is exact.
+    std::unordered_map<std::uint64_t, std::uint8_t> expected_codes;
+    for (unsigned t = 0; t < T; ++t) {
+        double maximum = 0;
+        bool bad       = false;
+        for (unsigned k = 0; k < K; ++k) {
+            double value = static_cast<float>(x[std::size_t(t) * K + k]);
+            bad |= !std::isfinite(value);
+            if (std::isfinite(value)) maximum = std::max(maximum, std::abs(value));
+        }
+        const float scale = bad ? 0.0F : static_cast<float>(maximum) / 448.0F;
+        require(std::bit_cast<unsigned>(scales[t]) == std::bit_cast<unsigned>(scale),
+                "plain exact scale");
+        require(flags[t] == (bad ? linear::Fp8ActivationNonfinite : linear::Fp8ActivationOk),
+                "plain exact flag");
+        for (unsigned k = 0; k < K; ++k) {
+            std::uint8_t expected = 0;
+            if (!bad && scale != 0) {
+                float value             = static_cast<float>(x[std::size_t(t) * K + k]);
+                const std::uint64_t key = (std::uint64_t(std::bit_cast<unsigned>(scale)) << 32U) |
+                                          std::bit_cast<unsigned>(value);
+                auto it                 = expected_codes.find(key);
+                if (it == expected_codes.end())
+                    it = expected_codes.emplace(key, oracle::encode_e4m3fn(value / scale)).first;
+                expected = it->second;
+            }
+            if (codes[std::size_t(t) * image.workspace.padded_columns + k] != expected)
+                throw std::runtime_error("plain exact E4M3 code T" + std::to_string(T) + " K" +
+                                         std::to_string(K) + " token " + std::to_string(t) +
+                                         " column " + std::to_string(k));
+        }
+    }
+    require_warm_identical(
+        image, T, K,
+        [&](const auto& workspace, const auto& warm) {
+            return linear::fp8_quantize_activation({dx.data, workspace, warm}, stream);
+        },
+        stream, "plain exact K" + std::to_string(K) + " T" + std::to_string(T));
+}
+
 } // namespace
 
 int main() {
     try {
+        auto& guard = ninfer::r9700_qualification::device_guard();
+        guard.select();
         hipStream_t stream = nullptr;
         check(hipStreamCreate(&stream), "stream");
         Rng rng{0xf8f8ULL};
         for (const std::uint32_t tokens : {1U, 6U, 16U, 17U, 33U, 48U, 64U, 130U, 2048U})
             run(tokens, false, rng, stream);
         for (const std::uint32_t tokens : {6U, 49U, 300U}) run(tokens, true, rng, stream);
+        for (const std::uint32_t columns : {5120U, 17408U})
+            for (const std::uint32_t tokens : {255U, 256U, 257U})
+                check_plain_exact(tokens, columns, stream);
+        check(hipStreamDestroy(stream), "stream destroy");
+        guard.check("after-producer-qualification");
         std::cout << "fp8 producers qualification: PASS\n";
         return 0;
     } catch (const std::exception& error) {

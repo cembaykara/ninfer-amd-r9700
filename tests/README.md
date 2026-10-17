@@ -83,7 +83,9 @@ recorded by the benchmark and profiler workflow at the level of the claim.
 `ninfer_r9700_output_constraint_real_test` exercises JSON Schema, exact EBNF and an unconstrained
 request together at C3, with the fixed production cache, Device Graphs, ordinary decode, MTP and
 DFlash chain verification. It checks schema values, exact text, EOS, streaming/logprob attribution
-and a second cached-compilation pass. The frontend suite checks represented byte/escape syntax,
+and a second cached-compilation pass. The plain request switches from no-thinking to thinking
+on the second pass and checks closing-token counts and streamed logprobs across the reasoning
+boundary. The frontend suite checks represented byte/escape syntax,
 Unicode lengths, special-token literals, reasoning transitions and speculative rollback.
 `ninfer_schema_grammar_test` checks finite JSON languages and next-token masks against explicit
 word sets, including both object orders. `ninfer_grammar_tokenizer_test` compares masks with

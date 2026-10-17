@@ -448,6 +448,10 @@ The 2026-10-17 README refresh above updates the C1 allowance and resolved capaci
 | 7 | 62 | 597696 | 66.19 |
 | 8 | 62 | 589568 | 65.77 |
 
+These capacities precede the physical-residual correction in the 2026-10-16 shared-GDN
+follow-up below; that correction supersedes the C6..8 capacity values while retaining this
+graph inventory.
+
 All C1..8 cells exercise startup, fresh-Engine SSD restore with an exact cold-token check,
 and short/repeated requests, with all C lanes decode-ready. C6 and C8 additionally run near
 capacity at 100352 and 71680 prompt tokens per lane respectively. The minimum is sampled every
@@ -552,9 +556,10 @@ operator and lifetime qualification remains applicable at the reduced capacities
 column retains the HIP-measured growth used for its separate reservation. Capacity checks are
 instrumented and are not throughput evidence.
 
-The existing separate reservations remain valid: 2 MiB startup driver residency, the C-specific
-late driver values above, SSD device storage (54 MiB with DFlash), and a 4-MiB bound for physical
-arena rounding. None consumes the external 64-MiB headroom. At C6, graph allowance falls from
+That qualification used separate reservations: 2 MiB startup driver residency, the C-specific
+late driver values above, SSD device storage (54 MiB with DFlash), and a 4-MiB arena allocation
+bound. The C6..8 main-stream allowances are superseded by the physical-residual correction below.
+None consumes the external 64-MiB headroom. At C6, graph allowance fell from
 1624 to 62 MiB and shared KV grows from the prior deployment's 548736 to 605824 tokens after the physical-availability correction.
 
 The exact-capacity C8 engine reproduced a workspace allocation failure with 442 MiB reported
@@ -624,12 +629,13 @@ immutable-executable inventory bound; requalify the table after a graph/kernel/t
 NInfer separately reserves 2 MiB of startup driver residency preceding graph preparation
 (the first synchronous HIP clear of DFlash's 8-byte completion flag),
 plus its measured lazy kernel-driver residency. The main-stream component
-is 6/6/4/4/2/2/2/2 MiB at C1..8; enabling SSD adds 2 MiB for the scatter kernel. These are
+was 6/6/4/4/2/2/2/2 MiB at C1..8; the 2026-10-16 shared-GDN follow-up below corrects the
+physical residual at C6..8. Enabling SSD adds 2 MiB for the scatter kernel. These are
 NInfer-owned resources inside `B(M)`, in addition to the SSD's 52-MiB staging buffer and its
 2-MiB descriptor allocation bound. The existing 4-MiB bound covers physical allocation rounding
 of the runtime arenas. Neither physical rounding nor lazy driver resources consume external
-headroom. Physical allocation granularity is 2 MiB, so logical reservation bytes need not equal
-physical residency byte for byte.
+headroom. HIP arena accounting rounds in 2-MiB units; physical-counter residency can differ,
+so logical reservation bytes need not equal physical residency byte for byte.
 
 | C | Graph budget MiB | Late driver MiB, with SSD | Shared KV tokens | Long prompt per lane | Minimum observed free MiB |
 |---|---:|---:|---:|---:|---:|
@@ -814,6 +820,290 @@ Decode depends on DFlash acceptance and therefore on the prompt mix; compare onl
 harness. Prefill rows predate the 2026-09-28 output-head and
 attention GPTQ reconversions, which change weight values but not formats or routes, and all rows
 predate the 2026-09-30 reduction to 21 protections (C1 decode +2.3%, C4 unchanged, prefill +0.4%).
+
+## Prefill follow-up attribution after bulk graph submission (2026-10-16)
+
+Diagnostic on `experimental` after pulling `6f069b6c`, rebuilt Release `ninfer_bench`, production
+21-protection `r9700-lq4` artifact, one R9700/gfx1201, ROCm 10, unchanged 300 W cap and
+`auto` power profile. The canonical host-argument bulk graph flags from the container were used.
+The shared GPU lease covered every inference process and was released after collection.
+
+Workloads use `bench/fixtures/bench_corpus.ids`, chunk 2048 and mixed-forward `auto`:
+C1 ordinary prefill-only 8192 tokens (one sampled output, no speculation), and C6 fresh whole
+8192-token prompts with fixed DFlash K7, optimized proposal head and 128 decode steps per lane
+(129 output tokens including the first prefill token). One warmup and three unprofiled repetitions,
+max context 262144 and automatic KV capacity, gave:
+
+| Scope | Mean | Standard deviation |
+|---|---:|---:|
+| C1 8K prefill throughput | 3431.50 tok/s | 9.92 tok/s |
+| C1 8K prefill service | 2.38716 s | 0.00690 s |
+| C6 aggregate active prefill throughput | 3193.67 tok/s | 4.74 tok/s |
+| C6 summed prefill service | 15.39048 s | 0.02285 s |
+| C6 whole wave wall | 16.68891 s | 0.32627 s |
+
+Service and decode costs overlap; they must not be added as a wall-time decomposition.
+These are current baselines, not an A/B speedup result.
+
+Selected-region marker/kernel/copy traces capture one measured repetition after one warmup,
+excluding load, graph priming and warmup. Traces use max context 16384 and workload-sized KV
+(C6 timing uses 593856 KV tokens) to leave profiler memory. All traced output token IDs match all
+three unprofiled repetitions, including every C6 lane. Kernel shares below use summed dispatch
+durations, which can overlap; they are attribution, not exclusive wall shares:
+
+| Kernel family | C1 prefill | C6 whole |
+|---|---:|---:|
+| LQ4/raw-FP8 prefill GEMMs | 80.93% | 72.78% |
+| of which MLP gate/up and down | 56.71% | 50.49% |
+| Chunked GDN recurrence | 5.70% | 5.25% |
+| Dense prefill attention | 5.57% | 4.99% |
+| Text FP8 activation preparation | 5.06% | 4.59% |
+| GDN projection/conv scatter | 1.56% | 1.38% |
+
+C6 projection durations include the verify columns sharing mixed forwards. Its initial ordinary
+owner uses 2048-token chunks; most subsequent prefill/mixed projection launches use width 1024.
+The dominant GEMM variants use 240 VGPRs; raw-FP8 and smaller-width variants use fewer. All
+captured prefill GEMMs have zero scratch; chunked GDN uses 256 VGPRs, 58880 bytes LDS
+and 8 bytes scratch. A late 100 ms telemetry sample during the C6 trace observed 41 samples above
+90% GPU busy, averaging 297 W; this is a coarse trace-time observation, not proof of individual
+kernel saturation or a reason to change clocks/power.
+
+The highest-value kernel target is the MLP GEMM family at N34816/K5120 (gate/up) and
+N5120/K17408 (down), particularly the real mixed width 1024 and ordinary width 2048. A serial
+estimate from the C6 trace puts a 10% reduction of MLP kernel duration near 5% of whole-wave
+latency; this is a prioritization bound, not an achieved or guaranteed speedup. Prior wider/narrower
+tiles and weight-staging experiments remain rejected as recorded below. A new challenger needs a
+specific improvement to issue/staging/epilogue efficiency and the owning FP64 oracle before timing.
+GDN register lifetime/scratch and moving reusable intra-chunk work off its serial recurrence are
+secondary hypotheses; its entire captured cost is only about 5%, and the previously rejected
+value-row split should not be repeated without a changed mechanism. Attention is a secondary
+8K target; the historical 128K attention-heavy attribution remains a different workload.
+
+The union of kernel intervals leaves 5.73% of C1 measured wall and 11.46% of C6 measured wall
+without a captured kernel active. C6 copy durations sum to 13.21 ms (0.08% of measured wall),
+so transfers alone cannot explain that interval, although copy duration is not additive wall time.
+The subsequent HIP API trace (`c6-whole8192-api-trace`) retained exact token parity. It recorded
+15.508 s inside 756 `hipMemcpyAsync` calls, of which 96.38% overlapped active GPU kernels; this
+API duration must not be added to GPU time or interpreted as CPU execution cost. The 51087
+`hipLaunchKernel` calls totalled 202.60 ms of API wall duration, 83.30% overlapping GPU kernels.
+The trace also records the profiler's system-memory interception-queue fallback. Its graph/API
+latencies and inactive intervals cannot replace unprofiled measurements or justify deleting
+required host-visible token/state synchronization. C6 ordinary chunk markers cover only the
+initial owner, so their gap cannot describe all mixed prefill service. Remaining inactive time
+is not established recoverable launch overhead.
+
+Evidence: `profiles/rocprof/r9700-prefill-20261016/` contains exact commands, unprofiled reports,
+selected-region SQLite traces, token comparisons and standalone attribution scripts. No numerical,
+kernel, scheduling or container configuration was changed by this diagnostic. The maintained
+legacy whole-profile analyzer rejects benchmark schema 24 and C6; the retained standalone SQL
+analysis validates measured-region containment and uses explicit stage associations instead.
+
+## FP8 activation preparation follow-up (2026-10-16)
+
+The next bounded prefill experiment targets activation preparation on top of the shared-GDN
+implementation and upstream persistent-decode/deferred-GDN update. The production artifact remains
+`qwen3.8-27b/r9700-lq4`; the FP8-K/INT4-V/FP16-scale cache, scheduling, precision boundaries,
+clocks and 300-W power cap are unchanged. The R9700 runs in `auto`, with Release ROCm 10 / HIP
+7.15 / AMDClang 23 and the canonical graph environment above.
+
+For ordinary T>=256 rows of K5120 or K17408, the producer retains packed BF16 inputs across the
+row reduction instead of loading them twice. Sign-cleared BF16 magnitude bits admit one unsigned
+maximum that also detects nonfinite rows. The shared fused producer encoder likewise reduces
+unsigned FP32 magnitude bits. Both preserve the existing FP32 `maximum / 448` scale and zero-row
+policy. Native two-value saturated E4M3 conversion replaces two scalar conversions: ISA inspection
+confirms four packed conversion instructions per eight values, rather than eight packed
+instructions with duplicated inputs. Smaller/other plain rows keep the existing resident body.
+There is no added global workspace or changed activation image format.
+
+Unprofiled owning-Op event measurements use seven groups of twenty launches after four warmups.
+The exact-code fixture has the same represented inputs before and after; baseline ranges below
+span its two surrounding invocations. These are producer latencies, not whole-inference gains.
+
+| Plain activation shape | Baseline range | Selected producer |
+|---|---:|---:|
+| T1024, K5120 | 0.041526–0.042966 ms | 0.029520 ms |
+| T2048, K5120 | 0.052462–0.052786 ms | 0.037320 ms |
+| T1024, K17408 | 0.070962–0.071230 ms | 0.047480 ms |
+| T2048, K17408 | 0.198428–0.198668 ms | 0.187270 ms |
+
+The fused T2048 RMSNorm producer measured 0.065786 ms versus 0.079276–0.081022 ms, and GDN gated
+RMSNorm measured 0.095034 ms versus 0.108738–0.110659 ms. Attention-output gating was effectively
+neutral at this width. The new K5120/K17408 prefill specializations use 57/73 VGPRs, 40 bytes LDS
+and zero private scratch or spills. The memory-traffic lower bound drops from two BF16 reads
+plus one code write (five bytes/value) to one read plus one write (three); this does not establish
+an HBM-traffic saving because the second baseline read can hit cache.
+
+Whole-inference comparison uses max context 262144, automatic KV, P2048, mixed `auto`, one warmup
+and three repetitions per invocation, without profiling or concurrent builds. C1 uses ordinary
+8192-token prefill; C6 uses fixed DFlash K7, optimized proposal head and an 8192,128 fresh-prompt
+whole wave per lane. Two invocations per implementation yield six pooled repetitions:
+
+| Scope | Baseline median | Selected median | Observed latency reduction |
+|---|---:|---:|---:|
+| C1 8192-token prefill wave | 2.375835 s | 2.352935 s | 0.96% |
+| C6 8192,128 whole wave | 16.293090 s | 16.188519 s | 0.64% |
+
+All generated tokens, C6 speculative statistics and automatic KV capacities match. C1
+baseline/selected ranges were
+2.371986–2.396011 / 2.350651–2.366054 s; C6 ranges were 16.258738–16.300633 /
+16.159915–16.198480 s. These support a small improvement on these workloads, not a general
+maximum-performance claim. Paired conversion alone was not a reliable whole-inference gain.
+A separate balanced comparison removes paired conversion from the otherwise selected producer.
+Its pooled C1/C6 medians change from 2.370090/16.228088 s to 2.361603/16.187690 s
+(0.36/0.25% reduction); C1 includes a 2.493601-s candidate outlier. The independent C6 comparison
+also favors retaining the native paired conversion, without establishing a universal gain.
+
+An isolated C6 decode regression check uses `-pg 8192,128 --isolate-prompt-decode` with the same
+fixed-K7 settings, balanced order, warmup and repetition count. Pooled decode-service medians
+were 1.473705 s baseline and 1.470841 s selected (about 0.19% lower), with identical tokens and
+speculative statistics. This establishes no observed decode regression on the tested workload.
+
+Final-source no-cache residency checks repeat startup plus an adaptive-DFlash 8192,8 whole
+request per lane at C6/C7/C8. Physical free is sampled every 50 ms with the same HIP allocation
+probe used above. Minimum free is 65.938/65.152/66.359 MiB; shared KV remains
+608576/600448/592256 tokens, observed graphs stay at 62 MiB, and workspace capacity stays
+265043968 bytes. The existing 64-MiB external headroom and runtime reservations cover the
+additional kernel code without a budget change. These instrumented runs are memory checks,
+not throughput evidence.
+
+Cache-enabled probes use the Compose-equivalent public Engine options (8192 MiB RAM,
+25600 MiB SSD) with separate per-concurrency cache directories. C6/C8 retain 605760/589440
+shared KV tokens and reach 68.523/68.934 MiB minimum free; observed graphs remain 62 MiB.
+
+Final-source producer and persistent qualifiers pass normally, with guard-page memcheck and
+allocation-poison initcheck. The producer also passes LDS racecheck; clang-tidy reports zero
+diagnostics. Persistent racecheck is limited by the existing `PhaseCta::group_sync` protocol:
+it uses workgroup release/acquire atomics, while checker epochs advance only at hardware
+workgroup barriers. An instrumented exact-HEAD baseline reproduces all 15 reported source sites,
+hazard kinds and per-site counts (519120776 total) identically. Neither report names changed
+encoder code; all 23 numerical scenarios pass in both. This is the documented unsupported
+synchronization model, not a passing persistent racecheck result. No checker suppression or
+product synchronization change was made. Independent review found no material implementation,
+numerical-contract or evidence concern.
+
+The alternative MLP codebook lookup interleaved nibble selectors before table lookup, preserving
+decoded bytes while shortening the codebook-result dependency. It passed the independent FP64
+Linear/SiLU oracle at real T1024/T2048 gate/up and down shapes, but neither plain down nor actual
+fused SiLU gate/up showed a reliable timing benefit in balanced comparisons. It is discarded.
+
+Numerical evidence includes the existing independent FP64 producer oracle and complete exact
+code/scale/status checks against the independent E4M3FN encoder at both plain widths. The latter
+cover zero, NaN, positive/negative infinity and T255/256/257 dispatch boundaries. Temporary
+baseline comparisons also matched complete fused producer images, with/without cache warming,
+and persistent-decode qualification passed. Evidence and exact commands are under
+`profiles/bench/r9700-prefill-followup-20261016/`.
+
+## Shared GDN chunk preparation (2026-10-16)
+
+The follow-up optimization above targets state-independent work inside GDN rather than changing
+precision, clocks, scheduling or graph submission. For normalized ordinary T>=256, a separate
+chunk-parallel kernel computes normalized FP16 keys, FP32 query scales and FP32 QK/KK products
+once per Q/K head, shared by its three value heads. Per-value-head controls, FP16 A/P casts,
+diagonal solves and FP32 recurrent state stay in the existing recurrence. T16..255 keeps the
+direct chunk route. Caller-owned transient workspace is explicit in the Op and runtime plan:
+18.125 MiB at T2048, reused below the existing MLP workspace peak. This is GDN scratch, not an
+attention KV-cache plane.
+
+On the same R9700, Release ROCm 10 toolchain, canonical graph flags and unchanged `auto`/300 W
+profile, independent public FP64 oracle checks passed for ordinary in-place/distinct state,
+partial chunks, T255/256/257 crossover, snapshot and replay. Maximum output absolute error was
+1.114e-5, relative L2 0.001864 and state absolute error 1.527e-5. The same public qualifier's
+unprofiled event screen gave:
+
+| Ordinary normalized width | Incumbent | Shared preparation | Latency reduction |
+|---|---:|---:|---:|
+| T1024 | 0.318171 ms | 0.297464 ms | 6.51% |
+| T2048 | 0.636317 ms | 0.607608 ms | 4.52% |
+
+The integrated qualifier measured 0.297719/0.607449 ms at these widths. The producer uses 51
+VGPRs, 17408 bytes LDS and zero scratch; the prepared recurrence uses 256 VGPRs, 58880 bytes LDS
+and 12 bytes scratch. ISA inspection found the incumbent's 8-byte scratch was one offset save
+before the chunk loop and reload afterward, not repeated per-chunk traffic. A lane-contiguous
+vector-product workspace alternative passed the oracle but gave no timing benefit and was discarded.
+
+Whole-inference admission uses the same workloads and artifact as the attribution section,
+max context 262144, automatic KV, one warmup and three repetitions per invocation, in
+incumbent/candidate/candidate/incumbent order. The shared lease covers all invocations, with no
+build during timing. Pooled medians of six repetitions per implementation are:
+
+| Scope | Incumbent | Shared preparation | Observed latency reduction |
+|---|---:|---:|---:|
+| C1 ordinary 8192-token prefill service | 2.390364 s | 2.382705 s | 0.32% |
+| C6 fixed-K7 8192,128 whole wave | 16.768307 s | 16.748495 s | 0.12% |
+
+These small whole-inference differences have overlapping timing ranges; they establish no robust
+general speedup. The qualified improvement is at the GDN operator, with C6 whole inference
+nearly neutral. A 2.910451 s C1 incumbent outlier makes means unsuitable for this comparison.
+C6 summed prefill-service medians are 15.606773/15.812400 s, but include mixed decode work and
+are not exclusive prefill GPU time. Eleven repetitions have wave minus summed service near
+0.936 s; the first incumbent alone has 1.548 s. Aggregate reports cannot determine the cause of
+that phase-placement difference, so it does not establish a prefill-kernel regression.
+All twelve repetitions per concurrency have exact generated-token parity; C6 speculative
+statistics also match exactly. Workspace capacity/allocator peak remain 265043968/256262144
+bytes, and automatic KV capacity is unchanged by this implementation.
+
+Residency admission also exposed a pre-existing physical-budget shortfall with RAM/SSD caching
+disabled. The incumbent and candidate both resolved C8 KV to 592448 tokens and fell to about
+61.6 MiB free, despite configured 64-MiB external headroom. A C1..8 startup plus 8192,8 adaptive
+whole-inference sweep and physical/HIP phase snapshots separated this from the GDN workspace.
+At C6/C7/C8, measured aggregate physical consumption beyond logical arenas and the HIP graph
+observation was 8.744/9.980/about 10.83 MiB versus an 8-MiB reservation. HIP allocation rounding
+and physical residency differ; the snapshots do not establish an exact driver-allocation cause.
+
+The main-stream runtime bound changes from 6/6/4/4/2/2/2/2 to 6/6/4/4/2/4/4/6 MiB at C1..8,
+retaining the separate 2-MiB startup component, 4-MiB allocation bound and 2-MiB SSD scatter
+component. The increases at C6/C7/C8 are the smallest 2-MiB driver-reservation steps covering the
+observed aggregate deficit. They apply independently of RAM-cache size; two cache configurations
+do not establish a safe RAM-dependent calibration. The 64-MiB external headroom and 56/56/60/60/
+62/62/62/62-MiB graph table are unchanged. The throughput A/B above predates this independent
+capacity correction; it isolates the GDN implementation at identical KV capacity.
+
+Corrected no-cache capacity and physical minima are below. C1..5 retain their measured sweep
+entries; C6..8 are rebuilt reruns after the correction. Every cell uses max context 262144,
+adaptive DFlash K7, optimized proposal head, P2048/mixed `auto`, no warmup and one 8192,8 whole
+request per lane. Physical free is sampled every 50 ms over the complete subprocess lifetime;
+these instrumented checks are not throughput measurements.
+
+| C | Shared KV tokens, no RAM/SSD cache | Minimum physical free MiB |
+|---:|---:|---:|
+| 1 | 262144 | 9904.613 |
+| 2 | 524288 | 2783.805 |
+| 3 | 632960 | 71.301 |
+| 4 | 624896 | 67.059 |
+| 5 | 616768 | 65.539 |
+| 6 | 608576 | 66.008 |
+| 7 | 600448 | 65.223 |
+| 8 | 592256 | 66.434 |
+
+The cache-enabled probe sets public Engine options to 8192 MiB RAM and 25600 MiB SSD, matching
+Compose. It is compiled from the current benchmark driver with only those Engine options
+changed; the stock benchmark has no cache-capacity CLI flags. Production C6 resolves 605760
+shared KV tokens, with 68.578 MiB minimum physical free; C8 resolves 589440 tokens with
+69.012 MiB minimum free. Both retain 62 MiB observed/budgeted graphs. All measured allocator
+peaks remain 256262144 bytes within 265043968 bytes of workspace. The corrected runtime planner
+and its explicit C1..8 reservation assertions pass. The C8 probe uses its own fresh cache
+directory: reusing C6's directory correctly rejects the different cyclic-lane fingerprint.
+These short physical-capacity reruns do not claim a new long-context throughput result.
+
+Integration after rebasing onto the upstream decode work through `2cbd438c` passes the ordinary
+GDN FP64 qualifier, deferred fold/record qualifier, runtime planner and explicit reservation
+assertions. Rebuilt no-cache C6/C8 adaptive 8192,8 runs retain 65.926/66.344 MiB minimum physical
+free with unchanged 608576/592256 shared KV tokens and 62-MiB graphs. The prefill A/B above
+remains evidence against its stated `6f069b6c` baseline; it does not measure the separate upstream
+decode improvements. Integration records are under `profiles/bench/r9700-prefill-followup-20261016/`
+and the `merged-adaptive-capacity-c6/c8` records in the original evidence directory.
+
+The dominant GEMM hypotheses were also tested against the independent FP64 oracle and whole
+C1 prefill. Moving weight decode/store earlier than stage 3 passed the oracle but increased
+mean latency from 2.40010 s to 2.41972–2.44761 s. A 512x128 sixteen-wave CTA passed the oracle
+but took 2.458/2.468 s versus a stable 2.376 s incumbent. Both were rejected; production GEMM
+code is unchanged. The HIP API trace above does not justify removing required token/state
+synchronization or treating overlapping API waits as recoverable CPU time.
+
+The selected GDN route passed the required gfx1201 racecheck, memcheck and initcheck, the
+runtime planner qualifier, and focused clang-tidy with zero diagnostics. Evidence and exact
+commands are in `profiles/bench/r9700-prefill-opt-20261016/`; API attribution remains under
+`profiles/rocprof/r9700-prefill-20261016/`.
 
 ## Drafter leftovers after the persistent decode kernel (2026-10-03)
 
@@ -2567,7 +2857,8 @@ non-dual-issue FP32 VALU rate) is replaced by a chunked (WY) route: one workgrou
 walks 64-token chunks with FP16 WMMA products and FP32 accumulation, keeps each wave's 16 state
 rows as S^T WMMA accumulators that feed the next chunk directly, solves only the four FP32
 diagonal blocks of (I + A)^-1 and forms the corrected values by block forward substitution. It
-uses no workspace. P2048 is about 0.7–0.87 ms per call. Output error versus FP64 stays at the BF16
+initially used no workspace (the 2026-10-16 shared-preparation update above adds transient
+workspace for T>=256). P2048 was about 0.7–0.87 ms per call. Output error versus FP64 stays at the BF16
 floor (rel-RMS 1.73e-3 versus 1.66e-3 for the staged route); the FP32 state carries about 5e-4
 relative error on long synthetic runs (no growth with length), inside the GDN Op criterion.
 Interleaved: 4K 2242→2306, 32K 1874→1930 tok/s (eval artifact); 4K prefill PPL

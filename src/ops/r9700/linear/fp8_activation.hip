@@ -13,6 +13,83 @@
 namespace ninfer::ops::r9700::linear {
 namespace fp8_activation_kernels {
 
+// Retain each prefill row across the reduction: BF16 magnitude bits have unsigned
+// numeric order, including infinities and NaNs above every finite value.
+template <std::uint32_t Columns>
+__global__ __launch_bounds__(256) void fp8_quantize_prefill_kernel(
+    const hip_bfloat16* input, std::uint8_t* codes, float* scales, std::uint32_t* status,
+    unsigned tokens, unsigned padded, CacheWarm warm, unsigned work_ctas) {
+    static_assert(Columns == 5120U || Columns == 17408U);
+    constexpr unsigned Vectors = Columns / 8U, V = (Vectors + 255U) / 256U;
+    __shared__ unsigned maxima[8];
+    __shared__ float row_scale;
+    __shared__ unsigned row_bad;
+    const unsigned tid = threadIdx.x, lane = tid % 32U, wave = tid / 32U;
+    if (blockIdx.x >= work_ctas) {
+        warm_cache(warm, blockIdx.x - work_ctas, gridDim.x - work_ctas, tid, 256U);
+        return;
+    }
+    for (unsigned token = blockIdx.x; token < tokens; token += work_ctas) {
+        const auto* row = reinterpret_cast<const uint4*>(input + std::size_t(token) * Columns);
+        uint4 retained[V];
+        unsigned maximum = 0;
+#pragma unroll
+        for (unsigned v = 0; v < V; ++v) {
+            const unsigned index = v * 256U + tid;
+            if (index < Vectors) {
+                const uint4 value       = row[index];
+                retained[v]             = value;
+                const unsigned words[4] = {value.x, value.y, value.z, value.w};
+#pragma unroll
+                for (unsigned w = 0; w < 4; ++w) {
+                    maximum = max(maximum, words[w] & 0x7fffU);
+                    maximum = max(maximum, (words[w] >> 16U) & 0x7fffU);
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned d = 16; d; d >>= 1U) maximum = max(maximum, __shfl_down(maximum, d, 32));
+        if (lane == 0) maxima[wave] = maximum;
+        __syncthreads();
+        if (wave == 0) {
+            maximum = lane < 8U ? maxima[lane] : 0U;
+#pragma unroll
+            for (unsigned d = 16; d; d >>= 1U) maximum = max(maximum, __shfl_down(maximum, d, 32));
+            if (lane == 0) {
+                row_bad       = maximum >= 0x7f80U;
+                row_scale     = row_bad ? 0.0F : __uint_as_float(maximum << 16U) / 448.0F;
+                scales[token] = row_scale;
+                status[token] = row_bad ? Fp8ActivationNonfinite : Fp8ActivationOk;
+            }
+        }
+        __syncthreads();
+        const float scale  = row_scale;
+        const bool encoded = row_bad == 0U && scale != 0.0F;
+#pragma unroll
+        for (unsigned v = 0; v < V; ++v) {
+            const unsigned index = v * 256U + tid;
+            if (index < Vectors) {
+                unsigned packed[2] = {0, 0};
+                if (encoded) {
+                    const uint4 value       = retained[v];
+                    const unsigned words[4] = {value.x, value.y, value.z, value.w};
+#pragma unroll
+                    for (unsigned w = 0; w < 4; ++w) {
+                        const float low     = __uint_as_float(words[w] << 16U),
+                                    high    = __uint_as_float(words[w] & 0xffff0000U);
+                        const unsigned pair = __hip_cvt_float2_to_fp8x2(
+                            float2{low / scale, high / scale}, __HIP_SATFINITE, __HIP_E4M3);
+                        packed[w / 2U] |= pair << (16U * (w % 2U));
+                    }
+                }
+                *reinterpret_cast<uint2*>(codes + std::size_t(token) * padded + index * 8U) =
+                    uint2{packed[0], packed[1]};
+            }
+        }
+        __syncthreads();
+    }
+}
+
 __global__ __launch_bounds__(kBlockSize) void fp8_quantize_activation_kernel(
     const hip_bfloat16* input, std::uint8_t* codes, float* scales, std::uint32_t* status,
     std::uint32_t tokens, std::uint32_t columns, std::uint32_t padded, CacheWarm warm,
@@ -205,6 +282,24 @@ hipError_t fp8_quantize_activation(const Fp8ActivationQuantizeArgs& args,
         ranges_overlap(args.input, input_bytes, args.workspace.status,
                        status_bytes(args.workspace))) {
         return hipErrorInvalidValue;
+    }
+    if (args.workspace.tokens >= 256U &&
+        (args.workspace.columns == 5120U || args.workspace.columns == 17408U) &&
+        reinterpret_cast<std::uintptr_t>(args.input) % 16U == 0U) {
+        const unsigned blocks = std::min(args.workspace.tokens, kQuantizeResidentBlocks);
+        const dim3 grid(blocks + cache_warm_ctas(args.warm, kBlockSize, blocks));
+        if (args.workspace.columns == 5120U) {
+            hipLaunchKernelGGL((fp8_activation_kernels::fp8_quantize_prefill_kernel<5120U>), grid,
+                               dim3(kBlockSize), 0, stream, args.input, args.workspace.codes,
+                               args.workspace.scales, args.workspace.status, args.workspace.tokens,
+                               args.workspace.padded_columns, args.warm, blocks);
+        } else {
+            hipLaunchKernelGGL((fp8_activation_kernels::fp8_quantize_prefill_kernel<17408U>), grid,
+                               dim3(kBlockSize), 0, stream, args.input, args.workspace.codes,
+                               args.workspace.scales, args.workspace.status, args.workspace.tokens,
+                               args.workspace.padded_columns, args.warm, blocks);
+        }
+        return hipGetLastError();
     }
     const std::uint32_t work_ctas = std::min(args.workspace.tokens, kQuantizeResidentBlocks);
     hipLaunchKernelGGL(fp8_quantize_activation_kernel,

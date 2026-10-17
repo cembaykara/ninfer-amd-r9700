@@ -17,8 +17,7 @@ constexpr float kE4M3FiniteMaximum = 448.0F;
 
 template <std::uint32_t Threads>
 struct EncodeShared {
-    float wave_maxima[Threads / kWaveSize];
-    unsigned wave_bad[Threads / kWaveSize];
+    unsigned wave_maxima[Threads / kWaveSize];
 };
 
 // Encodes one token row of 8 * Vectors columns held by a Threads-thread CTA context as V vectors
@@ -37,35 +36,29 @@ __device__ __forceinline__ void encode_rows(const Cta& cta, EncodeShared<Threads
     const std::uint32_t thread = cta.thread();
     const std::uint32_t lane = thread % kWaveSize, wave = thread / kWaveSize;
     const auto exists = [&](std::uint32_t v) { return v * Threads + thread < Vectors; };
-    float maximum     = 0.0F;
-    unsigned bad      = 0U;
+    unsigned maximum  = 0U;
 #pragma unroll
     for (std::uint32_t v = 0; v < V; ++v) {
         if (!exists(v)) continue;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            bad |= static_cast<unsigned>(!isfinite(values[v][i]));
-            if (isfinite(values[v][i])) maximum = fmaxf(maximum, fabsf(values[v][i]));
+            maximum = max(maximum, __float_as_uint(values[v][i]) & 0x7fffffffU);
         }
     }
 #pragma unroll
     for (std::uint32_t delta = kWaveSize / 2U; delta != 0U; delta >>= 1U) {
-        maximum = fmaxf(maximum, __shfl_xor(maximum, delta, kWaveSize));
-        bad |= __shfl_xor(bad, delta, kWaveSize);
+        maximum = max(maximum, __shfl_xor(maximum, delta, kWaveSize));
     }
-    if (lane == 0U) {
-        shared.wave_maxima[wave] = maximum;
-        shared.wave_bad[wave]    = bad;
-    }
+    if (lane == 0U) { shared.wave_maxima[wave] = maximum; }
     cta.sync();
-    float row_maximum = 0.0F;
-    unsigned row_bad  = 0U;
+    unsigned row_maximum = 0U;
 #pragma unroll
     for (std::uint32_t index = 0; index < Threads / kWaveSize; ++index) {
-        row_maximum = fmaxf(row_maximum, shared.wave_maxima[index]);
-        row_bad |= shared.wave_bad[index];
+        row_maximum = max(row_maximum, shared.wave_maxima[index]);
     }
-    const float token_scale = row_bad != 0U ? 0.0F : row_maximum / kE4M3FiniteMaximum;
+    const unsigned row_bad = row_maximum >= 0x7f800000U;
+    const float token_scale =
+        row_bad != 0U ? 0.0F : __uint_as_float(row_maximum) / kE4M3FiniteMaximum;
     if (thread == 0U) {
         scales[token] = token_scale;
         status[token] = row_bad != 0U ? Fp8ActivationNonfinite : Fp8ActivationOk;
@@ -77,10 +70,12 @@ __device__ __forceinline__ void encode_rows(const Cta& cta, EncodeShared<Threads
         std::uint32_t packed[2] = {0U, 0U};
         if (encoded) {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const std::uint32_t code = static_cast<std::uint8_t>(__hip_cvt_float_to_fp8(
-                    values[v][i] / token_scale, __HIP_SATFINITE, __HIP_E4M3));
-                packed[i / 4] |= code << (8U * (i % 4));
+            for (int i = 0; i < 4; ++i) {
+                const float2 pair{values[v][2 * i] / token_scale,
+                                  values[v][2 * i + 1] / token_scale};
+                const std::uint32_t code =
+                    __hip_cvt_float2_to_fp8x2(pair, __HIP_SATFINITE, __HIP_E4M3);
+                packed[i / 2] |= code << (16U * (i % 2));
             }
         }
         *reinterpret_cast<uint2*>(codes + static_cast<std::size_t>(token) * padded +

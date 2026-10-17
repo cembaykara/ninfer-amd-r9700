@@ -1493,7 +1493,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, int text_laye
                                                 recurrent_state_trace.prefix_tokens, s);
     } else {
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                             /*normalize_qk=*/true, recurrent_state, o, s);
+                             /*normalize_qk=*/true, recurrent_state, o, work_, s);
     }
     if constexpr (requires { tap.capture_gdn_recurrence(text_layer, o, s); }) {
         tap.capture_gdn_recurrence(text_layer, o, s);
@@ -1572,7 +1572,7 @@ void TextContext::gdn_mix_mixed(const GdnLayerW& w, Tensor& x, int gidx, int tex
         Tensor recurrent_state =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
         ops::gated_delta_net(q_owner, k_owner, v_owner, g_owner, beta_owner, kGdnScale,
-                             /*normalize_qk=*/true, recurrent_state, o_owner, s);
+                             /*normalize_qk=*/true, recurrent_state, o_owner, work_, s);
     }
     {
         Tensor q_batch    = projection.query.slice(1, owner, verify)
