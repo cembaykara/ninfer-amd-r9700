@@ -256,7 +256,7 @@ the `quality/clang-tidy-backlog` branch, so `4051ebf0..26ba4203` are not descend
   when replays read it back; upstream captures without it, so its graph replays read calibration
   egress that no kernel wrote. The per-k temperature scale it removes was never ported here.
   R9700 production-shape A/B: acceptance +3.3%, decode +2.4% (`docs/performance.md`).
-- Already equivalent: `48eb0b01` producer-side A8 activations. The R9700 FP8LUT4 target already
+- Already equivalent: `48eb0b01` producer-side A8 activations. The R9700 LQ4 target already
   encodes projection inputs in their producers (`fp8_quantize_normalized`,
   `fp8_quantize_gated_rmsnorm`, `fp8_quantize_gated`), and at C1 the persistent decode kernel
   hosts the remaining quantize phases; MLP-down keeps a standalone quantizer in both trees. Its
@@ -307,7 +307,7 @@ and dflash gdn commits`). All changes are explicitly dispositioned; this sync ch
 
 - Excluded: the signed G16 A4 activation representation, RMSNorm/sigmoid/SwiGLU A4 producers,
   NVFP4 attention-input and residual consumers, NVFP4 tiled SwiGLU changes, and their target
-  dispatch/workspace changes. These are CUDA/NVFP4 routes outside the fixed R9700 FP8LUT4
+  dispatch/workspace changes. These are CUDA/NVFP4 routes outside the fixed R9700 LQ4
   weight and activation profiles. AMD's qualified producer-side A8 handoffs remain authoritative.
 - Excluded: 64-row short Exact attention prefill tiles. The changed launcher dispatch and kernel
   operate on upstream's U8 NVFP4 cache, with CUDA dynamic shared memory and NVIDIA matrix
@@ -364,7 +364,7 @@ reconciliation; no new correctness or performance claim is made. Future syncs re
 Verification: Release build with warnings as errors; native logprob FP64/exact oracle at
 248320 physical rows / 248077 tokens, signed-zero/equal-logit ties, large equal logits,
 strided and skipped outputs, explicit columns, widths through 16 and batches through 8;
-real r9700-fp8lut4 Engine checks for ordinary, MTP, DFlash chain/adaptive/eager/calibrated
+real r9700-lq4 Engine checks for ordinary, MTP, DFlash chain/adaptive/eager/calibrated
 Device Graphs, C8 reporting/quiet rows, streaming channel parity and reporting-on/off
 unchanged greedy tokens. Teacher-forced ordinary decode agrees within 0.000004 nats; the
 prefill comparison changes geometry by including its target token and is checked behaviorally

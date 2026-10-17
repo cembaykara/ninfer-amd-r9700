@@ -24,11 +24,13 @@ unique; shapes contain positive unsigned dimensions; object byte counts are posi
 
 ## Registered vocabulary
 
-- Numeric formats: `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, and
-  `W8G32_F16S`.
+- Numeric formats: `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`,
+  `W8G32_F16S`, `F8E4M3_ROW_F32S`, and `LQ4`.
 - Tensor layouts: `contiguous-le-v1`, `row-split-k128-v1`,
-  `r9700-q4g64-n16-k16-v1`, `r9700-w8g32-n16-k16-v1`, and `row-scaled-k128-v1`.
+  `r9700-q4g64-n16-k16-v1`, `r9700-w8g32-n16-k16-v1`, `row-scaled-k128-v1`, and
+  `r9700-lq4-n16k64-v1`.
 - Resource encoding: `raw-bytes-v1`.
+- Production identity: `qwen3.8-27b/r9700-lq4`.
 - Provisional evaluation identities: `qwen3.8-27b/r9700-int-candidate`,
   `qwen3.8-27b/r9700-w8g32-mse-eval`,
   `qwen3.8-27b/r9700-q4g64-n16k16-eval`, `qwen3.8-27b/r9700-q4-w8-n16k16-eval`,
@@ -38,9 +40,13 @@ unique; shapes contain positive unsigned dimensions; object byte counts are posi
   `qwen3.8-27b/r9700-w8-bf16-attn-vo-eval`, and
   `qwen3.8-27b/r9700-w8-bf16-gdn-qk-eval`.
 
-There is no compatibility format registry or runtime weight repacking. The R9700 candidate binds
-its grouped integer matrices directly to the HIP kernels. Its name remains provisional until the
-real BF16-source quality, capacity, and whole-inference Pareto gates select the final recipe.
+There is no compatibility format registry or runtime weight repacking. The R9700 target binds
+its encoded weights directly to the HIP kernels. The production LQ4 recipe and its admission
+gates are defined in `qwen3.8-27b-artifact.md`; evaluation identities remain conversion and
+qualification artifacts.
+
+The LQ4 naming change affects identifiers only; the numerical format, packing, and
+weight payloads are unchanged.
 
 ## Planning and materialization
 
@@ -79,7 +85,7 @@ same explicit weight artifact unless the weight recipe is also being compared.
 ## Qualification
 
 The artifact checks cover exact framing/directory parsing, direct and grouped-integer layout sizes,
-duplicate/overlap/range rejection, complete 1,124-object target binding, exact materialized device
+duplicate/overlap/range rejection, complete target binding, exact materialized device
 bytes, retained frontend resources, and accounting. The complete indexed 18-shard BF16 source is
 present locally; real-source conversion and final identity selection still require their explicit
 conversion and quality evidence.

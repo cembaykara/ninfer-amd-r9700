@@ -319,9 +319,9 @@ int main(int argc, char** argv) {
                     gdn::gdn_pair_conv_record_supported(8, 1) &&
                     !gdn::gdn_pair_conv_record_supported(9, 1) &&
                     !gdn::gdn_pair_conv_record_supported(4, 1) &&
-                    gdn::gdn_fp8lut4_pair_conv_record_supported(4, 1) &&
-                    !gdn::gdn_fp8lut4_pair_conv_record_supported(3, 1) &&
-                    !gdn::gdn_fp8lut4_pair_conv_record_supported(4, 2),
+                    gdn::gdn_lq4_pair_conv_record_supported(4, 1) &&
+                    !gdn::gdn_lq4_pair_conv_record_supported(3, 1) &&
+                    !gdn::gdn_lq4_pair_conv_record_supported(4, 2),
                 "unexpected fused support set");
         std::ostringstream out;
         out << std::setprecision(6)

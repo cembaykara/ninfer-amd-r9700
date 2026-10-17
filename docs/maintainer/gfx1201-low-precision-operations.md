@@ -85,7 +85,7 @@ INT8, not INT4 or FP8. hipBLASLt ships gfx1201 F8/B8 and INT8 solution families 
 
 NInfer has no rocBLAS, hipBLAS, or hipBLASLt call site and does not link them. Every Linear,
 including the row-scaled FP8 projections, runs on repository-owned HIP kernels. hipBLASLt served the
-row-scaled FP8 prefill projections until 2026-09-27; the FP8LUT4 prefill GEMM with raw E4M3 staging
+row-scaled FP8 prefill projections until 2026-09-27; the LQ4 prefill GEMM with raw E4M3 staging
 measured 15-44% faster per call at T2048 on every protected shape (`docs/performance.md`) and
 replaced it, and the library dependency was removed.
 
@@ -105,7 +105,7 @@ implementation profile. For represented BF16 `X[K,T]`, `fp8_quantize_activation`
 token-major E4M3 `[T,K128]` image, `T` FP32 dequantization multipliers, and one status word per
 token into a caller-owned region; an all-zero token publishes positive-zero scale and zero codes,
 and a nonfinite token sets its status. T <= 32 then runs `fp8_small_t_linear` (one 16-token WMMA tile, or two for T 17..32); T > 32 runs
-`fp8_row_scaled_prefill_linear`, the FP8LUT4 prefill GEMM staging raw E4M3 rows. Both compute
+`fp8_row_scaled_prefill_linear`, the LQ4 prefill GEMM staging raw E4M3 rows. Both compute
 `BF16(sum_k w[r,k] a[t,k] * ws[r] * as[t])` with FP8 WMMA and FP32 accumulation, apply both scales
 in the epilogue, and publish the canonical BF16 quiet NaN for every element of a flagged token.
 Construction rejects a weight whose N or K is not a multiple of 128; every Qwen3.8 protected

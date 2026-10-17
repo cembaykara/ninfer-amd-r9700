@@ -28,8 +28,8 @@ from .numeric import (
     NumericFormat,
     QuantFormat,
     RowScaledFormat,
-    fp8lut4_group_magnitudes,
     get_format,
+    lq4_group_magnitudes,
 )
 
 PLANE_ALIGNMENT = 256
@@ -133,7 +133,7 @@ ROW_SPLIT_K128_V1 = Layout(
 R9700_Q4G64_N16_K16_V1 = Layout("r9700-q4g64-n16-k16-v1", 256, frozenset(("Q4G64_F16S",)))
 R9700_W8G32_N16_K16_V1 = Layout("r9700-w8g32-n16-k16-v1", 256, frozenset(("W8G32_F16S",)))
 ROW_SCALED_K128_V1 = Layout("row-scaled-k128-v1", 256, frozenset(("F8E4M3_ROW_F32S",)))
-R9700_FP8LUT4_N16K64_V1 = Layout("r9700-fp8lut4-n16k64-v1", 256, frozenset(("FP8LUT4",)))
+R9700_LQ4_N16K64_V1 = Layout("r9700-lq4-n16k64-v1", 256, frozenset(("LQ4",)))
 LAYOUTS = MappingProxyType(
     {
         layout.name: layout
@@ -143,7 +143,7 @@ LAYOUTS = MappingProxyType(
             R9700_Q4G64_N16_K16_V1,
             R9700_W8G32_N16_K16_V1,
             ROW_SCALED_K128_V1,
-            R9700_FP8LUT4_N16K64_V1,
+            R9700_LQ4_N16K64_V1,
         )
     }
 )
@@ -364,7 +364,7 @@ def row_scaled_geometry(format: str | RowScaledFormat, shape: Sequence[int]) -> 
     )
 
 
-def fp8lut4_geometry(shape: Sequence[int]) -> CodebookGeometry:
+def lq4_geometry(shape: Sequence[int]) -> CodebookGeometry:
     """K128-padded planes of N16 x K64 tiles (N % 16 == 0), each plane 256-byte aligned.
 
     Tile (row block b = r / 16, step s = k / 64) is tile index b * (K / 64) + s. Within a tile,
@@ -375,7 +375,7 @@ def fp8lut4_geometry(shape: Sequence[int]) -> CodebookGeometry:
 
     n, k = _shape(shape, rank=2)
     if n % 16:
-        raise ValueError("r9700-fp8lut4-n16k64-v1 requires N divisible by 16")
+        raise ValueError("r9700-lq4-n16k64-v1 requires N divisible by 16")
     k_pad = align_up(k, K_ALIGNMENT)
     code_bytes = n * (k_pad // 2)
     group_offset = align_up(code_bytes, PLANE_ALIGNMENT)
@@ -398,13 +398,13 @@ def fp8lut4_geometry(shape: Sequence[int]) -> CodebookGeometry:
 
 
 @lru_cache(maxsize=1)
-def fp8lut4_magnitude_table() -> tuple[tuple[int, ...], ...]:
+def lq4_magnitude_table() -> tuple[tuple[int, ...], ...]:
     """E4M3FN magnitude words [256 group codes][8 magnitudes]."""
 
-    return tuple(fp8lut4_group_magnitudes(code) for code in range(256))
+    return tuple(lq4_group_magnitudes(code) for code in range(256))
 
 
-def fp8lut4_tile_codes(packed: torch.Tensor) -> torch.Tensor:
+def lq4_tile_codes(packed: torch.Tensor) -> torch.Tensor:
     """Row-major packed codes uint8 [N, K/2] -> N16 x K64 tile order (flat uint8)."""
 
     n, half_k = packed.shape
@@ -416,56 +416,54 @@ def fp8lut4_tile_codes(packed: torch.Tensor) -> torch.Tensor:
     )
 
 
-def fp8lut4_tile_groups(groups: torch.Tensor) -> torch.Tensor:
+def lq4_tile_groups(groups: torch.Tensor) -> torch.Tensor:
     """Row-major group codes uint8 [N, K/32] -> N16 x K64 tile order (flat uint8)."""
 
     n, k32 = groups.shape
     return groups.reshape(n // 16, 16, k32 // 2, 2).permute(0, 2, 3, 1).contiguous().reshape(-1)
 
 
-def encode_fp8lut4_planes(codes: torch.Tensor, groups: torch.Tensor, scales: torch.Tensor) -> bytes:
-    """Pack exact FP8LUT4 words: codes uint8 [N, K_pad] in 0..15 (bit 3 = sign, bits 0..2 =
+def encode_lq4_planes(codes: torch.Tensor, groups: torch.Tensor, scales: torch.Tensor) -> bytes:
+    """Pack exact LQ4 words: codes uint8 [N, K_pad] in 0..15 (bit 3 = sign, bits 0..2 =
     magnitude index), group codes uint8 [N, K_pad / 32], FP32 row multipliers [N]."""
 
     _require_torch()
     if codes.dtype != torch.uint8 or groups.dtype != torch.uint8 or scales.dtype != torch.float32:
-        raise TypeError("FP8LUT4 planes require uint8 codes/groups and FP32 scales")
+        raise TypeError("LQ4 planes require uint8 codes/groups and FP32 scales")
     n, k_pad = codes.shape
-    geometry = fp8lut4_geometry((n, k_pad))
+    geometry = lq4_geometry((n, k_pad))
     if (
         geometry.k_pad != k_pad
         or tuple(groups.shape) != (n, k_pad // 32)
         or tuple(scales.shape) != (n,)
     ):
-        raise ValueError("FP8LUT4 planes have inconsistent shapes")
+        raise ValueError("LQ4 planes have inconsistent shapes")
     if bool((codes > 15).any()):
-        raise ValueError("FP8LUT4 codes must be four-bit words")
+        raise ValueError("LQ4 codes must be four-bit words")
     if not bool(torch.isfinite(scales).all()) or bool((scales < 0).any()):
-        raise ValueError("FP8LUT4 row multipliers must be finite and nonnegative")
+        raise ValueError("LQ4 row multipliers must be finite and nonnegative")
     c = codes.to("cpu")
     packed = (c[:, 0::2] | (c[:, 1::2] << 4)).contiguous()
     out = bytearray(geometry.payload_bytes)
-    out[: geometry.code_bytes] = fp8lut4_tile_codes(packed).numpy().tobytes()
+    out[: geometry.code_bytes] = lq4_tile_codes(packed).numpy().tobytes()
     out[geometry.group_offset : geometry.group_offset + geometry.group_bytes] = (
-        fp8lut4_tile_groups(groups.to("cpu")).numpy().tobytes()
+        lq4_tile_groups(groups.to("cpu")).numpy().tobytes()
     )
     out[geometry.scale_offset :] = scales.to("cpu").contiguous().numpy().astype("<f4").tobytes()
     return bytes(out)
 
 
-def decode_fp8lut4(source: Payload, shape: Sequence[int]) -> torch.Tensor:
+def decode_lq4(source: Payload, shape: Sequence[int]) -> torch.Tensor:
     """Exact logical FP64 [N, K] values (E4M3 magnitude times FP32 row multiplier) of one
-    FP8LUT4 payload."""
+    LQ4 payload."""
 
     _require_torch()
     import numpy as np
 
-    geometry = fp8lut4_geometry(shape)
+    geometry = lq4_geometry(shape)
     view = memoryview(source).cast("B")
     if len(view) != geometry.payload_bytes:
-        raise ValueError(
-            f"FP8LUT4 payload has {len(view)} bytes, expected {geometry.payload_bytes}"
-        )
+        raise ValueError(f"LQ4 payload has {len(view)} bytes, expected {geometry.payload_bytes}")
     n, k_pad = geometry.n, geometry.k_pad
     tiles = np.frombuffer(view[: geometry.code_bytes], dtype=np.uint8)
     packed = (
@@ -486,7 +484,7 @@ def decode_fp8lut4(source: Payload, shape: Sequence[int]) -> torch.Tensor:
     )
     groups = groups.reshape(n, k_pad // 32)
     scales = np.frombuffer(view[geometry.scale_offset :], dtype="<f4").astype(np.float64)
-    words = np.array(fp8lut4_magnitude_table(), dtype=np.uint8)  # [256, 8]
+    words = np.array(lq4_magnitude_table(), dtype=np.uint8)  # [256, 8]
     lut = torch.tensor(words).view(torch.float8_e4m3fn).to(torch.float64).numpy()
     magnitude = lut[np.repeat(groups, 32, axis=1), codes & 7]
     value = np.where(codes & 8, -magnitude, magnitude) * scales[:, None]
@@ -519,10 +517,10 @@ def encoded_size(
         if not isinstance(numeric_spec, RowScaledFormat):
             raise ValueError("row-scaled-k128-v1 requires a row-scaled format")
         return row_scaled_geometry(numeric_spec, shape).payload_bytes
-    if layout_spec is R9700_FP8LUT4_N16K64_V1:
+    if layout_spec is R9700_LQ4_N16K64_V1:
         if not isinstance(numeric_spec, CodebookFormat):
-            raise ValueError("r9700-fp8lut4-n16k64-v1 requires a codebook format")
-        return fp8lut4_geometry(shape).payload_bytes
+            raise ValueError("r9700-lq4-n16k64-v1 requires a codebook format")
+        return lq4_geometry(shape).payload_bytes
     if layout_spec is R9700_Q4G64_N16_K16_V1:
         return q4_n16k16_geometry(shape).payload_bytes
     if layout_spec is R9700_W8G32_N16_K16_V1:
@@ -1203,7 +1201,7 @@ __all__ = [
     "K_ALIGNMENT",
     "LAYOUTS",
     "PLANE_ALIGNMENT",
-    "R9700_FP8LUT4_N16K64_V1",
+    "R9700_LQ4_N16K64_V1",
     "R9700_Q4G64_N16_K16_V1",
     "R9700_W8G32_N16_K16_V1",
     "ROW_SCALED_K128_V1",
@@ -1216,23 +1214,23 @@ __all__ = [
     "align_up",
     "assemble_row_planes",
     "decode_direct",
-    "decode_fp8lut4",
+    "decode_lq4",
     "decode_q4_n16k16_codes",
     "decode_row_split_codes",
     "dequantize_q4_n16k16",
     "dequantize_q4_n16k16_rows",
     "dequantize_row_split",
     "encode_direct",
-    "encode_fp8lut4_planes",
+    "encode_lq4_planes",
     "encode_q4_n16k16",
     "encode_row_split",
     "encoded_size",
-    "fp8lut4_geometry",
-    "fp8lut4_magnitude_table",
-    "fp8lut4_tile_codes",
-    "fp8lut4_tile_groups",
     "gather_row_planes",
     "get_layout",
+    "lq4_geometry",
+    "lq4_magnitude_table",
+    "lq4_tile_codes",
+    "lq4_tile_groups",
     "q4_n16k16_geometry",
     "row_scaled_geometry",
     "row_split_geometry",

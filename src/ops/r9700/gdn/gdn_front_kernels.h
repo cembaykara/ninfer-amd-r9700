@@ -1,7 +1,7 @@
 #pragma once
 
 // GDN verification-front kernels (gdn_ops.h): the FP8 normalized front with its fused deferred
-// replay fold and cache-warm CTAs, and the FP8LUT4 pair projection with the recorded causal
+// replay fold and cache-warm CTAs, and the LQ4 pair projection with the recorded causal
 // convolution. Shared by their launchers (gdn_ops.hip) and the persistent decode kernel.
 #include "core/cache_warm.h"
 #include "ninfer/types.h"
@@ -9,8 +9,8 @@
 #include "ops/r9700/linear/a8g64_codec.h"
 #include "ops/r9700/linear/fp8_activation.h"
 #include "ops/r9700/linear/fp8_encode_impl.h"
-#include "ops/r9700/linear/fp8lut4_linear.h"
-#include "ops/r9700/linear/fp8lut4_pipeline_impl.h"
+#include "ops/r9700/linear/lq4_linear.h"
+#include "ops/r9700/linear/lq4_pipeline_impl.h"
 #include "ops/r9700/linear/r9700_linear.h"
 #include "ops/r9700/persistent/persistent_cta.h"
 
@@ -209,40 +209,41 @@ conv_record_token(Represented&& represented_at, const ConvChannel& conv,
                               channel);
 }
 
-// ---- FP8LUT4 GDN pair projection with the recorded convolution (one sequence, T 4..8 columns):
+// ---- LQ4 GDN pair projection with the recorded convolution (one sequence, T 4..8 columns):
 // CTAs [0, 256) own the query-key row blocks of one per-token E4M3 image, the rest the value-z
 // row blocks; each block's BF16 outputs (canonical NaN for a flagged token) are staged, then one
 // thread per (row, token) runs that token of the recorded convolution of the row's channel
 // (value-z rows 6144.. are the output gate z). Bitwise the pair projection followed by
 // projection_conv_record_kernel.
-inline constexpr std::uint32_t kFp8Lut4PairSplit = linear::fp8lut4::kVerifySplit;
-inline constexpr std::uint32_t kFp8Lut4PairSteps = linear::fp8lut4::kVerifySteps;
+inline constexpr std::uint32_t kLq4PairSplit = linear::lq4::kVerifySplit;
+inline constexpr std::uint32_t kLq4PairSteps = linear::lq4::kVerifySteps;
 
 template <unsigned T>
 struct PairConvShared {
     uint2 table[256];
-    float partial[kFp8Lut4PairSplit][1][8][32];
+    float partial[kLq4PairSplit][1][8][32];
     hip_bfloat16 staged[16][T];
 };
 
-template <unsigned T, std::uint32_t kSteps = kFp8Lut4PairSteps, class Cta>
-__device__ __forceinline__ void fp8lut4_pair_conv_record_body(
-    const Cta& cta, PairConvShared<T>& shared, const std::uint8_t* activation,
-    const float* token_scales, const std::uint32_t* status, const linear::Fp8Lut4Weight& query_key,
-    const linear::Fp8Lut4Weight& value_z, const hip_bfloat16* conv_weight,
-    const hip_bfloat16* conv_states, const std::int32_t* valid_columns,
-    const std::int32_t* initial_state_slots, const std::int32_t* parent_index,
-    hip_bfloat16* conv_record, hip_bfloat16* query, hip_bfloat16* key, hip_bfloat16* value,
-    hip_bfloat16* z, std::uint32_t state_slots) {
+template <unsigned T, std::uint32_t kSteps = kLq4PairSteps, class Cta>
+__device__ __forceinline__ void
+lq4_pair_conv_record_body(const Cta& cta, PairConvShared<T>& shared, const std::uint8_t* activation,
+                          const float* token_scales, const std::uint32_t* status,
+                          const linear::Lq4Weight& query_key, const linear::Lq4Weight& value_z,
+                          const hip_bfloat16* conv_weight, const hip_bfloat16* conv_states,
+                          const std::int32_t* valid_columns,
+                          const std::int32_t* initial_state_slots, const std::int32_t* parent_index,
+                          hip_bfloat16* conv_record, hip_bfloat16* query, hip_bfloat16* key,
+                          hip_bfloat16* value, hip_bfloat16* z, std::uint32_t state_slots) {
     constexpr unsigned kQueryKeyTiles = (kProjectionQueryRows + kProjectionKeyRows) / 16U;
     const std::uint32_t block = cta.block().x, thread = cta.thread();
-    const bool second                  = block >= kQueryKeyTiles;
-    const linear::Fp8Lut4Weight weight = second ? value_z : query_key;
-    const std::uint32_t row_base       = (second ? block - kQueryKeyTiles : block) * 16U;
+    const bool second              = block >= kQueryKeyTiles;
+    const linear::Lq4Weight weight = second ? value_z : query_key;
+    const std::uint32_t row_base   = (second ? block - kQueryKeyTiles : block) * 16U;
     // Epilogue thread `thread` owns token thread / 16 of row thread % 16 and, unless the row is
     // an output-gate z row, its convolution channel, whose inputs are loaded before the
     // projection so their latency overlaps it.
-    static_assert(16U * T <= 32U * kFp8Lut4PairSplit);
+    static_assert(16U * T <= 32U * kLq4PairSplit);
     const std::uint32_t token   = thread / 16U;
     const std::uint32_t row     = row_base + thread % 16U;
     const bool active           = token < T;
@@ -252,13 +253,13 @@ __device__ __forceinline__ void fp8lut4_pair_conv_record_body(
     if (convolved)
         conv = load_conv_channel(conv_weight, conv_states, valid_columns, initial_state_slots, T,
                                  state_slots, 0U, channel);
-    linear::fp8lut4::load_table(shared.table, thread, 32U * kFp8Lut4PairSplit);
+    linear::lq4::load_table(shared.table, thread, 32U * kLq4PairSplit);
     const auto stage = [&](std::uint32_t token, std::uint32_t row, float y) {
         shared.staged[row - row_base][token] = status[token] != linear::Fp8ActivationOk
                                                    ? hip_bfloat16(__builtin_nanf(""))
                                                    : hip_bfloat16(y);
     };
-    linear::fp8lut4::small_t_rows<kFp8Lut4PairSplit, kSteps, 1U>(
+    linear::lq4::small_t_rows<kLq4PairSplit, kSteps, 1U>(
         cta, weight, row_base, activation, token_scales, T, shared.table, shared.partial, stage);
     cta.sync();
     if (!active) return;
@@ -272,19 +273,19 @@ __device__ __forceinline__ void fp8lut4_pair_conv_record_body(
 }
 
 template <unsigned T>
-__global__ __launch_bounds__(32U * kFp8Lut4PairSplit) void gdn_fp8lut4_pair_conv_record_kernel(
+__global__ __launch_bounds__(32U * kLq4PairSplit) void gdn_lq4_pair_conv_record_kernel(
     const std::uint8_t* activation, const float* token_scales, const std::uint32_t* status,
-    linear::Fp8Lut4Weight query_key, linear::Fp8Lut4Weight value_z, const hip_bfloat16* conv_weight,
+    linear::Lq4Weight query_key, linear::Lq4Weight value_z, const hip_bfloat16* conv_weight,
     const hip_bfloat16* conv_states, const std::int32_t* valid_columns,
     const std::int32_t* initial_state_slots, const std::int32_t* parent_index,
     hip_bfloat16* conv_record, hip_bfloat16* query, hip_bfloat16* key, hip_bfloat16* value,
     hip_bfloat16* z, std::uint32_t state_slots) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
     __shared__ PairConvShared<T> shared;
-    fp8lut4_pair_conv_record_body<T>(persistent::LaunchCta{}, shared, activation, token_scales,
-                                     status, query_key, value_z, conv_weight, conv_states,
-                                     valid_columns, initial_state_slots, parent_index, conv_record,
-                                     query, key, value, z, state_slots);
+    lq4_pair_conv_record_body<T>(persistent::LaunchCta{}, shared, activation, token_scales, status,
+                                 query_key, value_z, conv_weight, conv_states, valid_columns,
+                                 initial_state_slots, parent_index, conv_record, query, key, value,
+                                 z, state_slots);
 #else
     (void)activation;
     (void)token_scales;

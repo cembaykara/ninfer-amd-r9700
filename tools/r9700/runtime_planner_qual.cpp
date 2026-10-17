@@ -346,7 +346,7 @@ void qualify_host_hybrid_allocation_bound() {
         for (const auto backend :
              {ninfer::SpeculativeBackend::DFlash, ninfer::SpeculativeBackend::Mtp}) {
             runtime::SequencePlanningInputs inputs{};
-            inputs.weights_profile     = Variant::WeightsProfile::R9700Fp8Lut4;
+            inputs.weights_profile     = Variant::WeightsProfile::R9700Lq4;
             inputs.capacity            = 262144U;
             inputs.max_concurrency     = concurrency;
             inputs.prefill_chunk       = 2048U;
@@ -465,7 +465,7 @@ void qualify_host_dflash_graph_allowance() {
         !ninfer::ops::r9700::kv::kTextP129WmmaTailCandidate;
     for (std::uint32_t c = 1; c <= ninfer::kMaximumConcurrency; ++c) {
         runtime::SequencePlanningInputs inputs{};
-        inputs.weights_profile     = Variant::WeightsProfile::R9700Fp8Lut4;
+        inputs.weights_profile     = Variant::WeightsProfile::R9700Lq4;
         inputs.capacity            = 262144U;
         inputs.max_concurrency     = c;
         inputs.prefill_chunk       = 2048U;

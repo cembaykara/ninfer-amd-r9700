@@ -1,4 +1,4 @@
-"""Layer-major input second moments of the Qwen3.8-27B Text projections for FP8LUT4 GPTQ.
+"""Layer-major input second moments of the Qwen3.8-27B Text projections for LQ4 GPTQ.
 
 The calibration sequences are evaluated through the checkpoint-direct BF16 reference
 (`tools.reference.qwen3_8_27b_bf16.backend`) one source layer at a time, with every sequence's

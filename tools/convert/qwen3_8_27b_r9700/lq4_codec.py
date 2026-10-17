@@ -1,4 +1,4 @@
-"""Source quantizer for the FP8LUT4 codebook weight format.
+"""Source quantizer for the LQ4 codebook weight format.
 
 Each row gets one FP32 multiplier R = max|w| / (7.5 * 16), so the largest group's natural
 codebook exponent is 4. Every 32-wide group then chooses the group code (exponent E and mantissa
@@ -8,7 +8,7 @@ own sign (zero magnitudes keep a clear sign bit). Ties keep the earliest candida
 and the smaller magnitude. With a `Calibration` (the projection's input second moments), the same
 row multiplier and group-code search are applied column-sequentially with GPTQ error compensation
 instead of independent rounding. The selected words are exactly those
-`tools.artifact.decode_fp8lut4` reconstructs.
+`tools.artifact.decode_lq4` reconstructs.
 """
 
 from __future__ import annotations
@@ -18,10 +18,10 @@ from collections.abc import Iterator
 import torch
 
 from tools.artifact.layouts import (
-    fp8lut4_geometry,
-    fp8lut4_magnitude_table,
-    fp8lut4_tile_codes,
-    fp8lut4_tile_groups,
+    lq4_geometry,
+    lq4_magnitude_table,
+    lq4_tile_codes,
+    lq4_tile_groups,
 )
 
 GROUP = 32
@@ -29,7 +29,7 @@ _E_MIN, _E_MAX = -26, 5
 
 
 def _magnitudes(device: torch.device) -> torch.Tensor:
-    words = torch.tensor(fp8lut4_magnitude_table(), dtype=torch.uint8)
+    words = torch.tensor(lq4_magnitude_table(), dtype=torch.uint8)
     return words.view(torch.float8_e4m3fn).to(torch.float32).to(device)  # [256, 8]
 
 
@@ -72,7 +72,7 @@ class Calibration:
 
     def __init__(self, hessian: torch.Tensor, damping: float):
         if hessian.dim() != 2 or hessian.shape[0] != hessian.shape[1] or hessian.shape[0] % GROUP:
-            raise ValueError("FP8LUT4 calibration requires a square [K, K] matrix with K % 32 == 0")
+            raise ValueError("LQ4 calibration requires a square [K, K] matrix with K % 32 == 0")
         h = hessian.to(torch.float32).clone()
         diagonal = torch.diagonal(h)
         self.dead = diagonal <= 0
@@ -92,7 +92,7 @@ class Calibration:
 def _gptq(
     scaled: torch.Tensor, calibration: Calibration, table: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Column-sequential error-compensated rounding onto the FP8LUT4 grid (GPTQ): each 32-wide
+    """Column-sequential error-compensated rounding onto the LQ4 grid (GPTQ): each 32-wide
     group code is searched on the error-updated weights at the group's first column, weighted by
     1 / U_jj^2, and every column's rounding error is propagated through U to the later columns."""
 
@@ -137,9 +137,9 @@ def quantize_rows(
     one, the rounding is error-compensated against that projection's input statistics."""
 
     if weight.dtype != torch.float32 or weight.dim() != 2 or weight.shape[1] % GROUP:
-        raise ValueError("FP8LUT4 quantization requires FP32 [rows, K] with K % 32 == 0")
+        raise ValueError("LQ4 quantization requires FP32 [rows, K] with K % 32 == 0")
     if not bool(torch.isfinite(weight).all()):
-        raise ValueError("FP8LUT4 quantization source contains NaN or infinity")
+        raise ValueError("LQ4 quantization source contains NaN or infinity")
     rows, columns = weight.shape
     table = _magnitudes(weight.device)
     rowmax = weight.abs().amax(1)
@@ -151,7 +151,7 @@ def quantize_rows(
         codes = _signed(index, scaled.reshape(index.shape)).reshape(rows, columns)
     else:
         if calibration.factor.shape[0] != columns:
-            raise ValueError("FP8LUT4 calibration width differs from the weight")
+            raise ValueError("LQ4 calibration width differs from the weight")
         codes, best_code = _gptq(scaled, calibration, table)
     zero = scale == 0
     codes[zero] = 0
@@ -160,7 +160,7 @@ def quantize_rows(
 
 
 def interleave_gate_up(weight: torch.Tensor) -> torch.Tensor:
-    """[gate; up] rows [2F, K] -> the FP8LUT4 MLP storage order: stored row 16 b + i is gate feature
+    """[gate; up] rows [2F, K] -> the LQ4 MLP storage order: stored row 16 b + i is gate feature
     8 b + i (i < 8) or up feature 8 b + i - 8, so one 16-row tile holds eight gate features and the
     matching eight up features (the SiLU-pair epilogue's operand pairs)."""
 
@@ -177,14 +177,14 @@ def encode_chunks(
     rows_per_chunk: int = 2048,
     calibration: Calibration | None = None,
 ) -> Iterator[bytes]:
-    """Yield one r9700-fp8lut4-n16k64-v1 payload for represented BF16 [N, K] in plane order."""
+    """Yield one r9700-lq4-n16k64-v1 payload for represented BF16 [N, K] in plane order."""
 
     if weight.dim() != 2 or weight.dtype != torch.bfloat16:
-        raise TypeError("FP8LUT4 encoding requires a represented BF16 rank-2 matrix")
+        raise TypeError("LQ4 encoding requires a represented BF16 rank-2 matrix")
     rows, columns = weight.shape
-    geometry = fp8lut4_geometry((rows, columns))
+    geometry = lq4_geometry((rows, columns))
     if rows_per_chunk % 16:
-        raise ValueError("FP8LUT4 encoding chunks must hold whole 16-row tiles")
+        raise ValueError("LQ4 encoding chunks must hold whole 16-row tiles")
     codes_out, groups_out, scales_out = [], [], []
     for begin in range(0, rows, rows_per_chunk):
         block = weight[begin : begin + rows_per_chunk].to(device=device, dtype=torch.float32)
@@ -192,10 +192,8 @@ def encode_chunks(
             block = torch.nn.functional.pad(block, (0, geometry.k_pad - columns))
         codes, groups, scales = quantize_rows(block, calibration)
         codes = codes.cpu()
-        codes_out.append(
-            fp8lut4_tile_codes(codes[:, 0::2] | (codes[:, 1::2] << 4)).numpy().tobytes()
-        )
-        groups_out.append(fp8lut4_tile_groups(groups.cpu()).numpy().tobytes())
+        codes_out.append(lq4_tile_codes(codes[:, 0::2] | (codes[:, 1::2] << 4)).numpy().tobytes())
+        groups_out.append(lq4_tile_groups(groups.cpu()).numpy().tobytes())
         scales_out.append(scales.cpu().numpy().astype("<f4").tobytes())
     yield from codes_out
     yield bytes(geometry.group_offset - geometry.code_bytes)

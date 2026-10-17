@@ -58,8 +58,8 @@ enum class WeightsProfile : std::uint8_t {
     R9700Q4W8MseDFlash2W8MseEvaluation,
     R9700Q4G64Fp8FourRoleDFlash2W8MseEvaluation,
     // The admitted production profile: the selective-cap DFlash2 base with every Text matrix
-    // outside its own 21 FP8 protections and the output head in (GPTQ-rounded) FP8LUT4.
-    R9700Fp8Lut4,
+    // outside its own 21 FP8 protections and the output head in (GPTQ-rounded) LQ4.
+    R9700Lq4,
 #define NINFER_QWEN38_FP8_ENDPOINT(symbol, id, base, embed, head) symbol,
 #include "targets/qwen3_8_27b/impl/load/fp8_endpoint_selection.inc"
 #undef NINFER_QWEN38_FP8_ENDPOINT
@@ -68,7 +68,7 @@ enum class WeightsProfile : std::uint8_t {
 // The endpoint rows are generated lookups whose results repeat across consecutive rows, so they
 // are independent early returns rather than switch cases.
 [[nodiscard]] constexpr WeightsProfile fp8_capped_base_profile(WeightsProfile profile) noexcept {
-    if (profile == WeightsProfile::R9700Fp8Lut4) {
+    if (profile == WeightsProfile::R9700Lq4) {
         return WeightsProfile::R9700Q4Fp8SelectiveCapDFlash2Q4Evaluation;
     }
 #define NINFER_QWEN38_FP8_ENDPOINT(symbol, id, base, embed, head)                                  \
@@ -95,9 +95,9 @@ enum class WeightsProfile : std::uint8_t {
 }
 
 // Text projections outside the profile's FP8 protections (`fp8_capped_selection.inc`), and the
-// output head, are FP8LUT4 codebook matrices.
-[[nodiscard]] constexpr bool is_fp8lut4_text_profile(WeightsProfile profile) noexcept {
-    return profile == WeightsProfile::R9700Fp8Lut4;
+// output head, are LQ4 codebook matrices.
+[[nodiscard]] constexpr bool is_lq4_text_profile(WeightsProfile profile) noexcept {
+    return profile == WeightsProfile::R9700Lq4;
 }
 
 [[nodiscard]] constexpr bool is_fp8_capped_profile(WeightsProfile profile) noexcept {

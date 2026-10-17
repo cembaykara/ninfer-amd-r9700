@@ -1,129 +1,155 @@
 # NInfer AMD — Radeon AI PRO R9700
 
-Native C++/HIP inference for **Qwen3.8-27B on one Radeon AI PRO R9700** (`gfx1201`,
-wave32). Supports CLI generation, OpenAI/Anthropic-compatible serving, Vision,
-DFlash2 speculative decoding, fixed concurrency of 1–8 requests, prefix caching,
-Device Graphs and perplexity scoring. This is a target-specific AMD engine, not
-a general multi-model or multi-GPU framework.
+C++/HIP inference for **Qwen3.8-27B on one AMD Radeon AI PRO R9700**, with
+**1–8 concurrent requests**.
 
-Serving includes constrained JSON/schema and EBNF output, required or named tool calls,
-optional restart-persistent Responses history, and candidate scoring through
-`POST /v1/score`. `GET /metrics` (Prometheus) and `GET /metrics.json` expose the process
-snapshot. Protocols, options, scoring semantics and metrics are in `docs/serving.md`.
+## What it does
 
-OpenAI Chat Completions and Responses support per-token logprobs with up to 20 ranked
-alternatives from the target model, including speculative decoding; see `docs/serving.md`.
+- **Works with chat clients.** Run from the terminal or connect a client that uses
+  OpenAI Chat Completions, Responses or Anthropic Messages. Answers stream as they
+  are generated, with reasoning kept separate from the answer.
+- **Calls tools and returns structured answers.** Let the model choose a tool or
+  require a specific one. Constrain output to JSON, a JSON Schema or an EBNF grammar.
+- **Reads images and video.** Add `--vision` at startup to accept media alongside text.
+- **DFlash2 decoding.** A small draft model proposes tokens for the main model to
+  check together. Draft length adapts automatically, up to seven tokens.
+  Use DFlash rather than MTP.
+- **Reuses conversation history.** Cached prefixes avoid processing the same text
+  again. Keep them in GPU memory, add a RAM cache, or save them to SSD for reuse
+  after a restart.
+- **Controls generation and scores text.** Adjust answer variation, choose greedy
+  decoding, inspect token probabilities or compare candidate answers. `ninfer-ppl`
+  measures how well the model predicts text.
+- **Shows how the server is doing.** Prometheus metrics, JSON statistics and request
+  logs report throughput, memory use, cache hits and draft acceptance.
 
-## Performance
+## Built for the R9700
 
-One R9700, ROCm 10, Release build, power `auto`, Device Graphs, dense G16 attention.
-Code workload: **4,096 prompt + 128 output tokens**, chunk 2,048, maximum context
-4,240; median of three repetitions after one warmup. Rates measure inference
-phases, excluding model loading—not end-to-end request throughput.
+Native HIP kernels and Device Graphs target `gfx1201` (wave32). The engine batches
+up to eight requests and can process a new prompt alongside ongoing DFlash
+generation. GPU memory is planned at startup, with workspace shared between
+execution phases.
 
-### DFlash2 decode · 2026-09-24
+**LQ4: 4-bit codebook weights decoded to FP8 for computation.** Most Text
+projections and the output head use LQ4; 21 sensitive projections stay in FP8.
+The DFlash-enabled artifact is **16.75 GB** on disk
+(decimal, not VRAM usage); its current identity is `qwen3.8-27b/r9700-lq4`.
+The paged KV cache stores FP8 keys, INT4 values and FP16 scales. DFlash keeps its
+own BF16 state.
 
-| Concurrent requests | 4 drafts, aggregate tok/s | 5 drafts, aggregate tok/s | Best tok/s per request |
-|---|---:|---:|---:|
-| 1 | — | **105.15** | 105.15 |
-| 2 | 146.25 | **149.40** | 74.70 |
-| 3 | **191.05** | 178.29 | 63.68 |
-| 4 | **203.26** | 186.88 | 50.82 |
+This port combines NInfer features with AMD-specific kernels, weight/cache formats
+and memory tuning. Port decisions: `docs/maintainer/upstream-sync.md`.
 
-Per-request rates are aggregate divided by concurrency. C1/four drafts was not
-remeasured. Five drafts wins at C1–2 and four at C3–4 on this workload; other
-prompts may differ. C4 adaptive reaches **201.04 aggregate tok/s**. All 24 final
-repetitions and 44 cold-transition cases matched ordinary greedy tokens exactly at that time;
-since 2026-09-25 verification attention keeps BF16 queries (ordinary decode uses FP8 queries), so
-greedy DFlash can differ from greedy ordinary decode on near-ties. See `docs/performance.md`.
+## Context and capacity
 
-### Prefill · 2026-09-26 (FP8LUT4 artifact)
+Each request can use up to **262,144 tokens** for prompt and answer combined,
+subject to the shared GPU cache capacity below.
 
-Single-request prefill, chunk 2,048, same host and power: **8K 3,352, 32K 2,894,
-64K 2,455 tok/s** (context ladder). Six-waves-per-SIMD attention and GEMM kernels
-with interleaved weight staging added +12% at 32K and 64K over the first FP8LUT4
-build in a same-session A/B, with bit-identical PPL. That build was itself +16% to +36% over
-the previous Q4 artifact (8K 2,046, 32K 2,075, 64K 1,804). Ordinary and DFlash2
-decode were unchanged within noise by the FP8LUT4 migration. Results are
-workload-specific, not a claimed hardware ceiling. Methodology, quality checks
-and evidence: `docs/performance.md`.
+Shared context capacity with automatic sizing, DFlash with up to seven draft tokens, the
+optimized proposal head, chunk 2048, Vision off and Compose graph settings
+(HIP 7.15.26333; measured 2026-10-17):
 
-## Model and precision
+| Concurrent requests (C) | Shared KV capacity (tokens) |
+|---:|---:|
+| 1 | 262,144 |
+| 2 | 524,288 |
+| 3 | 633,024 |
+| 4 | 624,896 |
+| 5 | 616,832 |
+| 6 | 608,704 |
+| 7 | 600,576 |
+| 8 | 592,512 |
 
-- **16.75 GB DFlash-enabled artifact** (decimal file size, not VRAM),
-  `qwen3.8-27b/r9700-fp8lut4` (the admitted production weights).
-- Text-layer weights and output head in FP8LUT4 (4-bit codes with a per-32 codebook of exact E4M3
-  values, FP32 row scale; GPTQ-rounded on real-session calibration except attention query/key);
-  21 protected attention projections in FP8; Q4 embedding, MTP and DFlash with BF16 codebooks.
-- Measured closer to the BF16 source than the 5090 NVFP4 build on every 8K/32K prefill and
-  decode PPL cell.
-- Per-token FP8 E4M3 activations for every Text projection (prefill, ordinary
-  decode and DFlash verification); Q4 A8 for the head, MTP and drafter.
-- Fixed cache: FP8 E4M3FN keys, INT4 values, FP16 value scales. DFlash state is BF16.
+Capacity depends on available VRAM and enabled features; automatic sizing leaves
+64 MiB headroom by default. RAM/SSD caches retain prefixes, not active-context
+offload. Qualification and settings: `docs/performance.md`.
 
-Against a BF16 reference at 8K, the mean NLL increase is +0.023 (prefill), about a third below
-the previous Q4 artifact. At 4K it is 0.024 nats/token below the 5090 NVFP4 build on the same
-wiki/technical/code windows (about 2.4% lower PPL). NIAH exact-answer retrieval passes 8K-128K and 240K (the
-opencode compaction point, 241K-token prompts) at five positions, standard and multikey.
-Admission against the source-BF16 reference (2026-09-27): +0.023/+0.018 at 8K/32K prefill, closer
-to BF16 than the 5090 NVFP4 build on the same positions (+0.032/+0.027); graph/eager decode and
-whole-inference greedy tokens are exact. This is not universal quality equivalence.
+## Performance and quality
 
-Artifacts are not bundled. The installed artifact and its conversion receipt are
-under `/path/to/local/models/qwen3.8-27b-r9700-fp8lut4/`.
-Conversion and binding details: `docs/maintainer/qwen3.8-27b-artifact.md` (FP8LUT4 Text recipe).
+Measured 2026-10-17 on one R9700, Release build, Device Graphs, power `auto`,
+chunk 2048 and the optimized DFlash proposal head.
+
+**Prompt processing (prefill), one request:**
+
+| Prompt tokens | Average tokens/s |
+|---:|---:|
+| 8,192 | 3,375 |
+| 32,768 | 2,903 |
+| 65,536 | 2,477 |
+| 131,072 | 1,907 |
+| 245,760 | 1,354 |
+
+**Answer generation, adaptive DFlash with up to seven draft tokens:**
+
+| Concurrent requests | Aggregate tokens/s |
+|---:|---:|
+| 1 | 192.7 |
+| 6 | 672.6 |
+
+Generation uses 8,192 prompt tokens and 256 output tokens per request. Values are
+means of three runs after one warmup, measured separately from prompt processing
+and model loading. These use a greedy token-corpus workload; prompt content and
+sampling affect DFlash acceptance and speed. Methodology: `docs/performance.md`.
+
+In every tested 8K/32K cell, the increase in prediction loss over the BF16 source
+was smaller than for the fixed 5090 NVFP4 reference. Standard and multikey needle retrieval
+passed through 240K; multikey also passed at 260K. Test conditions and limitations
+are in `docs/performance.md`.
 
 ## Build
 
-Requires 64-bit Linux, R9700, ROCm 10 with `gfx1201`, CMake ≥3.28, Ninja, C++20,
-FFmpeg and libcurl development libraries. Python reference/conversion tools also
-require Python 3.11, PyTorch and safetensors.
+Requires 64-bit Linux, the R9700, ROCm 10 with `gfx1201` and rocprofiler SDK ROCTx,
+CMake ≥3.28, Ninja, C++20, pkg-config, and FFmpeg, libcurl and zstd development
+libraries. CMake fetches a pinned XGrammar dependency. Python conversion/reference
+tools additionally need Python 3.11, PyTorch and safetensors.
 
 ```sh
 cmake -S . -B build-r9700 -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DNINFER_BUILD_APPS=ON \
-  -DNINFER_BUILD_BENCHMARKS=ON \
-  -DNINFER_R9700_Q4_ACTIVATION_BITS=8 \
-  -DNINFER_R9700_Q4_PREFILL_A4_FAMILIES=0 \
-  -DNINFER_R9700_W8_ACTIVATION_BITS=8
-cmake --build build-r9700 --parallel 4
+  -DNINFER_BUILD_BENCHMARKS=ON
+cmake --build build-r9700 --parallel 8 \
+  --target ninfer ninfer-serve ninfer-ppl ninfer_bench
 ```
 
-Only `gfx1201` is supported. Serialize GPU work with the shared lock in `AGENTS.md`.
-Each agent may run one build at a time, capped at 12 compiler jobs by default (14 maximum).
-
-For the native ROCm Docker image, dedicated development container and GPU device
-passthrough commands, see `docs/containers.md`. No NVIDIA container runtime is needed.
-`compose.yaml` defaults to temperature1.5, DFlash, 8 GiB RAM prefix cache and 25 GiB
-persistent disk cache, C6 and adaptive draft length up to 7. It joins the external
-`proxy` Docker network at `ninfer-r9700:8080`, with no published host port.
-Copy `.env.example` to `.env` and set your local paths, then run
-`docker compose up -d`. Startup builds the image and reuses cached CMake/Ninja
-objects after source edits; no separate deployment script is needed.
+Only `gfx1201` is supported; Ninja compile/link concurrency is capped at 8 jobs.
+Model artifacts are supplied separately. Conversion and binding: `docs/maintainer/qwen3.8-27b-artifact.md`.
 
 ## Run
 
-Use a DFlash-enabled `.ninfer` artifact for speculative generation:
+Use the selected DFlash-enabled production `.ninfer` artifact:
 
 ```sh
-build-r9700/apps/ninfer /path/to/model-dflash.ninfer \
+build-r9700/apps/ninfer /path/to/qwen3.8-27b-r9700-lq4.ninfer \
   --prompt "Explain wave32 matrix instructions." \
-  --spec dflash --draft-tokens 5 --max-new 256
+  --max-context 8192 --max-new 256 \
+  --spec dflash --lm-head-draft
 
-build-r9700/apps/ninfer-serve /path/to/model.ninfer \
+build-r9700/apps/ninfer-serve /path/to/qwen3.8-27b-r9700-lq4.ninfer \
   --host 127.0.0.1 --port 8080 \
-  --max-context 8192 --kv-capacity auto --max-concurrency 2
+  --max-context 262144 --kv-capacity auto --max-concurrency 6 \
+  --spec dflash --lm-head-draft
 ```
 
-Also built: `build-r9700/apps/ninfer-ppl` and `build-r9700/bench/ninfer_bench`.
-Use each executable's `--help` for exact options. Benchmark reproduction commands
-and reports: `profiles/bench/r9700-remaining-candidates-20260924/`.
+`--spec dflash` defaults to adaptive drafting with a maximum of seven tokens.
+Use `--draft-tokens N --no-adaptive-draft` for a fixed length. P-less sampling
+uses temperature **1.5** by default; `--temperature` overrides it. It ignores
+top-p/top-k/min-p and penalties; `--no-p-less-sampling` enables those controls.
+Use `--greedy` for argmax. Vision and DFlash must be selected at startup.
+Each executable's `--help` lists all options.
+
+For Compose, copy `.env.example` to `.env`, keep `COMPOSE_BAKE=false`, and set the
+explicit model, ROCm and self-contained Python paths. Create the cache directory
+and external `proxy` network as described in `docs/containers.md`, then run
+`docker compose up -d --wait`. Startup builds the image and reuses cached objects.
+Defaults: C6, adaptive DFlash up to K7, temperature 1.5, 262,144-token context,
+8 GiB RAM prefix cache and 25 GiB persistent disk cache. The server is reachable
+on the `proxy` network at `ninfer-r9700:8080`; no host port is published.
 
 ## Documentation
 
-- `docs/cli.md` — generation, sampling, media, speculative decoding and prefix storage.
-- `docs/serving.md` — OpenAI/Anthropic endpoints and request lifecycle.
-- `docs/performance.md` — benchmarks, recipes, quality comparisons and limitations.
+- `docs/cli.md` — input, sampling, media, speculation and prefix storage.
+- `docs/serving.md` — HTTP schemas, tools, constraints, scoring, state and metrics.
+- `docs/containers.md` — container prerequisites, deployment and verification.
+- `docs/performance.md` — capacity, benchmarks, quality gates and limitations.
 - `docs/README.md` — architecture, artifact formats, conversion and kernel development.
-- `plans/r9700-autonomous-todos.md` — live development work items.

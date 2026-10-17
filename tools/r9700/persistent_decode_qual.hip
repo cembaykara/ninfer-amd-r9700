@@ -5,7 +5,7 @@
 // both graphs from identical device contents. The lowered graph must write exactly the bytes of
 // the captured launches in every buffer (bitwise, inputs included) and be run-to-run
 // deterministic; constant operands must stay untouched. Operands are small finite pseudo-random
-// values (valid FP8LUT4 codes, group codes and scales), not production weights.
+// values (valid LQ4 codes, group codes and scales), not production weights.
 #include "core/arena.h"
 #include "core/cache_warm.h"
 #include "core/gdn_replay_records.h"
@@ -18,7 +18,7 @@
 #include "ops/r9700/gdn/gdn_ops.h"
 #include "ops/r9700/linear/fp8_activation.h"
 #include "ops/r9700/linear/fp8_small_t_linear.h"
-#include "ops/r9700/linear/fp8lut4_linear.h"
+#include "ops/r9700/linear/lq4_linear.h"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
@@ -264,12 +264,12 @@ private:
 
 // ---- Operands.
 struct Lut4 {
-    lin::Fp8Lut4Weight view{};
+    lin::Lq4Weight view{};
     std::size_t code_bytes  = 0;
     std::size_t group_bytes = 0;
 };
 
-// FP8LUT4 [rows, columns] in N16 x K64 tiles: random sign-magnitude nibbles, group codes with
+// LQ4 [rows, columns] in N16 x K64 tiles: random sign-magnitude nibbles, group codes with
 // E = (b >> 3) - 26 in [-6, 3], row multipliers 2^-10 (1 + u).
 Lut4 add_lut4(Scenario& s, const std::string& name, unsigned rows, unsigned columns, Rng& rng) {
     Lut4 w;
@@ -290,7 +290,7 @@ Lut4 add_lut4(Scenario& s, const std::string& name, unsigned rows, unsigned colu
     return w;
 }
 
-// The head of a FP8LUT4 weight's stream (core/cache_warm.h weight_warm): codes
+// The head of a LQ4 weight's stream (core/cache_warm.h weight_warm): codes
 // [offset, offset + bytes) and the same fraction of the group-code plane.
 CacheWarm lut4_warm(const Lut4& w, std::size_t offset, std::size_t bytes) {
     CacheWarm warm{};
@@ -519,10 +519,10 @@ Outcome attention_front(unsigned T, bool poison, hipStream_t stream) {
 }
 
 // Attention output and MLP: gated quantization -> row-scaled FP8 output projection into the
-// residual -> fused RMSNorm quantization (publishing the normalized rows) -> FP8LUT4 SiLU-pair
-// gate/up -> quantization of the MLP activation -> FP8LUT4 down projection accumulated into the
-// residual (QuantizeGated, Fp8SmallT<Residual>, QuantizeNormalized, Fp8Lut4SmallT<false,true>,
-// QuantizeActivation, Fp8Lut4SmallT<true,false>).
+// residual -> fused RMSNorm quantization (publishing the normalized rows) -> LQ4 SiLU-pair
+// gate/up -> quantization of the MLP activation -> LQ4 down projection accumulated into the
+// residual (QuantizeGated, Fp8SmallT<Residual>, QuantizeNormalized, Lq4SmallT<false,true>,
+// QuantizeActivation, Lq4SmallT<true,false>).
 Outcome attention_output_mlp(unsigned T, hipStream_t stream) {
     Scenario s("attention output + MLP T" + std::to_string(T));
     Rng rng(200U + T);
@@ -561,23 +561,23 @@ Outcome attention_output_mlp(unsigned T, hipStream_t stream) {
                                                          .warm = lut4_warm(gate_up, 0U, 2U * kMiB)},
                                                         st),
                 "quantize normalized");
-            check(lin::fp8lut4_linear(gate_up.view, normalized_image,
-                                      {.leading = activation, .silu_pair = true}, st),
+            check(lin::lq4_linear(gate_up.view, normalized_image,
+                                  {.leading = activation, .silu_pair = true}, st),
                   "gate_up silu");
             check(lin::fp8_quantize_activation(
                       {activation, activation_image, lut4_warm(down, 0U, 2U * kMiB)}, st),
                   "quantize activation");
-            check(lin::fp8lut4_linear(down.view, activation_image,
-                                      {.leading = residual, .accumulate = true}, st),
+            check(lin::lq4_linear(down.view, activation_image,
+                                  {.leading = residual, .accumulate = true}, st),
                   "down accumulate");
         },
         stream);
 }
 
-// Plain quantization feeding four consumers of one image: row-scaled FP8 store, an FP8LUT4 pair
-// with a second weight and feature splits on both, a plain FP8LUT4 store and an accumulating
-// FP8LUT4 pair into that output (QuantizeActivation, Fp8SmallT<Store>, Fp8Lut4SmallT<false,false>
-// x2, Fp8Lut4SmallT<true,false>).
+// Plain quantization feeding four consumers of one image: row-scaled FP8 store, an LQ4 pair
+// with a second weight and feature splits on both, a plain LQ4 store and an accumulating
+// LQ4 pair into that output (QuantizeActivation, Fp8SmallT<Store>, Lq4SmallT<false,false>
+// x2, Lq4SmallT<true,false>).
 Outcome projections(unsigned T, hipStream_t stream) {
     Scenario s("quantize + projections T" + std::to_string(T));
     Rng rng(300U + T);
@@ -601,25 +601,25 @@ Outcome projections(unsigned T, hipStream_t stream) {
         [&](hipStream_t st) {
             check(lin::fp8_quantize_activation({x, image, fp8_warm(rows)}, st), "quantize");
             check(lin::fp8_small_t_linear(rows.view, image, y, st), "fp8 store");
-            check(lin::fp8lut4_linear_pair(
+            check(lin::lq4_linear_pair(
                       query_key.view, {.leading = q, .trailing = k, .split = kQuery},
                       gate_value.view, {.leading = g, .trailing = v, .split = kQuery}, image, st),
                   "lut4 pair split");
-            check(lin::fp8lut4_linear(plain.view, image, {.leading = plain_out}, st), "lut4 plain");
-            check(lin::fp8lut4_linear_pair(plain.view, {.leading = plain_out, .accumulate = true},
-                                           second.view, {.leading = second_out, .accumulate = true},
-                                           image, st),
+            check(lin::lq4_linear(plain.view, image, {.leading = plain_out}, st), "lut4 plain");
+            check(lin::lq4_linear_pair(plain.view, {.leading = plain_out, .accumulate = true},
+                                       second.view, {.leading = second_out, .accumulate = true},
+                                       image, st),
                   "lut4 accumulate pair");
         },
         stream);
 }
 
 // One GDN layer at verification width T: FP8 normalized front (optionally applying this layer's
-// deferred replay fold into the shared state pool) -> FP8LUT4 pair projection + recorded
+// deferred replay fold into the shared state pool) -> LQ4 pair projection + recorded
 // convolution (chain or tree parents, partial valid columns) -> replay-record recurrence on the
-// folded state -> gated RMSNorm quantization -> FP8LUT4 output projection accumulated into the
+// folded state -> gated RMSNorm quantization -> LQ4 output projection accumulated into the
 // residual (GdnNormalizedFront, GdnPairConvRecord<T>, GdnRecord, QuantizeGatedRmsNorm,
-// Fp8Lut4SmallT<true,false>). The recurrence and the pair convolution overwrite the record row the
+// Lq4SmallT<true,false>). The recurrence and the pair convolution overwrite the record row the
 // fold reads, as the next round does in production. Tree mode runs the (unhosted) tree recurrence
 // between two lowered runs.
 struct GdnCase {
@@ -760,7 +760,7 @@ Outcome gdn_layer(const GdnCase& c, hipStream_t stream) {
                                                 lut4_warm(query_key, 0U, 4U * kMiB),
                                                 c.fold_batch > 0 ? &fold : nullptr),
                   "gdn front");
-            check(gdn::gdn_fp8lut4_pair_conv_record_bf16(
+            check(gdn::gdn_lq4_pair_conv_record_bf16(
                       image, query_key.view, value_z.view, conv_weight, conv_states, valid, initial,
                       c.tree ? parents : nullptr, static_cast<hip_bfloat16*>(layer.conv.data),
                       query, key, value, z, T, kSlots, st),
@@ -787,8 +787,8 @@ Outcome gdn_layer(const GdnCase& c, hipStream_t stream) {
                        .warm      = lut4_warm(out_proj, 0U, 2U * kMiB)},
                       st),
                   "quantize gated rmsnorm");
-            check(lin::fp8lut4_linear(out_proj.view, output_image,
-                                      {.leading = residual, .accumulate = true}, st),
+            check(lin::lq4_linear(out_proj.view, output_image,
+                                  {.leading = residual, .accumulate = true}, st),
                   "out_proj accumulate");
         },
         stream);

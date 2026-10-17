@@ -86,11 +86,11 @@ struct Variant {
         // producer may publish a Q4 activation image there for the next projection.
         [[nodiscard]] DeviceSpan activation_storage() const noexcept;
 
-        // One FP8LUT4 projection target: rows [0, leading rows) publish to `leading`, the rest to
+        // One LQ4 projection target: rows [0, leading rows) publish to `leading`, the rest to
         // `trailing` (nullptr: every row to `leading`); `accumulate` publishes
         // BF16(output + BF16(projection)); `silu_pair` publishes the SiLU-gated activation of a
         // gate/up-interleaved weight to `leading` [rows / 2, T].
-        struct Fp8Lut4Target {
+        struct Lq4Target {
             const Weight& weight;
             Tensor& leading;
             Tensor* trailing;
@@ -98,30 +98,27 @@ struct Variant {
             bool silu_pair = false;
         };
 
-        // FP8LUT4 projections of one per-token E4M3 image; each returns false unless every target
-        // weight is FP8LUT4. The image is produced from
+        // LQ4 projections of one per-token E4M3 image; each returns false unless every target
+        // weight is LQ4. The image is produced from
         // - the BF16 rows `input` [K, T];
-        [[nodiscard]] bool fp8lut4_projections(const Tensor& input,
-                                               std::span<const Fp8Lut4Target> targets,
-                                               hipStream_t stream);
+        [[nodiscard]] bool lq4_projections(const Tensor& input, std::span<const Lq4Target> targets,
+                                           hipStream_t stream);
         // - RMSNorm (unit offset) of `residual` [5120, T], also published to a non-null
         //   `normalized` [5120, T];
-        [[nodiscard]] bool fp8lut4_normalized_projections(const Tensor& residual,
-                                                          const Tensor& norm, float eps,
-                                                          std::span<const Fp8Lut4Target> targets,
-                                                          hipStream_t stream,
-                                                          Tensor* normalized = nullptr);
+        [[nodiscard]] bool lq4_normalized_projections(const Tensor& residual, const Tensor& norm,
+                                                      float eps, std::span<const Lq4Target> targets,
+                                                      hipStream_t stream,
+                                                      Tensor* normalized = nullptr);
         // - the attention output gate BF16(BF16(attention) * sigmoid(gate)) [6144, T];
-        [[nodiscard]] bool fp8lut4_gated_projections(const Tensor& gate,
-                                                     const Tensor& attention_fp32,
-                                                     std::span<const Fp8Lut4Target> targets,
-                                                     hipStream_t stream);
+        [[nodiscard]] bool lq4_gated_projections(const Tensor& gate, const Tensor& attention_fp32,
+                                                 std::span<const Lq4Target> targets,
+                                                 hipStream_t stream);
         // - the GDN gated per-head RMSNorm of `recurrent_output` with gate `z` [6144, T].
-        [[nodiscard]] bool fp8lut4_gated_rmsnorm_projections(const Tensor& recurrent_output,
-                                                             const Tensor& norm, const Tensor& z,
-                                                             float eps,
-                                                             std::span<const Fp8Lut4Target> targets,
-                                                             hipStream_t stream);
+        [[nodiscard]] bool lq4_gated_rmsnorm_projections(const Tensor& recurrent_output,
+                                                         const Tensor& norm, const Tensor& z,
+                                                         float eps,
+                                                         std::span<const Lq4Target> targets,
+                                                         hipStream_t stream);
         // SiLU-gated down projection added to the residual in place.
         // Small verification widths: normalized gate/up plus fused SiLU down as one Op whose
         // prepare also clears the down status (no reset launch). gate_up is BF16 scratch.
@@ -327,29 +324,28 @@ struct Variant {
         eager_widths(std::uint32_t prefill_tokens, std::uint32_t maximum_concurrency,
                      std::span<const std::uint32_t> verify_widths);
 
-        // Whether every target runs on the FP8LUT4 projection route (FP8LUT4 weights, or
+        // Whether every target runs on the LQ4 projection route (LQ4 weights, or
         // row-scaled E4M3 protections at prefill widths) over a [columns, tokens] image.
-        [[nodiscard]] bool
-        fp8lut4_targets_supported(std::uint32_t tokens, std::uint32_t columns,
-                                  std::span<const Fp8Lut4Target> targets) const noexcept;
+        [[nodiscard]] bool lq4_targets_supported(std::uint32_t tokens, std::uint32_t columns,
+                                                 std::span<const Lq4Target> targets) const noexcept;
 
     private:
         struct Impl;
         [[nodiscard]] ops::r9700::linear::FusedSiluA8Q4G64DownArgs
         fused_down_args(const Tensor& gate_up, const Weight& down, Tensor& residual) const;
-        // FP8LUT4 GDN front: residual RMSNorm, a/b controls into g/beta and the per-token E4M3
+        // LQ4 GDN front: residual RMSNorm, a/b controls into g/beta and the per-token E4M3
         // image of the seam (bound in the serialized region) from one kernel; false unless both GDN
-        // input projections are FP8LUT4. A non-null `fold` (that layer's deferred replay fold)
+        // input projections are LQ4. A non-null `fold` (that layer's deferred replay fold)
         // runs in the same launch.
-        [[nodiscard]] bool gdn_fp8lut4_front(const Tensor& residual, const Tensor& norm, float eps,
-                                             const GdnProjectionWeights& weights, Tensor& g,
-                                             Tensor& beta, hipStream_t stream,
-                                             ops::r9700::linear::Fp8ActivationWorkspace* image,
-                                             const ops::GdnLayerFold* fold = nullptr);
+        [[nodiscard]] bool gdn_lq4_front(const Tensor& residual, const Tensor& norm, float eps,
+                                         const GdnProjectionWeights& weights, Tensor& g,
+                                         Tensor& beta, hipStream_t stream,
+                                         ops::r9700::linear::Fp8ActivationWorkspace* image,
+                                         const ops::GdnLayerFold* fold = nullptr);
         [[nodiscard]] ops::r9700::linear::Fp8ActivationWorkspace
-        fp8lut4_image(std::uint32_t tokens, std::uint32_t columns) const;
-        void fp8lut4_project(const ops::r9700::linear::Fp8ActivationWorkspace& image,
-                             std::span<const Fp8Lut4Target> targets, hipStream_t stream) const;
+        lq4_image(std::uint32_t tokens, std::uint32_t columns) const;
+        void lq4_project(const ops::r9700::linear::Fp8ActivationWorkspace& image,
+                         std::span<const Lq4Target> targets, hipStream_t stream) const;
         [[nodiscard]] std::optional<ops::r9700::linear::Fp8ActivationWorkspace>
         fp8_small_activation(SelectedLinearRole role, std::int32_t text_layer, const Weight& weight,
                              std::uint32_t tokens) const;
@@ -656,8 +652,7 @@ struct Variant {
     [[nodiscard]] static constexpr std::size_t
     runtime_driver_reservation_bytes(WeightsProfile profile, std::uint32_t concurrency,
                                      bool disk_cache_enabled) noexcept {
-        if (profile != WeightsProfile::R9700Fp8Lut4 || concurrency == 0U || concurrency > 8U)
-            return 0U;
+        if (profile != WeightsProfile::R9700Lq4 || concurrency == 0U || concurrency > 8U) return 0U;
         constexpr std::array<std::size_t, 8> main_mib{6, 6, 4, 4, 2, 2, 2, 2};
         return (2U + main_mib[concurrency - 1U] + (disk_cache_enabled ? 2U : 0U)) << 20U;
     }

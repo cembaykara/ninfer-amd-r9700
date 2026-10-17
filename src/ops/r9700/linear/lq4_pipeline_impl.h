@@ -1,8 +1,8 @@
 #pragma once
 
-// Device-side pieces of the FP8LUT4 x per-token E4M3 Linear shared by the Linear kernels and fused
+// Device-side pieces of the LQ4 x per-token E4M3 Linear shared by the Linear kernels and fused
 // consumers (e.g. the GDN projection-convolution epilogue).
-#include "ops/r9700/linear/fp8lut4_linear.h"
+#include "ops/r9700/linear/lq4_linear.h"
 #include "ops/r9700/persistent/persistent_cta.h"
 
 #include <hip/hip_bfloat16.h>
@@ -13,7 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::r9700::linear::fp8lut4 {
+namespace ninfer::ops::r9700::linear::lq4 {
 
 inline constexpr std::uint32_t kBaseSixteenths[8] = {0U, 13U, 27U, 41U, 56U, 74U, 94U, 120U};
 
@@ -119,7 +119,7 @@ __device__ __forceinline__ void load_table(uint2* table, std::uint32_t thread,
 template <std::uint32_t kSplit, std::uint32_t kSteps, std::uint32_t kTiles, class Cta,
           class Publish>
 __device__ __forceinline__ void
-small_t_rows(const Cta& cta, const Fp8Lut4Weight& weight, std::uint32_t row_base,
+small_t_rows(const Cta& cta, const Lq4Weight& weight, std::uint32_t row_base,
              const std::uint8_t* activation_codes, const float* token_scales, std::uint32_t tokens,
              const uint2* table, float (&partial)[kSplit][kTiles][8][32], Publish&& publish) {
     static_assert(kTiles == 1U || kTiles == 2U);
@@ -236,4 +236,4 @@ inline constexpr std::uint32_t kSmallTokens = 16U;
 inline constexpr std::uint32_t kSmallTwoTileTokens = 32U;
 inline constexpr std::uint32_t kVerifySplit = 4U, kVerifySteps = 2U;
 
-} // namespace ninfer::ops::r9700::linear::fp8lut4
+} // namespace ninfer::ops::r9700::linear::lq4

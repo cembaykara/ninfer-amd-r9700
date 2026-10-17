@@ -1,9 +1,9 @@
-// Qualification of the FP8LUT4 x per-token E4M3 Linear (fp8lut4_linear) against an FP64 oracle that
+// Qualification of the LQ4 x per-token E4M3 Linear (lq4_linear) against an FP64 oracle that
 // decodes the stored codes through an independently rounded codebook: every group code's table,
 // small-T and prefill widths on the real Qwen3.8 projection shapes, the residual epilogue and the
 // poisoned-activation contract. Optional timing (--time) on the same shapes.
 #include "qualification_device_guard.h"
-#include "ops/r9700/linear/fp8lut4_linear.h"
+#include "ops/r9700/linear/lq4_linear.h"
 #include "ops/r9700/linear/fp8_activation.h"
 #include "../../tests/ops/fp8_int4_kv_oracle.h"
 
@@ -93,7 +93,7 @@ std::vector<double> reference_codebook() {
 }
 
 void check_table(const std::vector<double>& book) {
-    const auto& table = linear::fp8lut4_magnitude_table();
+    const auto& table = linear::lq4_magnitude_table();
     for (int code = 0; code < 256; ++code)
         for (int j = 0; j < 8; ++j)
             require(oracle::decode_e4m3fn(table[code][j]) == book[code * 8 + j],
@@ -126,11 +126,11 @@ struct Weight {
         device_scales.upload(scales);
     }
 
-    linear::Fp8Lut4Weight view() const {
+    linear::Lq4Weight view() const {
         return {device_codes.data, device_groups.data, device_scales.data, rows, columns};
     }
 
-    // r9700-fp8lut4-n16k64-v1: tile (r / 16) * (K / 64) + k / 64, slot 16 * ((k % 64) / 32) + r
+    // r9700-lq4-n16k64-v1: tile (r / 16) * (K / 64) + k / 64, slot 16 * ((k % 64) / 32) + r
     // % 16.
     double value(const std::vector<double>& book, std::uint32_t r, std::uint32_t k) const {
         const std::size_t tile   = static_cast<std::size_t>(r / 16U) * (columns / 64U) + k / 64U;
@@ -182,17 +182,17 @@ void run_case(const std::vector<double>& book, std::uint32_t rows, std::uint32_t
     if (!accumulate)
         check(hipMemsetAsync(output.data, 0xff, output.count * sizeof(hip_bfloat16), stream),
               "poison output");
-    check(linear::fp8lut4_linear(weight.view(), activation.workspace,
-                                 {.leading = output.data, .accumulate = accumulate}, stream),
-          "fp8lut4");
+    check(linear::lq4_linear(weight.view(), activation.workspace,
+                             {.leading = output.data, .accumulate = accumulate}, stream),
+          "lq4");
     check(hipStreamSynchronize(stream), "sync");
     constexpr int graph_batch = 32;
     hipGraph_t graph          = nullptr;
     hipGraphExec_t executable = nullptr;
     const auto launch         = [&] {
-        check(linear::fp8lut4_linear(weight.view(), activation.workspace, {.leading = output.data},
-                                     stream),
-              "timed fp8lut4");
+        check(linear::lq4_linear(weight.view(), activation.workspace, {.leading = output.data},
+                                 stream),
+              "timed lq4");
     };
     if (graph_timing) {
         require(timed && !accumulate && !poison, "graph timing requires plain Linear");
@@ -336,7 +336,7 @@ void run_pair(const std::vector<double>& book, std::uint32_t rows0, std::uint32_
               leading(static_cast<std::size_t>(tokens) * (s != 0U ? s : w.rows)),
               trailing(s != 0U ? static_cast<std::size_t>(tokens) * (w.rows - s) : 1U) {}
 
-        linear::Fp8Lut4Output output() const {
+        linear::Lq4Output output() const {
             return {leading.data, split != 0U ? trailing.data : nullptr, split, false};
         }
     };
@@ -346,8 +346,8 @@ void run_pair(const std::vector<double>& book, std::uint32_t rows0, std::uint32_
         for (const Device<hip_bfloat16>* buffer : {&side.leading, &side.trailing})
             check(hipMemsetAsync(buffer->data, 0xff, buffer->count * sizeof(hip_bfloat16), stream),
                   "poison pair output");
-    check(linear::fp8lut4_linear_pair(first.view(), sides[0].output(), second.view(),
-                                      sides[1].output(), activation.workspace, stream),
+    check(linear::lq4_linear_pair(first.view(), sides[0].output(), second.view(), sides[1].output(),
+                                  activation.workspace, stream),
           "pair");
     check(hipStreamSynchronize(stream), "sync");
     std::vector<std::uint8_t> codes(static_cast<std::size_t>(tokens) * columns);
@@ -431,8 +431,8 @@ void run_silu(const std::vector<double>& book, std::uint32_t rows, std::uint32_t
     Device<hip_bfloat16> output(static_cast<std::size_t>(tokens) * features);
     check(hipMemsetAsync(output.data, 0xff, output.count * sizeof(hip_bfloat16), stream),
           "poison SiLU output");
-    check(linear::fp8lut4_linear(weight.view(), activation.workspace,
-                                 {.leading = output.data, .silu_pair = true}, stream),
+    check(linear::lq4_linear(weight.view(), activation.workspace,
+                             {.leading = output.data, .silu_pair = true}, stream),
           "silu");
     check(hipStreamSynchronize(stream), "sync");
     constexpr int graph_batch = 32;
@@ -443,8 +443,8 @@ void run_silu(const std::vector<double>& book, std::uint32_t rows, std::uint32_t
                 "SiLU timing is restricted to the actual T1 gate/up cell");
         check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "capture SiLU");
         for (int i = 0; i < graph_batch; ++i)
-            check(linear::fp8lut4_linear(weight.view(), activation.workspace,
-                                         {.leading = output.data, .silu_pair = true}, stream),
+            check(linear::lq4_linear(weight.view(), activation.workspace,
+                                     {.leading = output.data, .silu_pair = true}, stream),
                   "captured SiLU");
         check(hipStreamEndCapture(stream, &graph), "end SiLU capture");
         check(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "instantiate SiLU");
@@ -569,7 +569,7 @@ int main(int argc, char** argv) {
         const bool one_cell   = graph_cell || (argc == 5 && std::string(argv[1]) == "--time-cell");
         if (argc != 1 && !timed && !one_cell && !t1_only && !silu_graph)
             throw std::invalid_argument(
-                "usage: fp8lut4_linear_qual [--time-silu-t1-graph | --verify-t1 | --time | "
+                "usage: lq4_linear_qual [--time-silu-t1-graph | --verify-t1 | --time | "
                 "--time-cell T N K | --time-cell-graph T N K]");
         std::uint32_t selected_tokens = 0, selected_rows = 0, selected_columns = 0;
         if (one_cell) {
@@ -608,7 +608,7 @@ int main(int argc, char** argv) {
             run_case(book, 7168, 5120, 1, false, true, rng, stream);
             ninfer::r9700_qualification::device_guard().check("after-T1-linear-oracles");
             check(hipStreamDestroy(stream), "destroy stream");
-            std::cout << "fp8lut4 T1 plain/pair/SiLU/residual/poison qualification: PASS\n";
+            std::cout << "lq4 T1 plain/pair/SiLU/residual/poison qualification: PASS\n";
             return 0;
         }
         if (one_cell) {
@@ -617,7 +617,7 @@ int main(int argc, char** argv) {
             run_case(book, selected_rows, selected_columns, selected_tokens, false, false, rng,
                      stream, true, graph_cell);
             check(hipStreamDestroy(stream), "destroy stream");
-            std::cout << "fp8lut4 linear selected-cell qualification: PASS\n";
+            std::cout << "lq4 linear selected-cell qualification: PASS\n";
             return 0;
         }
 
@@ -632,7 +632,7 @@ int main(int argc, char** argv) {
                  {1U,  5U,  6U,  16U, 17U, 20U, 24U, 32U, 33U,  40U, 48U,
                   49U, 56U, 57U, 64U, 65U, 80U, 96U, 97U, 113U, 128U})
                 run_case(book, shape.rows, shape.columns, tokens, false, false, rng, stream);
-        // FP8LUT4 output head (N248320/K5120): C1..C8 verification widths up to T64.
+        // LQ4 output head (N248320/K5120): C1..C8 verification widths up to T64.
         for (const std::uint32_t tokens : {1U, 6U, 16U, 24U, 32U, 40U, 49U, 64U})
             run_case(book, 248320, 5120, tokens, false, false, rng, stream);
         // Prefill CTA shapes: 256x64 (T130/200 at N<12288), 512x64 (T300/1000/2048), 256x128
@@ -718,7 +718,7 @@ int main(int argc, char** argv) {
         ninfer::r9700_qualification::device_guard().check("after-linear-suite");
         if (timed) time_shapes(book, stream, rng);
         check(hipStreamDestroy(stream), "destroy stream");
-        std::cout << "fp8lut4 linear qualification: PASS\n";
+        std::cout << "lq4 linear qualification: PASS\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << "\n";

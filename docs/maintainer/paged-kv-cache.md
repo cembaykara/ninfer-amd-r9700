@@ -121,7 +121,7 @@ of staging, plus a 2-MiB physical allocation bound for each scatter table (54 Mi
 This reservation is independent of physical KV page count and preserves the affine curve;
 it does not consume the external headroom.
 
-For the measured production `R9700Fp8Lut4` build at `S=262144`, adaptive DFlash K7 with
+For the measured production `R9700Lq4` build at `S=262144`, adaptive DFlash K7 with
 the optimized proposal head, no Vision, and prefill chunk 2048, the target bounds the
 complete immutable Device Graph residency by its measured C1..8 inventory. This includes one
 executable for every captured profile and the lowered persistent decode definitions. Other startup
