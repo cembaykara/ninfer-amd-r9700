@@ -427,7 +427,7 @@ TokenGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in
                 {"tags", tags},
                 {"excludes",
                  {"</invoke", "</parameter", "</function", "</tool_call", "<invoke", "<parameter",
-                  "<function"}}};
+                  "<function", "</think>"}}};
     if (require_tool_call) {
         // The first content item must be a declared call, not merely a promise
         // in the prompt. Subsequent calls/prose retain the normal dispatch grammar.
