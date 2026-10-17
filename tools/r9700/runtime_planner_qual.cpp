@@ -443,7 +443,7 @@ void qualify_host_dflash_graph_allowance() {
                                              setting("HSA_DISABLE_FRAGMENT_ALLOCATOR", "1")
                                          ? host_argument_graph_mib
                                          : graph_mib;
-    constexpr std::array<std::size_t, 8> main_driver_mib{6, 6, 4, 4, 2, 2, 2, 2};
+    constexpr std::array<std::size_t, 8> main_driver_mib{6, 6, 4, 4, 2, 4, 4, 6};
 #if defined(NINFER_R9700_XATTENTION_QUALIFICATION)
     constexpr bool production_attention = false;
 #else

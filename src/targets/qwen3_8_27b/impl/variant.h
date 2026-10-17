@@ -646,14 +646,15 @@ struct Variant {
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);
 
-    // NInfer-owned driver residency: 2 MiB precedes graph preparation, then lazy
-    // kernel residency remains after immutable graph warmup.
-    // The main-stream high-water varies with C; SSD scatter adds its own residency.
+    // NInfer-owned runtime overhead beyond logical arenas, HIP graph residency and the
+    // physical allocation bound. The C-specific bound includes lazy kernel residency and
+    // the measured physical-counter residual; SSD scatter adds its own residency.
+    // Keep the 2-MiB startup component separate from the main-stream bound.
     [[nodiscard]] static constexpr std::size_t
     runtime_driver_reservation_bytes(WeightsProfile profile, std::uint32_t concurrency,
                                      bool disk_cache_enabled) noexcept {
         if (profile != WeightsProfile::R9700Lq4 || concurrency == 0U || concurrency > 8U) return 0U;
-        constexpr std::array<std::size_t, 8> main_mib{6, 6, 4, 4, 2, 2, 2, 2};
+        constexpr std::array<std::size_t, 8> main_mib{6, 6, 4, 4, 2, 4, 4, 6};
         return (2U + main_mib[concurrency - 1U] + (disk_cache_enabled ? 2U : 0U)) << 20U;
     }
 

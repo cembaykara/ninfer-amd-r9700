@@ -5,11 +5,11 @@ repository by custom AMD ports, not merged ancestry; `AGENTS.md` states the sync
 
 ## Baseline
 
-Reconciled through upstream `62687bd37f1dfb629384630ed8c07b5cc3ef9da1` (2026-10-16), advanced
-from `17c504c9` (2026-10-12), `d5c38cda` (2026-10-09), `6e5b576e` (2026-10-06), `f0d3922e` (2026-10-04), `945515ea` (2026-10-04), `48eb0b01` (2026-10-03), `593c2d0c` (2026-10-03),
+Reconciled through upstream `edaad03a737aa1a9e8288c47af3f07ada50ae905` (2026-10-17), advanced
+from `62687bd3` (2026-10-16), `17c504c9` (2026-10-12), `d5c38cda` (2026-10-09), `6e5b576e` (2026-10-06), `f0d3922e` (2026-10-04), `945515ea` (2026-10-04), `48eb0b01` (2026-10-03), `593c2d0c` (2026-10-03),
 `574a8d91` (2026-10-02), `f7f70d89` (2026-10-02), `9639c32f` (2026-09-30), `34c7119b` (2026-09-28) and
 `e04fad3728573a0109236929f5d473475a8657f2` (2026-09-21, AMD ports `7187d95d`, `2eab0a50`,
-`49c896dd`) by the dispositions below. The next sync reviews upstream changes after `62687bd3`
+`49c896dd`) by the dispositions below. The next sync reviews upstream changes after `edaad03a`
 against current AMD behavior.
 
 ## Ported features (`c450798c..e04fad37`)
@@ -488,3 +488,44 @@ commits are dispositioned above. Before push, this sync was rebased onto AMD `69
 the combined warnings-as-errors Release build, 11 focused host tests and production-artifact
 constrained-generation GPU test pass (`rebase-build.log`, `rebase-host.log`, `rebase-gpu.log`).
 This reconciliation creates no upstream ancestry merge, master promotion or deployment.
+
+
+## `62687bd3..edaad03a` (2 upstream commits, reconciled 2026-10-17)
+
+- `81a12c69e09f91c6ca844b6f82575e903bbbafc4`: excluded exact NVFP4-to-FP8 CUDA
+  codec expansion, eight-row A8 Down staging, NVFP4 T>=2 policy documentation, and their
+  CUDA codec/LinearAdd tests and benchmarks. These do not implement the R9700 LQ4
+  format or native HIP projection routes. Query/single-chain-key prefetch changes only
+  upstream's accepted-history GDN recorder, whose state representation was explicitly not
+  adopted in `f0d3922e`; AMD retains its qualified raw-record/deferred-Fold path. Its history
+  tests and replay benchmark follow that excluded route. No native speed benefit is established
+  by these NVIDIA measurements. The kernel-iteration/tooling change admits bounded experiments
+  addressing profiler-attributed instruction, address or synchronization overhead despite an
+  unchanged byte roof: already equivalent to the native Layer 0 hypothesis and Layer 2 physical
+  qualification rules. The SM120 classifier/recipe, CUDA admission constants, performance
+  records and NVFP4 implementation documentation are excluded.
+- `edaad03a737aa1a9e8288c47af3f07ada50ae905`: ported single structural reasoning-close
+  framing through the Qwen3 frontend and native concurrent executor. Plain chat excludes the
+  dedicated closing token once reasoning ends, including no-thinking admission and recovery
+  re-prefill. Speculative rounds commit only through that transition before continuation samples
+  with updated exclusions; ordinary/MTP/DFlash state ownership remains native. Tool grammars
+  reserve closing-think markup in free prose, including byte-split forms. Schema-constrained
+  argument values, response constraints, ordinary-token literal text and raw output retain their
+  contents. Host regressions cover preview rollback, channel attribution, prefill/decode
+  exclusion updates and speculative-prefix commit; the native C3 real-artifact fixture checks
+  thinking/no-thinking and streamed logprobs with every supported backend. The spill preparation
+  versus installed-session age assertions were already correct on AMD from the previous sync;
+  ported the bounded retry for a temporarily unavailable nonblocking snapshot. Serving,
+  concurrency and test documentation describe the resulting behavior.
+
+Verification: warnings-as-errors Release build with the selected ROCm 10/gfx1201 toolchain;
+11 focused host tests covering frontend, token/schema grammars, tokenizer, recovery/executor,
+public API, CLI and OpenAI/Responses/Anthropic schemas; native disk-cache suite; production
+`qwen3.8-27b/r9700-lq4` C3 constrained/plain generation with ordinary decode, MTP and
+captured DFlash, thinking/no-thinking, exact closing-token counts and streaming/logprob
+attribution. Both GPU checks passed under the shared lock (11.03 s disk cache, 32.53 s real
+Engine fixture). Changed-line clang-tidy over 40 translation units reports zero diagnostics;
+changed C++ files pass clang-format and source whitespace checks pass. The executor regression
+uses AMD's probe device and native prefill signature. Evidence:
+`profiles/bench/r9700-upstream-sync-20261017/`. No throughput claim, ancestry merge, master promotion or deployment is part of this sync. The baseline advances to `edaad03a`;
+both source commits are dispositioned above.

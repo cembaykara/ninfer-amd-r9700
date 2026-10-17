@@ -440,6 +440,8 @@ struct RecordResult {
 RunResult run_ordinary(const Inputs& in, const std::vector<float>& initial, const Oracle& expected,
                        hipStream_t stream, const std::string& label) {
     DeviceInputs device(in);
+    ninfer::DeviceArena recurrence_workspace(std::max(
+        std::size_t{256}, ninfer::ops::gated_delta_net_workspace_capacity_bytes(in.width, true)));
     GuardedBuffer state_in(initial);
     GuardedBuffer state_out(initial.size() * sizeof(float));
     GuardedBuffer output(in.v.size() * sizeof(hip_bfloat16));
@@ -449,7 +451,7 @@ RunResult run_ordinary(const Inputs& in, const std::vector<float>& initial, cons
     ninfer::Tensor tout(state_out.data(), ninfer::DType::FP32, {kDim, kDim, kValueHeads});
     ninfer::Tensor out(output.data(), ninfer::DType::BF16, {kDim, kValueHeads, in.width});
     ninfer::ops::gated_delta_net(device.tq, device.tk, device.tv, device.tg, device.tbeta, kScale,
-                                 true, tin, tout, out, stream);
+                                 true, tin, tout, out, recurrence_workspace, stream);
     HIP_CHECK(hipStreamSynchronize(stream));
     RunResult result{
         output.copy<hip_bfloat16>(in.v.size()), state_out.copy<float>(initial.size()), {}};
@@ -727,6 +729,8 @@ TreeReference tree_reference(const Inputs& in, const std::vector<float>& initial
 void require_alias_rejection(hipStream_t stream) {
     const Inputs in = make_inputs(1, 901);
     DeviceInputs device(in);
+    ninfer::DeviceArena recurrence_workspace(std::max(
+        std::size_t{256}, ninfer::ops::gated_delta_net_workspace_capacity_bytes(in.width, true)));
     const std::size_t state_count = static_cast<std::size_t>(kValueHeads) * kDim * kDim;
     GuardedBuffer state(fp_fixture(state_count, 907, 8192.0F));
     ninfer::Tensor tstate(state.data(), ninfer::DType::FP32, {kDim, kDim, kValueHeads});
@@ -734,7 +738,8 @@ void require_alias_rejection(hipStream_t stream) {
     bool rejected = false;
     try {
         ninfer::ops::gated_delta_net(device.tq, device.tk, device.tv, device.tg, device.tbeta,
-                                     kScale, true, tstate, aliased_out, stream);
+                                     kScale, true, tstate, aliased_out, recurrence_workspace,
+                                     stream);
     } catch (const std::invalid_argument&) { rejected = true; }
     if (!rejected) { fail("ordinary output/input alias was accepted"); }
 }

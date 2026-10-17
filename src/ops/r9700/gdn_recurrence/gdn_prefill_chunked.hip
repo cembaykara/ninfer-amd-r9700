@@ -77,16 +77,99 @@ __device__ __forceinline__ F32x8 wmma(const F16x8& a, const F16x8& b, const F32x
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
 }
 
+// Chunk-parallel, state-independent work. All three value heads consume the same
+// represented FP16 keys, query normalization scale and FP32 WMMA products. The recurrence
+// still applies each head's controls and the original FP16 A/P boundaries.
+__global__ __launch_bounds__(256) void prepare_chunks(const hip_bfloat16* q, const hip_bfloat16* k,
+                                                      _Float16* keys, float* query_scales,
+                                                      float* products, int width, float scale) {
+    struct Shared {
+        _Float16 k[kChunk * kKPitch];
+    };
+
+    __shared__ Shared sh;
+    const int chunk = blockIdx.x, query_head = blockIdx.y;
+    const int tid = threadIdx.x, wave = tid / 32, lane = tid & 31;
+    const int n = lane & 15, half = lane >> 4, t0 = chunk * kChunk;
+    // Normalized k in both layouts and the query scales; wave w owns tokens 8w..8w+7 and
+    // lane l features 4l..4l+3. All loads are issued first; padded tokens read a clamped
+    // valid row and are zeroed.
+    {
+        uint2 key_raw[8], query_raw[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int source       = min(t0 + wave * 8 + r, width - 1);
+            const std::size_t base = (std::size_t(source) * kQHeads + query_head) * kDim + 4 * lane;
+            key_raw[r]             = *reinterpret_cast<const uint2*>(k + base);
+            query_raw[r]           = *reinterpret_cast<const uint2*>(q + base);
+        }
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int i      = wave * 8 + r;
+            const float live = t0 + i < width ? 1.0F : 0.0F;
+            const uint2 kr = key_raw[r], qr = query_raw[r];
+            const float kv[4] = {__uint_as_float(kr.x << 16U), __uint_as_float(kr.x & 0xffff0000U),
+                                 __uint_as_float(kr.y << 16U), __uint_as_float(kr.y & 0xffff0000U)};
+            const float qv[4] = {__uint_as_float(qr.x << 16U), __uint_as_float(qr.x & 0xffff0000U),
+                                 __uint_as_float(qr.y << 16U), __uint_as_float(qr.y & 0xffff0000U)};
+            float key_sum = 0.0F, query_sum = 0.0F;
+#pragma unroll
+            for (int it = 0; it < 4; ++it) {
+                key_sum   = fmaf(kv[it], kv[it], key_sum);
+                query_sum = fmaf(qv[it], qv[it], query_sum);
+            }
+            key_sum                 = wave_sum(key_sum);
+            query_sum               = wave_sum(query_sum);
+            const float key_inverse = rsqrtf(key_sum + kEpsilon) * live;
+#pragma unroll
+            for (int it = 0; it < 4; ++it) {
+                const _Float16 normalized         = _Float16(kv[it] * key_inverse);
+                sh.k[i * kKPitch + 4 * lane + it] = normalized;
+                keys[((std::size_t(chunk) * kQHeads + query_head) * kChunk + i) * kDim + 4 * lane +
+                     it]                          = normalized;
+            }
+            if (lane == 0)
+                query_scales[(std::size_t(chunk) * kQHeads + query_head) * kChunk + i] =
+                    rsqrtf(query_sum + kEpsilon) * scale * live;
+        }
+    }
+    __syncthreads();
+    // A = KK^T and P = QK^T on the ten lower tiles each.
+    for (int job = wave; job < 20; job += kWaves) {
+        const int I = kLowerTiles[job % 10][0], J = kLowerTiles[job % 10][1];
+        const int ia         = 16 * I + n;
+        const bool query_job = job >= 10;
+        const hip_bfloat16* query_row =
+            q + (std::size_t(t0 + ia) * kQHeads + query_head) * kDim + 8 * half;
+        F32x8 acc = {};
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            const F16x8 b_operand =
+                *reinterpret_cast<const F16x8*>(&sh.k[(16 * J + n) * kKPitch + 16 * ks + 8 * half]);
+            const F16x8 a_operand =
+                query_job
+                    ? bf16x8_to_f16(query_row + 16 * ks, t0 + ia < width, 1.0F)
+                    : *reinterpret_cast<const F16x8*>(&sh.k[ia * kKPitch + 16 * ks + 8 * half]);
+            acc = wmma(a_operand, b_operand, acc);
+        }
+        for (int e = 0; e < 8; ++e) {
+            products[(((std::size_t(chunk) * kQHeads + query_head) * 20 + job) * 16 + 8 * half +
+                      e) *
+                         16 +
+                     n] = acc[e];
+        }
+    }
+}
+
 // One workgroup per value head. WMMA fragments use tokens/state rows as the lane index
 // (lane & 15) and the reduction index as (lane >> 4) * 8 + e, so the S^T accumulator of wave w
 // (value rows 16w..16w+15, eight 16-key tiles) is directly the B operand of the next chunk's
 // K S^T and q S^T products.
-__global__ __launch_bounds__(kWaves *
-                             32) void chunked_kernel(const hip_bfloat16* q, const hip_bfloat16* k,
-                                                     const hip_bfloat16* v, const float* g,
-                                                     const float* beta, const float* state_in,
-                                                     float* state_out, hip_bfloat16* out, int width,
-                                                     float scale) {
+template <bool kPrepared>
+__global__ __launch_bounds__(kWaves * 32) void chunked_kernel(
+    const hip_bfloat16* q, const hip_bfloat16* k, const hip_bfloat16* v, const float* g,
+    const float* beta, const float* state_in, float* state_out, hip_bfloat16* out, int width,
+    float scale, const _Float16* keys, const float* query_scales, const float* products) {
     __shared__ ChunkShared sh;
     const int head = blockIdx.x, query_head = head / kHeadsPerQ;
     const int tid = threadIdx.x, wave = tid / 32, lane = tid & 31;
@@ -101,56 +184,81 @@ __global__ __launch_bounds__(kWaves *
     const int chunks = (width + kChunk - 1) / kChunk;
     for (int chunk = 0; chunk < chunks; ++chunk) {
         const int t0 = chunk * kChunk;
-        // Normalized k in both layouts and the query scales; wave w owns tokens 8w..8w+7 and
-        // lane l features 4l..4l+3. All loads are issued first; padded tokens read a clamped
-        // valid row and are zeroed.
-        {
-            uint2 key_raw[8], query_raw[8];
-#pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                const int source = min(t0 + wave * 8 + r, width - 1);
-                const std::size_t base =
-                    (std::size_t(source) * kQHeads + query_head) * kDim + 4 * lane;
-                key_raw[r]   = *reinterpret_cast<const uint2*>(k + base);
-                query_raw[r] = *reinterpret_cast<const uint2*>(q + base);
+        if constexpr (kPrepared) {
+            {
+                _Float16 transposed[4][8];
+                for (int r = 0; r < 8; ++r) {
+                    const int i = wave * 8 + r;
+                    for (int it = 0; it < 4; ++it) {
+                        const _Float16 normalized =
+                            keys[((std::size_t(chunk) * kQHeads + query_head) * kChunk + i) * kDim +
+                                 4 * lane + it];
+                        sh.k[i * kKPitch + 4 * lane + it] = normalized;
+                        transposed[it][r]                 = normalized;
+                    }
+                    if (lane == 0)
+                        sh.query_scale[i] =
+                            query_scales[(std::size_t(chunk) * kQHeads + query_head) * kChunk + i];
+                }
+                for (int it = 0; it < 4; ++it) {
+                    F16x8 features;
+                    for (int r = 0; r < 8; ++r) features[r] = transposed[it][r];
+                    *reinterpret_cast<F16x8*>(
+                        &sh.k_transposed[(4 * lane + it) * kTPitch + wave * 8]) = features;
+                }
             }
-            _Float16 transposed[4][8];
+        } else {
+            // Normalized k in both layouts and the query scales; wave w owns tokens 8w..8w+7 and
+            // lane l features 4l..4l+3. All loads are issued first; padded tokens read a clamped
+            // valid row and are zeroed.
+            {
+                uint2 key_raw[8], query_raw[8];
 #pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                const int i      = wave * 8 + r;
-                const float live = t0 + i < width ? 1.0F : 0.0F;
-                const uint2 kr = key_raw[r], qr = query_raw[r];
-                const float kv[4] = {
-                    __uint_as_float(kr.x << 16U), __uint_as_float(kr.x & 0xffff0000U),
-                    __uint_as_float(kr.y << 16U), __uint_as_float(kr.y & 0xffff0000U)};
-                const float qv[4] = {
-                    __uint_as_float(qr.x << 16U), __uint_as_float(qr.x & 0xffff0000U),
-                    __uint_as_float(qr.y << 16U), __uint_as_float(qr.y & 0xffff0000U)};
-                float key_sum = 0.0F, query_sum = 0.0F;
+                for (int r = 0; r < 8; ++r) {
+                    const int source = min(t0 + wave * 8 + r, width - 1);
+                    const std::size_t base =
+                        (std::size_t(source) * kQHeads + query_head) * kDim + 4 * lane;
+                    key_raw[r]   = *reinterpret_cast<const uint2*>(k + base);
+                    query_raw[r] = *reinterpret_cast<const uint2*>(q + base);
+                }
+                _Float16 transposed[4][8];
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    const int i      = wave * 8 + r;
+                    const float live = t0 + i < width ? 1.0F : 0.0F;
+                    const uint2 kr = key_raw[r], qr = query_raw[r];
+                    const float kv[4] = {
+                        __uint_as_float(kr.x << 16U), __uint_as_float(kr.x & 0xffff0000U),
+                        __uint_as_float(kr.y << 16U), __uint_as_float(kr.y & 0xffff0000U)};
+                    const float qv[4] = {
+                        __uint_as_float(qr.x << 16U), __uint_as_float(qr.x & 0xffff0000U),
+                        __uint_as_float(qr.y << 16U), __uint_as_float(qr.y & 0xffff0000U)};
+                    float key_sum = 0.0F, query_sum = 0.0F;
+#pragma unroll
+                    for (int it = 0; it < 4; ++it) {
+                        key_sum   = fmaf(kv[it], kv[it], key_sum);
+                        query_sum = fmaf(qv[it], qv[it], query_sum);
+                    }
+                    key_sum                 = wave_sum(key_sum);
+                    query_sum               = wave_sum(query_sum);
+                    const float key_inverse = rsqrtf(key_sum + kEpsilon) * live;
+#pragma unroll
+                    for (int it = 0; it < 4; ++it) {
+                        const _Float16 normalized         = _Float16(kv[it] * key_inverse);
+                        sh.k[i * kKPitch + 4 * lane + it] = normalized;
+                        transposed[it][r]                 = normalized;
+                    }
+                    if (lane == 0) sh.query_scale[i] = rsqrtf(query_sum + kEpsilon) * scale * live;
+                }
+                // Feature-major rows: eight consecutive tokens of each of this lane's features.
 #pragma unroll
                 for (int it = 0; it < 4; ++it) {
-                    key_sum   = fmaf(kv[it], kv[it], key_sum);
-                    query_sum = fmaf(qv[it], qv[it], query_sum);
+                    F16x8 features;
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) features[r] = transposed[it][r];
+                    *reinterpret_cast<F16x8*>(
+                        &sh.k_transposed[(4 * lane + it) * kTPitch + wave * 8]) = features;
                 }
-                key_sum                 = wave_sum(key_sum);
-                query_sum               = wave_sum(query_sum);
-                const float key_inverse = rsqrtf(key_sum + kEpsilon) * live;
-#pragma unroll
-                for (int it = 0; it < 4; ++it) {
-                    const _Float16 normalized         = _Float16(kv[it] * key_inverse);
-                    sh.k[i * kKPitch + 4 * lane + it] = normalized;
-                    transposed[it][r]                 = normalized;
-                }
-                if (lane == 0) sh.query_scale[i] = rsqrtf(query_sum + kEpsilon) * scale * live;
-            }
-            // Feature-major rows: eight consecutive tokens of each of this lane's features.
-#pragma unroll
-            for (int it = 0; it < 4; ++it) {
-                F16x8 features;
-#pragma unroll
-                for (int r = 0; r < 8; ++r) features[r] = transposed[it][r];
-                *reinterpret_cast<F16x8*>(&sh.k_transposed[(4 * lane + it) * kTPitch + wave * 8]) =
-                    features;
             }
         }
         if (wave == kWaves - 1) {
@@ -182,20 +290,30 @@ __global__ __launch_bounds__(kWaves *
         // A = KK^T and P = QK^T on the ten lower tiles each.
         for (int job = wave; job < 20; job += kWaves) {
             const int I = kLowerTiles[job % 10][0], J = kLowerTiles[job % 10][1];
-            const int ia         = 16 * I + n;
             const bool query_job = job >= 10;
-            const hip_bfloat16* query_row =
-                q + (std::size_t(t0 + ia) * kQHeads + query_head) * kDim + 8 * half;
-            F32x8 acc = {};
+            F32x8 acc;
+            if constexpr (kPrepared) {
+                for (int e = 0; e < 8; ++e)
+                    acc[e] =
+                        products[(((std::size_t(chunk) * kQHeads + query_head) * 20 + job) * 16 +
+                                  8 * half + e) *
+                                     16 +
+                                 n];
+            } else {
+                const int ia = 16 * I + n;
+                const hip_bfloat16* query_row =
+                    q + (std::size_t(t0 + ia) * kQHeads + query_head) * kDim + 8 * half;
+                acc = {};
 #pragma unroll
-            for (int ks = 0; ks < 8; ++ks) {
-                const F16x8 b_operand = *reinterpret_cast<const F16x8*>(
-                    &sh.k[(16 * J + n) * kKPitch + 16 * ks + 8 * half]);
-                const F16x8 a_operand =
-                    query_job
-                        ? bf16x8_to_f16(query_row + 16 * ks, t0 + ia < width, 1.0F)
-                        : *reinterpret_cast<const F16x8*>(&sh.k[ia * kKPitch + 16 * ks + 8 * half]);
-                acc = wmma(a_operand, b_operand, acc);
+                for (int ks = 0; ks < 8; ++ks) {
+                    const F16x8 b_operand = *reinterpret_cast<const F16x8*>(
+                        &sh.k[(16 * J + n) * kKPitch + 16 * ks + 8 * half]);
+                    const F16x8 a_operand =
+                        query_job ? bf16x8_to_f16(query_row + 16 * ks, t0 + ia < width, 1.0F)
+                                  : *reinterpret_cast<const F16x8*>(
+                                        &sh.k[ia * kKPitch + 16 * ks + 8 * half]);
+                    acc = wmma(a_operand, b_operand, acc);
+                }
             }
             const int j = 16 * J + n;
 #pragma unroll
@@ -336,7 +454,8 @@ __global__ __launch_bounds__(kWaves *
 hipError_t prefill_chunked(const hip_bfloat16* query, const hip_bfloat16* key,
                            const hip_bfloat16* value, const float* g, const float* beta,
                            const float* state_in, float* state_out, hip_bfloat16* output,
-                           std::int32_t width, float scale, hipStream_t stream) noexcept {
+                           std::int32_t width, float scale, void* workspace,
+                           hipStream_t stream) noexcept {
     if (query == nullptr || key == nullptr || value == nullptr || g == nullptr || beta == nullptr ||
         state_in == nullptr || state_out == nullptr || output == nullptr ||
         width < kChunkedMinimumWidth || !std::isfinite(scale) || stream == nullptr ||
@@ -344,8 +463,25 @@ hipError_t prefill_chunked(const hip_bfloat16* query, const hip_bfloat16* key,
         reinterpret_cast<std::uintptr_t>(key) % 16U != 0U) {
         return hipErrorInvalidValue;
     }
-    hipLaunchKernelGGL(chunked_kernel, dim3(kValueHeads), dim3(kWaves * 32), 0, stream, query, key,
-                       value, g, beta, state_in, state_out, output, width, scale);
+    if (width >= kPreparedMinimumWidth) {
+        if (workspace == nullptr) return hipErrorInvalidValue;
+        const int chunks = (width + kChunk - 1) / kChunk;
+        auto* keys       = static_cast<_Float16*>(workspace);
+        float* query_scales =
+            reinterpret_cast<float*>(keys + std::size_t(chunks) * kQHeads * kChunk * kDim);
+        float* products = query_scales + std::size_t(chunks) * kQHeads * kChunk;
+        hipLaunchKernelGGL(prepare_chunks, dim3(chunks, kQHeads), dim3(kWaves * 32), 0, stream,
+                           query, key, keys, query_scales, products, width, scale);
+        const hipError_t prepare_status = hipGetLastError();
+        if (prepare_status != hipSuccess) return prepare_status;
+        hipLaunchKernelGGL((chunked_kernel<true>), dim3(kValueHeads), dim3(kWaves * 32), 0, stream,
+                           query, key, value, g, beta, state_in, state_out, output, width, scale,
+                           keys, query_scales, products);
+    } else {
+        hipLaunchKernelGGL((chunked_kernel<false>), dim3(kValueHeads), dim3(kWaves * 32), 0, stream,
+                           query, key, value, g, beta, state_in, state_out, output, width, scale,
+                           nullptr, nullptr, nullptr);
+    }
     return hipGetLastError();
 }
 

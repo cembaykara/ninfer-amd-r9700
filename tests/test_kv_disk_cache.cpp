@@ -1223,11 +1223,17 @@ void spill_crc_runs_without_index_mutex(ninfer::DeviceContext& device) {
         disk.request_idle_spill();
         require(hold.entered(), "spill-crc-unlocked raw spill never reached its encode");
         hold.arm();
-        const auto active = disk.try_snapshot();
+        std::optional<cache::KvDiskSnapshot> active;
+        const bool sampled = wait_pred(
+            [&] {
+                if (!active) { active = disk.try_snapshot(); }
+                return active.has_value();
+            },
+            std::chrono::seconds(2));
         // Encoding still owns a private session. Preparation is active, but an installed
         // session's age is zero until prepare_spill publishes it.
-        prepare_visible = active && active->spill_active && active->spill_elapsed_seconds == 0.0 &&
-                          active->captures == 1;
+        prepare_visible     = sampled && active && active->spill_active &&
+                              active->spill_elapsed_seconds == 0.0 && active->captures == 1;
         const bool admitted = disk_admission_round(disk, resident, resident_entry);
         encode_admitted     = hold.disarm() && admitted;
         disk.test_hold_spill_encode(false);
@@ -1245,9 +1251,15 @@ void spill_crc_runs_without_index_mutex(ninfer::DeviceContext& device) {
         disk.request_idle_spill();
         require(hold.entered(), "spill-crc-unlocked spill never reached its page-batch CRC build");
         hold.arm();
-        const auto active = disk.try_snapshot();
-        session_visible   = active && active->spill_active && active->spill_elapsed_seconds > 0.0 &&
-                            active->captures == 2;
+        std::optional<cache::KvDiskSnapshot> active;
+        const bool sampled = wait_pred(
+            [&] {
+                if (!active) { active = disk.try_snapshot(); }
+                return active.has_value();
+            },
+            std::chrono::seconds(2));
+        session_visible     = sampled && active && active->spill_active &&
+                              active->spill_elapsed_seconds > 0.0 && active->captures == 2;
         const bool admitted = disk_admission_round(disk, resident, resident_entry);
         crc_admitted        = hold.disarm() && admitted;
         hold.release();
