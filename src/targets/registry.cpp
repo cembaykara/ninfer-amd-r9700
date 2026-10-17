@@ -82,6 +82,9 @@ decltype(auto) with_automatic_headroom_hint(const KvCapacityPolicy& policy, Fn&&
     if (policy.mode != KvCapacityMode::Automatic) { return fn(); }
     try {
         return fn();
+    } catch (const PinnedHostAllocationError&) {
+        // Host/GTT exhaustion is independent of automatic VRAM KV sizing.
+        throw;
     } catch (const std::exception& error) {
         throw std::runtime_error(
             std::string(error.what()) + " (automatic KV capacity left " +
@@ -130,7 +133,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
-    // Registered host memory can consume physical GPU page-table storage. Complete it
+    // Driver-backed pinned host memory consumes physical GPU page-table storage. Complete it
     // before sizing so its actual residency is already included in available VRAM.
     std::unique_ptr<HostPinnedArena> kv_ram_arena;
     if (kv_ram_future.valid()) { kv_ram_arena = kv_ram_future.get(); }

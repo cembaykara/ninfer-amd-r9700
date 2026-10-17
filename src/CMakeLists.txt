@@ -69,7 +69,7 @@ add_library(ninfer_r9700_core STATIC
   ops/r9700/kv/fp8_int4_kv_attention.hip
   ops/r9700/linear/linear_tensor_op.cpp
   ops/r9700/linear/fp8_activation.hip
-  ops/r9700/linear/fp8lut4_linear.hip
+  ops/r9700/linear/lq4_linear.hip
   ops/r9700/linear/fp8_small_t_linear.hip
   ops/r9700/linear/linear_execution.hip
   ops/r9700/linear/r9700_linear.hip)
@@ -775,12 +775,12 @@ ninfer_r9700_internal_includes(ninfer_r9700_attention_fused_qual)
 set_target_properties(ninfer_r9700_attention_fused_qual PROPERTIES HIP_ARCHITECTURES gfx1201)
 target_link_libraries(ninfer_r9700_attention_fused_qual PRIVATE ninfer_r9700_core hip::host)
 
-# Qualify the FP8LUT4 x per-token E4M3 Linear against its FP64 codebook oracle.
-add_executable(ninfer_r9700_fp8lut4_linear_qual
-  ${PROJECT_SOURCE_DIR}/tools/r9700/fp8lut4_linear_qual.hip)
-ninfer_r9700_internal_includes(ninfer_r9700_fp8lut4_linear_qual)
-set_target_properties(ninfer_r9700_fp8lut4_linear_qual PROPERTIES HIP_ARCHITECTURES gfx1201)
-target_link_libraries(ninfer_r9700_fp8lut4_linear_qual PRIVATE ninfer_r9700_core hip::host)
+# Qualify the LQ4 x per-token E4M3 Linear against its FP64 codebook oracle.
+add_executable(ninfer_r9700_lq4_linear_qual
+  ${PROJECT_SOURCE_DIR}/tools/r9700/lq4_linear_qual.hip)
+ninfer_r9700_internal_includes(ninfer_r9700_lq4_linear_qual)
+set_target_properties(ninfer_r9700_lq4_linear_qual PROPERTIES HIP_ARCHITECTURES gfx1201)
+target_link_libraries(ninfer_r9700_lq4_linear_qual PRIVATE ninfer_r9700_core hip::host)
 
 # Qualify the per-token E4M3 activation producers against their FP64 oracle.
 add_executable(ninfer_r9700_fp8_producers_qual
@@ -789,12 +789,12 @@ ninfer_r9700_internal_includes(ninfer_r9700_fp8_producers_qual)
 set_target_properties(ninfer_r9700_fp8_producers_qual PROPERTIES HIP_ARCHITECTURES gfx1201)
 target_link_libraries(ninfer_r9700_fp8_producers_qual PRIVATE ninfer_r9700_core hip::host)
 
-# Qualify the FP8LUT4 GDN verification front and fused projection-convolution.
-add_executable(ninfer_r9700_gdn_fp8lut4_front_qual
-  ${PROJECT_SOURCE_DIR}/tools/r9700/gdn_fp8lut4_front_qual.hip)
-ninfer_r9700_internal_includes(ninfer_r9700_gdn_fp8lut4_front_qual)
-set_target_properties(ninfer_r9700_gdn_fp8lut4_front_qual PROPERTIES HIP_ARCHITECTURES gfx1201)
-target_link_libraries(ninfer_r9700_gdn_fp8lut4_front_qual PRIVATE ninfer_r9700_core hip::host)
+# Qualify the LQ4 GDN verification front and fused projection-convolution.
+add_executable(ninfer_r9700_gdn_lq4_front_qual
+  ${PROJECT_SOURCE_DIR}/tools/r9700/gdn_lq4_front_qual.hip)
+ninfer_r9700_internal_includes(ninfer_r9700_gdn_lq4_front_qual)
+set_target_properties(ninfer_r9700_gdn_lq4_front_qual PROPERTIES HIP_ARCHITECTURES gfx1201)
+target_link_libraries(ninfer_r9700_gdn_lq4_front_qual PRIVATE ninfer_r9700_core hip::host)
 
 # Qualify the persistent decode lowering: lowered Device Graph chains bitwise equal to their
 # captured production launches.

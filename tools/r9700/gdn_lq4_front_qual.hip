@@ -1,13 +1,13 @@
-// Qualifies the FP8LUT4 GDN verification front on physical gfx1201:
+// Qualifies the LQ4 GDN verification front on physical gfx1201:
 //   * fp8_gdn_normalized_front: g/beta bitwise equal to the A8G64 front (the same seam and control
 //     arithmetic), and the per-token E4M3 image bitwise equal to fp8_quantize_activation of that
 //     front's published seam, for T in {1, 2, 5, 6, 7, 8, 12, 16, 24, 28, 32}, with a nonfinite
 //     token flagged;
-//   * gdn_fp8lut4_pair_conv_record_bf16 bitwise equal to fp8lut4_linear_pair followed by
-//     projection_conv_record_bf16 (chain, tree and partial columns; a poisoned token). The FP8LUT4
-//     projection itself is qualified against its FP64 oracle by ninfer_r9700_fp8lut4_linear_qual.
+//   * gdn_lq4_pair_conv_record_bf16 bitwise equal to lq4_linear_pair followed by
+//     projection_conv_record_bf16 (chain, tree and partial columns; a poisoned token). The LQ4
+//     projection itself is qualified against its FP64 oracle by ninfer_r9700_lq4_linear_qual.
 #include "ops/r9700/gdn/gdn_ops.h"
-#include "ops/r9700/linear/fp8lut4_linear.h"
+#include "ops/r9700/linear/lq4_linear.h"
 #include "ops/r9700/linear/fp8_activation.h"
 #include "ops/r9700/linear/r9700_linear.h"
 
@@ -168,12 +168,12 @@ void run_front(unsigned T, bool poison, hipStream_t s) {
     std::cout << label << ": bitwise\n";
 }
 
-struct Fp8Lut4Matrix {
+struct Lq4Matrix {
     Device<std::uint8_t> codes, groups;
     Device<float> scales;
     unsigned rows;
 
-    Fp8Lut4Matrix(unsigned n, Rng& rng)
+    Lq4Matrix(unsigned n, Rng& rng)
         : codes(std::size_t(n) * K / 2), groups(std::size_t(n) * K / 32), scales(n), rows(n) {
         std::vector<std::uint8_t> c(codes.count), g(groups.count);
         for (auto& v : c) v = std::uint8_t(rng.next());
@@ -185,7 +185,7 @@ struct Fp8Lut4Matrix {
         scales.put(r);
     }
 
-    lin::Fp8Lut4Weight view() const { return {codes.data, groups.data, scales.data, rows, K}; }
+    lin::Lq4Weight view() const { return {codes.data, groups.data, scales.data, rows, K}; }
 };
 
 struct Case {
@@ -206,7 +206,7 @@ void run_pair(const Case& c, hipStream_t s) {
     if (c.poison) x[std::size_t(T / 2U) * K + 11U] = hip_bfloat16(NAN);
     for (auto& v : conv_weight) v = hip_bfloat16(float(rng.uniform() - 0.5));
     for (auto& v : states) v = hip_bfloat16(float(2.0 * rng.uniform() - 1.0));
-    Fp8Lut4Matrix qk(QK, rng), vz(VZ, rng);
+    Lq4Matrix qk(QK, rng), vz(VZ, rng);
     const std::int32_t initial_slot = 1, valid = c.partial ? std::int32_t(T - 2) : std::int32_t(T);
     std::vector<std::int32_t> parents(T);
     for (unsigned t = 0; t < T; ++t)
@@ -241,15 +241,15 @@ void run_pair(const Case& c, hipStream_t s) {
         z.poison();
     };
     poison_outputs();
-    check(gdn::gdn_fp8lut4_pair_conv_record_bf16(
-              image.workspace, qk.view(), vz.view(), d_conv_weight.data, d_states.data,
-              d_valid.data, d_initial.data, parent_arg, record.data, query.data, key.data,
-              value.data, z.data, T, Slots, s),
+    check(gdn::gdn_lq4_pair_conv_record_bf16(image.workspace, qk.view(), vz.view(),
+                                             d_conv_weight.data, d_states.data, d_valid.data,
+                                             d_initial.data, parent_arg, record.data, query.data,
+                                             key.data, value.data, z.data, T, Slots, s),
           "fused");
     const Outputs fused = collect();
     poison_outputs();
-    check(lin::fp8lut4_linear_pair(qk.view(), {.leading = qk_out.data}, vz.view(),
-                                   {.leading = vz_out.data}, image.workspace, s),
+    check(lin::lq4_linear_pair(qk.view(), {.leading = qk_out.data}, vz.view(),
+                               {.leading = vz_out.data}, image.workspace, s),
           "pair");
     check(gdn::projection_conv_record_bf16(qk_out.data, vz_out.data, d_conv_weight.data,
                                            d_states.data, d_valid.data, d_initial.data, parent_arg,
@@ -280,7 +280,7 @@ int main() {
               Case{6, false, false, true}, Case{7, false, false, false}, Case{7, false, true, true},
               Case{8, false, false, false}, Case{8, true, false, true}})
             run_pair(c, s);
-        std::cout << "gdn fp8lut4 front qualification: PASS\n";
+        std::cout << "gdn lq4 front qualification: PASS\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << "\n";

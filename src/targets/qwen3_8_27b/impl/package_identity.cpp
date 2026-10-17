@@ -39,8 +39,8 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == model_id && identity.weights_id == (id)) return WeightsProfile::symbol;
 #include "targets/qwen3_8_27b/impl/load/fp8_endpoint_selection.inc"
 #undef NINFER_QWEN38_FP8_ENDPOINT
-    if (identity.model_id == model_id && identity.weights_id == "r9700-fp8lut4") {
-        return WeightsProfile::R9700Fp8Lut4;
+    if (identity.model_id == model_id && identity.weights_id == "r9700-lq4") {
+        return WeightsProfile::R9700Lq4;
     }
     if (identity.model_id == model_id &&
         identity.weights_id == "r9700-q4-fp8-selective-cap-n16k16-dflash2-q4-eval") {

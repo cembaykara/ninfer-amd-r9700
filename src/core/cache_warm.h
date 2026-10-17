@@ -29,7 +29,7 @@ struct CacheWarm {
 };
 
 // Bytes [offset, offset + bytes) of a weight's row-tile-major code stream and the same fraction of
-// its high plane (FP8LUT4 group codes), when it has one.
+// its high plane (LQ4 group codes), when it has one.
 [[nodiscard]] inline CacheWarm weight_warm(const Weight& weight, std::size_t offset,
                                            std::size_t bytes) noexcept {
     CacheWarm warm{};

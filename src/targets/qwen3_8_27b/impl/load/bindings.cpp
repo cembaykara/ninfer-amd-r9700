@@ -56,7 +56,7 @@ NumericFormat matrix_format(WeightsProfile profile, bool source_q4) {
     case WeightsProfile::R9700Q4W8MseDFlash2Q4MseEvaluation:
     case WeightsProfile::R9700Q4W8MseDFlash2W8MseEvaluation:
         return source_q4 ? NumericFormat::Q4G64_F16S : NumericFormat::W8G32_F16S;
-    case WeightsProfile::R9700Fp8Lut4:
+    case WeightsProfile::R9700Lq4:
 #define NINFER_QWEN38_FP8_ENDPOINT(symbol, id, base, embed, head) case WeightsProfile::symbol:
 #include "targets/qwen3_8_27b/impl/load/fp8_endpoint_selection.inc"
 #undef NINFER_QWEN38_FP8_ENDPOINT
@@ -212,10 +212,10 @@ load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtif
 }
 
 void bind_r9700_text_layers(artifact::Binder& binder, BindingPlan& out, WeightsProfile profile,
-                            bool fp8lut4_text) {
+                            bool lq4_text) {
     const auto bind_weight = [&](artifact::Binder& target, std::string_view name,
                                  NumericFormat format, std::initializer_list<std::uint64_t> shape) {
-        if (fp8lut4_text && format == NumericFormat::Q4G64_F16S) format = NumericFormat::FP8LUT4;
+        if (lq4_text && format == NumericFormat::Q4G64_F16S) format = NumericFormat::LQ4;
         return detail::bind_weight(target, name, format, shape);
     };
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
@@ -313,17 +313,17 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 } // namespace
 
 NumericFormat token_embedding_format(WeightsProfile profile) {
-    if (is_fp8lut4_text_profile(profile)) profile = fp8_capped_base_profile(profile);
+    if (is_lq4_text_profile(profile)) profile = fp8_capped_base_profile(profile);
     return base_token_embedding_format(profile);
 }
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3::StartupFeatures features) {
-    // An FP8LUT4 Text profile binds exactly its base recipe except for the Text-layer matrices
+    // An LQ4 Text profile binds exactly its base recipe except for the Text-layer matrices
     // outside its own FP8 protection set and the output head.
     const WeightsProfile text_profile = weights_profile;
-    const bool fp8lut4_text           = is_fp8lut4_text_profile(weights_profile);
-    if (fp8lut4_text) weights_profile = fp8_capped_base_profile(weights_profile);
+    const bool lq4_text               = is_lq4_text_profile(weights_profile);
+    if (lq4_text) weights_profile = fp8_capped_base_profile(weights_profile);
     (void)matrix_format(weights_profile, false);
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
@@ -344,7 +344,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                                    artifact::TensorPlacement::MappedHost),
                    .format = embedding_format,
                    .layout = embedding_layout};
-    bind_r9700_text_layers(binder, out, text_profile, fp8lut4_text);
+    bind_r9700_text_layers(binder, out, text_profile, lq4_text);
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
     if (weights_profile == WeightsProfile::R9700Q4SelectiveProtectedDFlash2Q4Evaluation ||
@@ -357,9 +357,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         out.output_head = WeightPlan{.object = handle,
                                      .format = NumericFormat::W8G32_F16S,
                                      .layout = artifact::StorageLayout::R9700W8G32N16K16V1};
-    } else if (fp8lut4_text) {
+    } else if (lq4_text) {
         out.output_head =
-            bind_weight(binder, "text/output_head", NumericFormat::FP8LUT4, {248320, 5120});
+            bind_weight(binder, "text/output_head", NumericFormat::LQ4, {248320, 5120});
     } else {
         out.output_head = bind_weight(binder, "text/output_head",
                                       is_selective_protected_profile(weights_profile)

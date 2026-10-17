@@ -546,9 +546,8 @@ void rewrite_images_round_trip(ninfer::DeviceContext& device,
         config.logical_page_bytes = ninfer::paged_kv_logical_page_bytes(*fixture.pool);
         config.hidden_bytes       = 1024;
         config.fingerprint        = q3::detail::make_disk_fingerprint(
-            "qwen3.8-27b", "r9700-fp8lut4", "state-restore-fixture",
-            ninfer::SpeculativeBackend::DFlash, *fixture.pool, nullptr, fixture.semantics,
-            std::nullopt, &gdn, &cyclic);
+            "qwen3.8-27b", "r9700-lq4", "state-restore-fixture", ninfer::SpeculativeBackend::DFlash,
+            *fixture.pool, nullptr, fixture.semantics, std::nullopt, &gdn, &cyclic);
         q3::detail::KVDiskCache disk(config);
         disk.note_ram_resident(entry_id, 0);
         require(disk.emergency_spill_ram(entry_id), "state-image disk spill failed");

@@ -8,6 +8,10 @@ namespace ninfer {
 
 void hip_check(hipError_t error, const char* expr, const char* file, int line);
 
+// Remaining driver-backed pinned-host budget on the current HIP device.
+// Allocation remains authoritative when concurrent users consume the shared GTT heap.
+[[nodiscard]] std::size_t available_pinned_host_memory();
+
 #define HIP_CHECK(expr) ::ninfer::hip_check((expr), #expr, __FILE__, __LINE__)
 
 // Sole device-context contract for the R9700 product. It owns ordered compute, load, and copy

@@ -138,8 +138,9 @@ when explicitly supplied.
 MTP and DFlash cannot be enabled together. DFlash requires appended `dflash/` objects and
 uses chain verification `W=k+1`, `k` in `1..7`. `--adaptive-draft` selects live K from `{3..N}`
 for `--draft-tokens N` (5..7; MTP stays `{3,4,5}`) using measured expected yield divided by round
-time; explicit `--draft-tokens 4` stays fixed. The recommended DFlash setting is
-`--draft-tokens 7 --adaptive-draft` (see `docs/performance.md`).
+time; explicit `--draft-tokens 4` stays fixed. `--spec dflash` defaults to seven drafts with
+adaptive length enabled. Use
+`--no-adaptive-draft` for a fixed length (see `docs/performance.md`).
 For DFlash, K describes the physical captured graph. Per-request output and context limits
 still clip the logical proposals and published tokens. Near an output limit, a larger padded
 graph may be selected only with measured cost at the current batch size and enough remaining
@@ -161,8 +162,9 @@ R9700 speed recommendations require R9700 end-to-end measurements; NVIDIA timing
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | HIP device index | `0` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`, DFlash2 `1..7` | unset |
-| `--adaptive-draft` | pick live draft K in `{3..N}` (DFlash `--draft-tokens N>=5`; MTP `{3,4,5}`) by locking `E[Y]/T(k,C,L)` (nested `r_i`; least-squares T; at most one probe of an unmeasured k; 1 ms switch cost). `--draft-tokens 4` stays `{4}` | off |
+| `--draft-tokens N` | MTP `1..5`, DFlash2 `1..7` | `7` with DFlash; required with MTP |
+| `--adaptive-draft` | pick live draft K in `{3..N}` (DFlash `--draft-tokens N>=5`; MTP `{3,4,5}`) by locking `E[Y]/T(k,C,L)` (nested `r_i`; least-squares T; at most one probe of an unmeasured k; 1 ms switch cost). `--draft-tokens 4` stays `{4}` | on with DFlash; off with MTP |
+| `--no-adaptive-draft` | use the fixed `--draft-tokens` length instead of adapting | off |
 | `--dflash-verify-width N` | DFlash2 chain verify width `W=k+1`, `2..8` | auto |
 | `--dflash-p-less-draft-temperature T` | Pins the DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. Unset, the engine calibrates it online per p-less `--temperature` and draft length: every chain round scores eight candidate temperatures against the verified target distribution and the next round uses the best ([model §8](maintainer/qwen3.8-27b-model.md#8-dflash2-block-diffusion-draft-model)) | calibrated |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -174,7 +176,7 @@ R9700 speed recommendations require R9700 end-to-end measurements; NVIDIA timing
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
 | `--no-p-less-sampling` | opt out of p-less and use top-p/top-k/min-p/penalties | p-less on |
-| `--temperature F` | sampling temperature override | registered model/mode default |
+| `--temperature F` | sampling temperature override | `1.5` with p-less; model/mode preset otherwise |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
 | `--top-k N` | top-k-threshold override | registered model/mode default |
 | `--min-p F` | min-p-threshold override | registered model/mode default |
@@ -183,7 +185,7 @@ R9700 speed recommendations require R9700 end-to-end measurements; NVIDIA timing
 | `--seed N` | sampling seed | `0` |
 
 When a sampling flag is omitted, Engine selects the official general-task preset registered for
-the loaded model and the rendered prompt mode. The current presets are:
+the loaded model and the rendered prompt mode. The standard-sampler presets (selected with `--no-p-less-sampling`) are:
 
 | Model | Prompt mode | Temperature | Top-p | Top-k | Min-p | Presence penalty |
 |---|---|---:|---:|---:|---:|---:|
@@ -193,7 +195,7 @@ the loaded model and the rendered prompt mode. The current presets are:
 Frequency penalty is `0` in every registered preset. Qwen's separate precise-coding recommendation
 is task-specific and is therefore an explicit override rather than an inferred Engine default.
 
-P-less is the default process/request truncation mode, with temperature `2.0` for Qwen3.8. It keeps
+P-less is the default process/request truncation mode, with temperature `1.5` when no override is supplied. It keeps
 temperature and seed, ignores top-p, top-k, min-p, and presence/frequency penalties, and writes a
 one-time warning on stderr. Ignored parameters must still satisfy their normal input ranges.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
@@ -297,7 +299,7 @@ so it is not part of the device weights. It does not probe
 allocations or resize the pool at request time. The single-request
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
-Checkpoint images live in one pinned host slab that startup allocates, prefaults, and registers
+Checkpoint images live in one driver-backed HIP/GTT pinned host slab allocated at startup
 outside `--kv-ram-capacity`: each lane's turn (rewrite) checkpoint image of the GDN state
 (146.8 MiB on Qwen3.8-27B, plus 40 MiB of DFlash local K/V), and with MTP or DFlash a pool of
 context-checkpoint heads (the same image plus the hidden row) for prefill-ladder and
@@ -319,6 +321,11 @@ otherwise it costs one H2D before the suffix prefill.
 `--kv-ram-capacity N` is a separate pinned-host budget in MiB for completed prefix bundles. It is
 not a token capacity, does not enlarge the GPU pool, and defaults to `off`. `N` must be a positive
 decimal integer; `0` is rejected. Construction fails if the host pin cannot be allocated.
+The fixed host-memory policy uses driver-backed GTT allocations with normal unified addressing;
+it changes no system-wide compaction setting. The RAM tier shares the GTT budget with checkpoint
+slabs, mapped weights, transfer staging and runtime host buffers. Host RAM availability alone does
+not guarantee admission; startup reports the requested allocation and remaining GTT budget when
+that budget is insufficient. Requested capacity is never silently reduced.
 `--kv-disk-capacity N` is a third-tier SSD budget in MiB of unique object bytes. It requires
 `--kv-ram-capacity > 0` and `--kv-disk-location PATH`. Location without capacity is an error.
 `--kv-disk-compress zstd` compresses new GDN/hidden/cyclic blobs only; KV pages are never
@@ -382,7 +389,7 @@ Use `--json-object` for an arbitrary JSON object, `--json-schema FILE` to read a
 or `--grammar FILE` to read an XGrammar EBNF grammar with a `root` rule. Select one constraint:
 
 ```bash
-build-r9700/apps/ninfer /path/to/qwen3.8-27b-r9700-fp8lut4.ninfer --prompt 'Return a JSON object with an answer.' \
+build-r9700/apps/ninfer /path/to/qwen3.8-27b-r9700-lq4.ninfer --prompt 'Return a JSON object with an answer.' \
   --json-schema answer.schema.json --no-thinking --max-new 256
 ```
 

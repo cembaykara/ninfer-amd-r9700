@@ -47,7 +47,7 @@ The token-logprob real-model check uses the explicit production artifact:
 
 ```bash
 flock --exclusive /path/to/local/.ninfer-coordination/gpu.lock \
-  env NINFER_R9700_WEIGHTS=/absolute/path/to/r9700-fp8lut4.ninfer \
+  env NINFER_R9700_WEIGHTS=/absolute/path/to/r9700-lq4.ninfer \
   ctest --test-dir build-r9700 -R '^ninfer_r9700_(token_logprobs_qual|engine_logprobs_real_test)$' \
     --output-on-failure
 ```
@@ -95,7 +95,7 @@ cold compilation with independent completed-call validators.
 
 ```bash
 flock --exclusive /path/to/local/.ninfer-coordination/gpu.lock \
-  env NINFER_R9700_WEIGHTS=/path/to/local/models/qwen3.8-27b-r9700-fp8lut4/qwen3.8-27b-r9700-fp8lut4.ninfer \
+  env NINFER_R9700_WEIGHTS=/path/to/local/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer \
   ctest --test-dir build-r9700 -R '^ninfer_r9700_output_constraint_real_test$' --output-on-failure
 ```
 
@@ -110,6 +110,6 @@ with the same explicit production artifact and GPU lease as the other R9700 Engi
 
 ```bash
 flock --exclusive /path/to/local/.ninfer-coordination/gpu.lock \
-  env NINFER_R9700_WEIGHTS=/path/to/local/models/qwen3.8-27b-r9700-fp8lut4/qwen3.8-27b-r9700-fp8lut4.ninfer \
+  env NINFER_R9700_WEIGHTS=/path/to/local/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer \
   ctest --test-dir build-r9700 -R '^ninfer_r9700_engine_cache_write_real_test$' --output-on-failure
 ```

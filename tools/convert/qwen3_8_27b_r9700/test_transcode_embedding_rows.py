@@ -36,14 +36,14 @@ class EmbeddingRowTranscodeTest(unittest.TestCase):
                 ResourceSpec("frontend/tokenizer.json", "raw-bytes-v1", len(head)),
             )
             with ArtifactWriter(
-                source, ArtifactIdentity("qwen3.8-27b", "r9700-fp8lut4"), specs
+                source, ArtifactIdentity("qwen3.8-27b", "r9700-lq4"), specs
             ) as writer:
                 writer.write("text/token_embedding", [encode_q4_n16k16(codes, scales, shape)])
                 writer.write("frontend/tokenizer.json", [head])
             Path(str(source) + ".conversion.json").write_text(
                 json.dumps(
                     {
-                        "recipe": "r9700-fp8lut4",
+                        "recipe": "r9700-lq4",
                         "objects": [
                             {
                                 "name": "text/token_embedding",

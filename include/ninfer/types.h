@@ -208,8 +208,8 @@ struct ModelSamplingDefaults {
     }
 };
 
-// Public request-side overrides. std::nullopt means "use the registered model/mode default";
-// explicit zero remains a real override (including temperature=0 for exact argmax).
+// Public request-side overrides. Omitted fields use the registered model/mode preset, except
+// p-less temperature defaults to 1.5. Explicit zero remains an override (including exact argmax).
 struct SamplingOverrides {
     std::optional<float> temperature;
     std::optional<std::int32_t> top_k;
@@ -219,7 +219,8 @@ struct SamplingOverrides {
     std::optional<float> frequency_penalty;
     std::optional<std::uint64_t> seed;
     // Product-default process/request mode. False explicitly opts out. When true, Engine keeps
-    // temperature and seed and ignores top-k, top-p, min-p, and presence/frequency penalties.
+    // temperature (default 1.5) and seed, ignoring top-k, top-p, min-p and presence/frequency
+    // penalties.
     bool p_less = true;
 };
 

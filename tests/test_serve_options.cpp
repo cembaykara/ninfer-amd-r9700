@@ -33,6 +33,25 @@ int main() {
 
     static_assert(ninfer::kMaximumConcurrency == 8);
 
+    const auto dflash_defaults = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash"});
+    failures += check(dflash_defaults.speculative.draft_tokens == 7 &&
+                          dflash_defaults.speculative.adaptive_draft,
+                      "DFlash must default to adaptive drafting with a maximum of seven");
+    const auto fixed_dflash = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
+                                     "--draft-tokens", "5", "--no-adaptive-draft"});
+    failures += check(fixed_dflash.speculative.draft_tokens == 5 &&
+                          !fixed_dflash.speculative.adaptive_draft,
+                      "explicit fixed DFlash length was not preserved");
+    const auto adaptive_override = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
+                                          "--no-adaptive-draft", "--adaptive-draft"});
+    failures += check(adaptive_override.speculative.adaptive_draft,
+                      "last adaptive-draft option did not win");
+    bool zero_drafts_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "0"});
+    } catch (const std::invalid_argument&) { zero_drafts_rejected = true; }
+    failures += check(zero_drafts_rejected, "explicit zero drafts silently selected the default");
+
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.prefill_chunk == ninfer::kDefaultPrefillChunk,
                       "serve prefill chunk diverges from the product default");

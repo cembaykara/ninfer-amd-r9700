@@ -18,7 +18,7 @@ It does not stop other GPU applications or restart the server. Do not run anothe
 From the repository root, with the currently installed artifact:
 
 ```bash
-model=/path/to/local/models/qwen3.8-27b-r9700-fp8lut4/qwen3.8-27b-r9700-fp8lut4.ninfer
+model=/path/to/local/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer
 ids=profiles/bench/r9700-compact-mixed-delivery-20260923/code.ids
 python3.11 tools/bench/context_ladder.py run --kind speed \
   --binary build-r9700/bench/ninfer_bench --attention dense \

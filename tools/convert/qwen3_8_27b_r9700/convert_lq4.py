@@ -1,9 +1,9 @@
-"""Create-only conversion of the FP8LUT4 Text recipe on the selective-cap DFlash2 base.
+"""Create-only conversion of the LQ4 Text recipe on the selective-cap DFlash2 base.
 
 Every Text-layer projection except the 21 FP8 protections of `fp8_capped_selection.inc` (the
 5090 NVFP4 reference's BF16 set plus the attention input projections at layers 27/31/51), and the
-output head, is re-encoded from the original BF16 checkpoint as FP8LUT4 (`fp8lut4_codec`), MLP
-gate/up rows in the interleaved SiLU-pair order (`fp8lut4_codec.interleave_gate_up`), with GPTQ
+output head, is re-encoded from the original BF16 checkpoint as LQ4 (`lq4_codec`), MLP
+gate/up rows in the interleaved SiLU-pair order (`lq4_codec.interleave_gate_up`), with GPTQ
 error-compensated rounding against the input second moments of the calibration sequences
 (`calibration.InputMoments`, evaluated layer-major through the BF16 reference in lock-step with
 the object order; the head against the final-norm moments). This includes the base's FP8 matrices
@@ -11,8 +11,8 @@ outside the protections. The token embedding is stored row-split (`row-split-k12
 permutation of the base's N16K16 codes and scales, because it is only row-gathered from pinned
 host memory. Every other object (the FP8 protections, draft head, MTP, DFlash2 companion, Vision,
 resources) is copied byte-exact from the base artifact.
-`--reuse-layers` copies each Text-layer FP8LUT4 object byte-exact from an existing
-`r9700-fp8lut4` artifact of the same calibration and damping whose receipt records the same
+`--reuse-layers` copies each Text-layer LQ4 object byte-exact from an existing
+`r9700-lq4` artifact of the same calibration and damping whose receipt records the same
 rounding (GPTQ or independent) for it; the others are re-encoded.
 """
 
@@ -54,11 +54,11 @@ EMBEDDING = "text/token_embedding"
 ROW_SPLIT = "row-split-k128-v1"
 
 BASE_WEIGHTS_ID = "r9700-q4-fp8-selective-cap-n16k16-dflash2-q4-eval"
-WEIGHTS_ID = "r9700-fp8lut4"
-FP8LUT4 = "FP8LUT4"
-FP8LUT4_LAYOUT = "r9700-fp8lut4-n16k64-v1"
+WEIGHTS_ID = "r9700-lq4"
+LQ4 = "LQ4"
+LQ4_LAYOUT = "r9700-lq4-n16k64-v1"
 # The Text projections kept as row-scaled FP8 (the binder reads the same authority entry).
-PROTECTED = frozenset(selections()[0]["R9700Fp8Lut4"])
+PROTECTED = frozenset(selections()[0]["R9700Lq4"])
 
 
 def selected(obj) -> bool:
@@ -100,7 +100,7 @@ def convert(args) -> None:
     from tools.convert.common.safetensors import ShardReader
     from tools.reference.qwen3_8_27b_bf16.protocol import LAYERS
 
-    from . import fp8lut4_codec, source, source_recipe
+    from . import lq4_codec, source, source_recipe
     from .calibration import InputMoments
 
     receipt = Path(str(args.out) + ".conversion.json")
@@ -127,13 +127,13 @@ def convert(args) -> None:
             or prior["base"] != str(args.base.resolve())
             or prior["source_model"] != str(args.model.resolve())
         ):
-            raise ValueError("--reuse-layers needs an r9700-fp8lut4 artifact of this calibration")
+            raise ValueError("--reuse-layers needs an r9700-lq4 artifact of this calibration")
         prior_digests = {row["name"]: row["sha256"] for row in prior["objects"]}
         prior_origins = {row["name"]: row["origin"] for row in prior["objects"]}
         reuse = Artifact(args.reuse_layers)
         if reuse.identity.weights_id != WEIGHTS_ID:
             reuse.close()
-            raise ValueError("--reuse-layers artifact identity is not r9700-fp8lut4")
+            raise ValueError("--reuse-layers artifact identity is not r9700-lq4")
     report = dict(
         recipe=WEIGHTS_ID,
         base=str(args.base.resolve()),
@@ -157,7 +157,7 @@ def convert(args) -> None:
         if base.identity.weights_id != BASE_WEIGHTS_ID:
             raise ValueError(f"base must be {BASE_WEIGHTS_ID}, got {base.identity.weights_id}")
         stored = tuple(
-            StoredTensor(o.name, o.shape, FP8LUT4, FP8LUT4_LAYOUT)
+            StoredTensor(o.name, o.shape, LQ4, LQ4_LAYOUT)
             if selected(o)
             else StoredTensor(o.name, o.shape, o.format, ROW_SPLIT)
             if o.name == EMBEDDING
@@ -174,15 +174,15 @@ def convert(args) -> None:
                 if selected(obj) and obj.name == HEAD:
                     while moments.next_layer < LAYERS:
                         moments.layer(moments.next_layer)
-                    calibration = fp8lut4_codec.Calibration(moments.final(), HEAD_DAMPING)
+                    calibration = lq4_codec.Calibration(moments.final(), HEAD_DAMPING)
                     tensor = source_recipe.materialize_recipe(
                         source_recipe.RECIPES_BY_NAME[obj.name], reader
                     )
-                    record["origin"] = "original-bf16-source-fp8lut4-gptq"
+                    record["origin"] = "original-bf16-source-lq4-gptq"
                     writer.write(
                         obj.name,
                         recorded(
-                            fp8lut4_codec.encode_chunks(
+                            lq4_codec.encode_chunks(
                                 tensor, device=device, rows_per_chunk=16384, calibration=calibration
                             ),
                             record,
@@ -198,12 +198,12 @@ def convert(args) -> None:
                         raise ValueError(f"{obj.name} is out of layer-major order")
                     role = "/".join(obj.name.split("/")[3:])
                     gptq = role not in INDEPENDENT_ROLES
-                    rounding = "fp8lut4-gptq" if gptq else "fp8lut4"
+                    rounding = "lq4-gptq" if gptq else "lq4"
                     if reuse is not None and prior_origins[obj.name].endswith("-" + rounding):
                         # Same rounding as this recipe: copy the prior encoding byte-exact.
                         record["origin"] = "reused-" + rounding
-                        if reuse.find(obj.name).format != FP8LUT4:
-                            raise ValueError(f"reused {obj.name} is not FP8LUT4")
+                        if reuse.find(obj.name).format != LQ4:
+                            raise ValueError(f"reused {obj.name} is not LQ4")
                         writer.write(obj.name, recorded(copied(reuse, obj.name), record))
                         if record["sha256"] != prior_digests.get(obj.name):
                             raise ValueError(f"reused {obj.name} differs from its receipt")
@@ -212,9 +212,9 @@ def convert(args) -> None:
                             source_recipe.RECIPES_BY_NAME[obj.name], reader
                         )
                         if obj.name.endswith("/mlp/gate_up"):
-                            tensor = fp8lut4_codec.interleave_gate_up(tensor)
+                            tensor = lq4_codec.interleave_gate_up(tensor)
                         calibration = (
-                            fp8lut4_codec.Calibration(
+                            lq4_codec.Calibration(
                                 layer_moments[role], DAMPING.get(role, DEFAULT_DAMPING)
                             )
                             if gptq
@@ -224,7 +224,7 @@ def convert(args) -> None:
                         writer.write(
                             obj.name,
                             recorded(
-                                fp8lut4_codec.encode_chunks(
+                                lq4_codec.encode_chunks(
                                     tensor,
                                     device=device,
                                     rows_per_chunk=tensor.shape[0],
@@ -284,7 +284,7 @@ def main() -> None:
     parser.add_argument(
         "--reuse-layers",
         type=Path,
-        help="copy the Text-layer FP8LUT4 objects from this r9700-fp8lut4 artifact",
+        help="copy the Text-layer LQ4 objects from this r9700-lq4 artifact",
     )
     parser.add_argument("--validate", type=Path)
     args = parser.parse_args()

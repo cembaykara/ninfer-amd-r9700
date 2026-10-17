@@ -10,8 +10,8 @@
 
 namespace ninfer::targets::qwen3::detail {
 
-// Page alignment of every checkpoint image region, so the disk tier's direct (O_DIRECT) state
-// reads land in the images without a bounce buffer.
+// Page alignment of every checkpoint image region preserves aligned state extents. The disk
+// tier reads through bounded ordinary-RAM staging before copying into the pinned GTT image.
 inline constexpr std::size_t kCheckpointImageAlignment = 4096;
 
 // One region of the Program's checkpoint-image slab: pinned, prefaulted, and carved at startup.

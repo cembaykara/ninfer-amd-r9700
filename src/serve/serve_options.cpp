@@ -108,8 +108,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--response-store-location DIR] [--response-store-max-records N] "
            "[--response-store-max-mib N] "
-           "[--spec mtp|dflash --draft-tokens N] "
-           "[--adaptive-draft] [--dflash-verify-width N] [--dflash-p-less-draft-temperature T] "
+           "[--spec mtp|dflash] [--draft-tokens N] "
+           "[--adaptive-draft|--no-adaptive-draft] [--dflash-verify-width N] "
+           "[--dflash-p-less-draft-temperature T] "
            "[--default-max-tokens N] "
            "[--vision] [--no-device-graph] [--no-prefix-reuse] "
            "[--context-checkpoints off|a,b,c] "
@@ -152,7 +153,9 @@ std::string serve_usage_text(const char* argv0) {
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n"
-           "       p-less sampling is enabled by default and uses temperature (default 2.0) and "
+           "       --spec dflash defaults to 7 draft tokens and adaptive drafting; "
+           "--no-adaptive-draft fixes the draft length.\n"
+           "       p-less sampling is enabled by default and uses temperature (default 1.5) and "
            "seed only; top-p, top-k, min-p, and penalties from flags and requests are ignored.\n"
            "       --no-p-less-sampling opts into the registered production sampler.\n";
 }
@@ -171,6 +174,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         redact_next = options.startup_argv.back() == "--api-key";
     }
     bool default_max_tokens_explicit = false;
+    bool draft_tokens_explicit       = false;
+    bool adaptive_draft_explicit     = false;
     bool kv_capacity_explicit        = false;
     std::optional<std::uint64_t> kv_capacity_headroom_mib;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
@@ -280,10 +285,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
         } else if (arg == "--draft-tokens") {
+            draft_tokens_explicit            = true;
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
         } else if (arg == "--adaptive-draft") {
             options.speculative.adaptive_draft = true;
+            adaptive_draft_explicit            = true;
+        } else if (arg == "--no-adaptive-draft") {
+            options.speculative.adaptive_draft = false;
+            adaptive_draft_explicit            = true;
         } else if (arg == "--dflash-p-less-draft-temperature") {
             options.speculative.dflash_p_less_draft_temperature =
                 parse_float_in(require_value("--dflash-p-less-draft-temperature"),
@@ -391,7 +401,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.mixed_forward_rounds == 0) {
         throw std::invalid_argument("--mixed-forward-rounds must be positive");
     }
-    product::validate_speculative_cli_options(options.speculative);
+    product::resolve_speculative_cli_options(options.speculative, draft_tokens_explicit,
+                                             adaptive_draft_explicit);
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");

@@ -14,7 +14,7 @@
 #include "ops/r9700/gdn_recurrence/gdn_record_kernel.h"
 #include "ops/r9700/linear/fp8_activation_kernels.h"
 #include "ops/r9700/linear/fp8_small_t_kernel.h"
-#include "ops/r9700/linear/fp8lut4_small_t_kernel.h"
+#include "ops/r9700/linear/lq4_small_t_kernel.h"
 #include "ops/r9700/persistent/persistent_cta.h"
 #include "ops/r9700/rope/rope_kernels.h"
 
@@ -41,7 +41,7 @@ namespace linear     = r9700::linear;
 namespace gdn_front  = r9700::gdn::front_kernels;
 namespace recurrence = detail::gated_delta_net::recurrence;
 
-// Two 384-thread blocks per WGP: a 128-thread FP8LUT4 GEMM phase ran as fast as 128-thread
+// Two 384-thread blocks per WGP: a 128-thread LQ4 GEMM phase ran as fast as 128-thread
 // persistent blocks and ~0.8 us faster per boundary than one 768-thread block per WGP.
 constexpr std::uint32_t kBlockThreads = 384U;
 constexpr std::uint32_t kBlocksPerWgp = 2U;
@@ -145,10 +145,9 @@ struct PhaseStreams {
 };
 
 // ---- Entries.
-// Row block c of an FP8LUT4 weight: its contiguous N16 code tiles and group codes.
-inline PhaseStreams fp8lut4_streams(const linear::Fp8Lut4Weight& first,
-                                    const linear::Fp8Lut4Weight& second) {
-    const auto part = [](const linear::Fp8Lut4Weight& weight) {
+// Row block c of an LQ4 weight: its contiguous N16 code tiles and group codes.
+inline PhaseStreams lq4_streams(const linear::Lq4Weight& first, const linear::Lq4Weight& second) {
+    const auto part = [](const linear::Lq4Weight& weight) {
         return std::array<StreamRange, 2>{
             StreamRange{reinterpret_cast<std::uint64_t>(weight.codes),
                         static_cast<std::uint64_t>(weight.columns) * 8U},
@@ -171,18 +170,17 @@ inline PhaseStreams fp8lut4_streams(const linear::Fp8Lut4Weight& first,
 // T1 projects 32 rows per CTA instead of SmallT's 16. Its next CTA overwrites only
 // the codebook before the first barrier; the prior CTA has finished reading it.
 template <bool Accumulate, bool SiluPair>
-struct Fp8Lut4T1 : CapturedGrid {
+struct Lq4T1 : CapturedGrid {
     static constexpr bool lds_reuse_safe = true;
-    static constexpr auto kernel =
-        &linear::fp8lut4_kernels::fp8lut4_t1_kernel<Accumulate, SiluPair>;
-    static constexpr std::uint32_t launch_threads = 32U * linear::fp8lut4_kernels::kGemvSplit;
+    static constexpr auto kernel = &linear::lq4_kernels::lq4_t1_kernel<Accumulate, SiluPair>;
+    static constexpr std::uint32_t launch_threads = 32U * linear::lq4_kernels::kGemvSplit;
     static constexpr std::uint32_t threads        = launch_threads;
-    using Shared                                  = linear::fp8lut4_kernels::T1Shared;
+    using Shared                                  = linear::lq4_kernels::T1Shared;
 
     template <class Params>
     static PhaseStreams streams(const Params& params) {
         const auto& a = slot_value<0>(params);
-        auto result   = fp8lut4_streams(a.weight, a.second);
+        auto result   = lq4_streams(a.weight, a.second);
         for (auto& part : result.parts)
             for (auto& range : part) range.bytes *= 2U;
         result.split /= 2U;
@@ -191,26 +189,24 @@ struct Fp8Lut4T1 : CapturedGrid {
 
     template <class Cta>
     __device__ static void run(const Cta& cta, Shared& shared,
-                               const linear::fp8lut4_kernels::KernelArgs& a) {
-        linear::fp8lut4_kernels::t1_body<Accumulate, SiluPair>(cta, shared, a);
+                               const linear::lq4_kernels::KernelArgs& a) {
+        linear::lq4_kernels::t1_body<Accumulate, SiluPair>(cta, shared, a);
     }
 };
 
 // T <= 16 (one token tile): a single-sequence verification width is at most 8.
 template <bool kAccumulate, bool kSiluPair>
-struct Fp8Lut4SmallT {
+struct Lq4SmallT {
     static constexpr std::uint32_t kTiles = 1U;
     // Before its first barrier the body writes only the codebook, which the previous CTA reads
     // only before its K-split barrier.
     static constexpr bool lds_reuse_safe = true;
     static constexpr auto kernel =
-        &linear::fp8lut4_kernels::fp8lut4_small_t_kernel<kAccumulate, kSiluPair,
-                                                         linear::fp8lut4::kVerifySplit,
-                                                         linear::fp8lut4::kVerifySteps, kTiles>;
-    static constexpr std::uint32_t launch_threads = 32U * linear::fp8lut4::kVerifySplit;
+        &linear::lq4_kernels::lq4_small_t_kernel<kAccumulate, kSiluPair, linear::lq4::kVerifySplit,
+                                                 linear::lq4::kVerifySteps, kTiles>;
+    static constexpr std::uint32_t launch_threads = 32U * linear::lq4::kVerifySplit;
     static constexpr std::uint32_t threads        = launch_threads;
-    using Shared =
-        linear::fp8lut4_kernels::SmallTShared<kSiluPair, linear::fp8lut4::kVerifySplit, kTiles>;
+    using Shared = linear::lq4_kernels::SmallTShared<kSiluPair, linear::lq4::kVerifySplit, kTiles>;
 
     template <class Params>
     static uint3 grid(uint3 captured, const Params&) {
@@ -219,16 +215,15 @@ struct Fp8Lut4SmallT {
 
     template <class Params>
     static PhaseStreams streams(const Params& params) {
-        const linear::fp8lut4_kernels::KernelArgs& a = slot_value<0>(params);
-        return fp8lut4_streams(a.weight, a.second);
+        const linear::lq4_kernels::KernelArgs& a = slot_value<0>(params);
+        return lq4_streams(a.weight, a.second);
     }
 
     template <class Cta>
     __device__ static void run(const Cta& cta, Shared& shared,
-                               const linear::fp8lut4_kernels::KernelArgs& a) {
-        linear::fp8lut4_kernels::small_t_body<kAccumulate, kSiluPair, linear::fp8lut4::kVerifySplit,
-                                              linear::fp8lut4::kVerifySteps, kTiles>(cta, shared,
-                                                                                     a);
+                               const linear::lq4_kernels::KernelArgs& a) {
+        linear::lq4_kernels::small_t_body<kAccumulate, kSiluPair, linear::lq4::kVerifySplit,
+                                          linear::lq4::kVerifySteps, kTiles>(cta, shared, a);
     }
 };
 
@@ -353,10 +348,10 @@ struct GdnNormalizedFront {
 
 template <unsigned T>
 struct GdnPairConvRecord {
-    // As Fp8Lut4SmallT; the previous CTA's convolution reads only its staged rows.
-    static constexpr bool lds_reuse_safe = true;
-    static constexpr auto kernel         = &gdn_front::gdn_fp8lut4_pair_conv_record_kernel<T>;
-    static constexpr std::uint32_t launch_threads = 32U * gdn_front::kFp8Lut4PairSplit;
+    // As Lq4SmallT; the previous CTA's convolution reads only its staged rows.
+    static constexpr bool lds_reuse_safe          = true;
+    static constexpr auto kernel                  = &gdn_front::gdn_lq4_pair_conv_record_kernel<T>;
+    static constexpr std::uint32_t launch_threads = 32U * gdn_front::kLq4PairSplit;
     static constexpr std::uint32_t threads        = launch_threads;
     using Shared                                  = gdn_front::PairConvShared<T>;
 
@@ -367,12 +362,12 @@ struct GdnPairConvRecord {
 
     template <class Params>
     static PhaseStreams streams(const Params& params) {
-        return fp8lut4_streams(slot_value<3>(params), slot_value<4>(params));
+        return lq4_streams(slot_value<3>(params), slot_value<4>(params));
     }
 
     template <class Cta, class... A>
     __device__ static void run(const Cta& cta, Shared& shared, const A&... a) {
-        gdn_front::fp8lut4_pair_conv_record_body<T>(cta, shared, a...);
+        gdn_front::lq4_pair_conv_record_body<T>(cta, shared, a...);
     }
 };
 
@@ -420,13 +415,13 @@ struct QkNormRope : CapturedGrid {
 using linear::fp8_small_t_kernels::Epilogue;
 // The kernels of a single-sequence decode graph (verification width at most 8).
 using Entries =
-    std::tuple<Fp8Lut4T1<false, false>, Fp8Lut4T1<true, false>, Fp8Lut4T1<false, true>,
-               Fp8Lut4SmallT<false, false>, Fp8Lut4SmallT<true, false>, Fp8Lut4SmallT<false, true>,
-               Fp8SmallT<Epilogue::Store>, Fp8SmallT<Epilogue::PairSplit>,
-               Fp8SmallT<Epilogue::Residual>, QuantizeActivation, QuantizeNormalized, QuantizeGated,
-               QuantizeGatedRmsNorm, GdnNormalizedFront, GdnPairConvRecord<4U>,
-               GdnPairConvRecord<5U>, GdnPairConvRecord<6U>, GdnPairConvRecord<7U>,
-               GdnPairConvRecord<8U>, GdnRecord, QkNormRope<rope_kernels::Profile::Text1D>,
+    std::tuple<Lq4T1<false, false>, Lq4T1<true, false>, Lq4T1<false, true>, Lq4SmallT<false, false>,
+               Lq4SmallT<true, false>, Lq4SmallT<false, true>, Fp8SmallT<Epilogue::Store>,
+               Fp8SmallT<Epilogue::PairSplit>, Fp8SmallT<Epilogue::Residual>, QuantizeActivation,
+               QuantizeNormalized, QuantizeGated, QuantizeGatedRmsNorm, GdnNormalizedFront,
+               GdnPairConvRecord<4U>, GdnPairConvRecord<5U>, GdnPairConvRecord<6U>,
+               GdnPairConvRecord<7U>, GdnPairConvRecord<8U>, GdnRecord,
+               QkNormRope<rope_kernels::Profile::Text1D>,
                QkNormRope<rope_kernels::Profile::TextMrope>>;
 constexpr std::size_t kEntryCount = std::tuple_size_v<Entries>;
 
