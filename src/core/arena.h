@@ -8,10 +8,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
 namespace ninfer {
+
+class PinnedHostAllocationError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct DeviceSpan {
     void* data        = nullptr;
@@ -140,10 +146,9 @@ private:
     };
 
     void insert_free(std::size_t offset, std::size_t bytes);
-    void* base_                = nullptr;
-    std::size_t capacity_      = 0;
-    std::size_t used_          = 0;
-    std::size_t mapping_bytes_ = 0;
+    void* base_           = nullptr;
+    std::size_t capacity_ = 0;
+    std::size_t used_     = 0;
     std::vector<Span> free_;
     std::unordered_map<void*, Span> live_;
 };

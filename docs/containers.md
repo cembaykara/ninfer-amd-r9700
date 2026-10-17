@@ -20,6 +20,11 @@ is 32768 tokens. The 262144-token context limit includes prompt and output and i
 literal `--max-context` argument in `compose.yaml`.
 The server option for adaptive length is `--adaptive-draft`, not `--adaptive-token`.
 
+Device startup selects driver-backed HIP/GTT host memory before HIP initialization, using
+`HSA_USERPTR_FOR_PAGED_MEM=0` and normal SVM addressing. This fixed process policy needs no
+host sysctl changes. The RAM prefix cache, checkpoint slabs and runtime pinned buffers share
+the driver's GTT capacity; lower the requested RAM cache if startup reports insufficient GTT.
+
 Compose selects bulk packet replay with `DEBUG_HIP_GRAPH_CLASSIC_PATH=0`,
 `ROC_ENABLE_LARGE_BAR=0`, `ROC_SKIP_KERNEL_ARG_COPY=0`,
 `HSA_DISABLE_FRAGMENT_ALLOCATOR=1`, and `DEBUG_HIP_GRAPH_BATCH_SIZE=16384` on the

@@ -4435,28 +4435,33 @@ bool KVDiskCache::read_page_payload(DiskObjectKind kind, std::uint64_t id, void*
     } catch (...) { return false; }
     const int fd            = descriptor->direct;
     const std::size_t bytes = static_cast<std::size_t>(location.extent_bytes);
-    std::size_t off         = 0;
+    // O_DIRECT cannot pin the driver's GTT mapping. Read into ordinary aligned RAM,
+    // then publish the complete page into the stable pinned transfer window.
+    thread_local UninitializedBytes staging;
+    if (staging.size() < bytes) { staging.resize(bytes); }
+    std::size_t off = 0;
     while (off < bytes) {
-        const ssize_t n = ::pread(fd, static_cast<unsigned char*>(io) + off, bytes - off,
+        const ssize_t n = ::pread(fd, staging.data() + off, bytes - off,
                                   static_cast<off_t>(location.offset + off));
         if (n < 0 && errno == EINTR) { continue; }
         if (n <= 0) { return false; }
         off += static_cast<std::size_t>(n);
     }
-    const auto* hdr = static_cast<const std::uint8_t*>(io);
+    const auto* hdr = staging.data();
     if (std::memcmp(hdr, kDiskPageMagic, 8) != 0) { return false; }
     std::uint32_t version = 0;
     std::memcpy(&version, hdr + 8, 4);
     std::uint32_t expected_crc = 0;
     std::memcpy(&expected_crc, hdr + 12, 4);
     const std::uint32_t payload_crc =
-        crc32c(std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(dst), payload));
+        crc32c(std::span<const std::uint8_t>(hdr + kDiskPageHeaderBytes, payload));
     const std::uint32_t record_crc = crc32c_combine(
         crc32c(std::span<const std::uint8_t>(hdr, kDiskPageHeaderBytes)), payload_crc, payload);
     if (version != kDiskFormatVersion || expected_crc != payload_crc ||
         location.record_crc32c != record_crc) {
         return false;
     }
+    std::memcpy(io, staging.data(), bytes);
     return true;
 }
 
@@ -4545,33 +4550,36 @@ bool KVDiskCache::decode_state_parts(std::uint64_t id, DiskStateKind expected, v
             } catch (...) { return false; }
             fd = descriptor->direct;
         }
-        std::uint32_t payload_crc = 0;
-        if (direct && read_workers > 1 && total >= (8ULL << 20)) {
-            constexpr std::size_t kChunkBytes = 4ULL << 20;
+        constexpr std::size_t kChunkBytes = 4ULL << 20;
 
-            struct Chunk {
-                std::uint8_t* dst            = nullptr;
-                std::size_t bytes            = 0;
-                std::uint64_t payload_offset = 0;
-                std::uint32_t crc            = 0;
-            };
-
-            std::vector<Chunk> chunks;
-            chunks.reserve((total + kChunkBytes - 1) / kChunkBytes + 1);
+        struct Chunk {
+            std::uint8_t* dst            = nullptr;
+            std::size_t bytes            = 0;
             std::uint64_t payload_offset = 0;
-            auto append_chunks           = [&](void* output, std::size_t output_bytes) {
-                auto* p = static_cast<std::uint8_t*>(output);
-                for (std::size_t off = 0; off < output_bytes; off += kChunkBytes) {
-                    const std::size_t n = std::min(kChunkBytes, output_bytes - off);
-                    chunks.push_back({p + off, n, payload_offset + off, 0});
-                }
-                payload_offset += output_bytes;
-            };
-            if (bytes != 0) { append_chunks(dst, bytes); }
-            if (bytes2 != 0) { append_chunks(dst2, bytes2); }
-            std::atomic<std::size_t> next{0};
-            std::atomic<bool> failed{false};
-            auto run = [&] {
+            std::uint32_t crc            = 0;
+        };
+
+        std::vector<Chunk> chunks;
+        chunks.reserve((total + kChunkBytes - 1) / kChunkBytes + 1);
+        std::uint64_t payload_offset = 0;
+        auto append_chunks           = [&](void* output, std::size_t output_bytes) {
+            auto* p = static_cast<std::uint8_t*>(output);
+            for (std::size_t off = 0; off < output_bytes; off += kChunkBytes) {
+                const std::size_t n = std::min(kChunkBytes, output_bytes - off);
+                chunks.push_back({p + off, n, payload_offset + off, 0});
+            }
+            payload_offset += output_bytes;
+        };
+        if (bytes != 0) { append_chunks(dst, bytes); }
+        if (bytes2 != 0) { append_chunks(dst2, bytes2); }
+        std::atomic<std::size_t> next{0};
+        std::atomic<bool> failed{false};
+        auto run = [&] {
+            try {
+                // One bounded ordinary-RAM scratch buffer per worker, never direct I/O
+                // into a driver's pinned GTT allocation.
+                UninitializedBytes staging;
+                staging.resize(std::min(kChunkBytes, total));
                 for (;;) {
                     const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
                     if (index >= chunks.size() || failed.load(std::memory_order_relaxed)) { break; }
@@ -4579,7 +4587,7 @@ bool KVDiskCache::decode_state_parts(std::uint64_t id, DiskStateKind expected, v
                     std::size_t got = 0;
                     while (got < chunk.bytes) {
                         const ssize_t n =
-                            ::pread(fd, chunk.dst + got, chunk.bytes - got,
+                            ::pread(fd, staging.data() + got, chunk.bytes - got,
                                     static_cast<off_t>(location.offset + kDiskStatePayloadOffset +
                                                        chunk.payload_offset + got));
                         if (n < 0 && errno == EINTR) { continue; }
@@ -4590,61 +4598,31 @@ bool KVDiskCache::decode_state_parts(std::uint64_t id, DiskStateKind expected, v
                         got += static_cast<std::size_t>(n);
                     }
                     if (got == chunk.bytes) {
-                        chunk.crc = crc32c(std::span<const std::uint8_t>(chunk.dst, chunk.bytes));
+                        chunk.crc =
+                            crc32c(std::span<const std::uint8_t>(staging.data(), chunk.bytes));
+                        std::memcpy(chunk.dst, staging.data(), chunk.bytes);
                     }
                 }
-            };
-            const std::uint32_t workers = std::min<std::uint32_t>(
-                std::max(1u, read_workers), static_cast<std::uint32_t>(chunks.size()));
-            std::vector<std::thread> pool;
-            pool.reserve(workers > 0 ? workers - 1 : 0);
-            try {
-                for (std::uint32_t i = 1; i < workers; ++i) { pool.emplace_back(run); }
-                run();
             } catch (...) { failed.store(true, std::memory_order_relaxed); }
-            for (auto& thread : pool) {
-                if (thread.joinable()) { thread.join(); }
-            }
-            if (failed.load(std::memory_order_relaxed)) { return false; }
-            payload_crc = chunks.front().crc;
-            for (std::size_t i = 1; i < chunks.size(); ++i) {
-                payload_crc = crc32c_combine(payload_crc, chunks[i].crc, chunks[i].bytes);
-            }
-        } else {
-            iovec iov[2]    = {{dst, bytes}, {dst2, bytes2}};
-            int first       = bytes == 0 ? 1 : 0;
-            std::size_t got = 0;
-            while (got < total) {
-                const ssize_t n =
-                    ::preadv(fd, iov + first, 2 - first,
-                             static_cast<off_t>(location.offset + kDiskStatePayloadOffset + got));
-                if (n < 0 && errno == EINTR) { continue; }
-                if (n <= 0) { return false; }
-                got += static_cast<std::size_t>(n);
-                ssize_t left = n;
-                while (left > 0 && first < 2) {
-                    auto& cur = iov[first];
-                    if (static_cast<std::size_t>(left) < cur.iov_len) {
-                        cur.iov_base = static_cast<char*>(cur.iov_base) + left;
-                        cur.iov_len -= static_cast<std::size_t>(left);
-                        break;
-                    }
-                    left -= static_cast<ssize_t>(cur.iov_len);
-                    ++first;
-                }
-            }
-            std::uint32_t actual_crc = ~0U;
-            if (bytes != 0) {
-                actual_crc = crc32c_update(
-                    actual_crc,
-                    std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(dst), bytes));
-            }
-            if (bytes2 != 0) {
-                actual_crc = crc32c_update(
-                    actual_crc,
-                    std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(dst2), bytes2));
-            }
-            payload_crc = ~actual_crc;
+        };
+        const std::uint32_t workers =
+            direct && total >= (8ULL << 20)
+                ? std::min<std::uint32_t>(std::max(1u, read_workers),
+                                          static_cast<std::uint32_t>(chunks.size()))
+                : 1u;
+        std::vector<std::thread> pool;
+        pool.reserve(workers - 1);
+        try {
+            for (std::uint32_t i = 1; i < workers; ++i) { pool.emplace_back(run); }
+            run();
+        } catch (...) { failed.store(true, std::memory_order_relaxed); }
+        for (auto& thread : pool) {
+            if (thread.joinable()) { thread.join(); }
+        }
+        if (failed.load(std::memory_order_relaxed)) { return false; }
+        std::uint32_t payload_crc = 0;
+        for (const auto& chunk : chunks) {
+            payload_crc = crc32c_combine(payload_crc, chunk.crc, chunk.bytes);
         }
         if (expected_crc != payload_crc) { return false; }
         const std::pair<const void*, std::uint64_t> prefix_parts[2] = {{hdr, sizeof(hdr)},

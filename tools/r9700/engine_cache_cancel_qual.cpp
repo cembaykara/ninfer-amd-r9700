@@ -82,7 +82,7 @@ int qualify_disk_restart(const std::filesystem::path& artifact,
         value.max_context            = 256;
         value.kv_capacity            = ninfer::KvCapacityPolicy::explicit_capacity(256);
         value.max_concurrency        = 1;
-        value.kv_ram_capacity_bytes  = 1ULL << 30;
+        value.kv_ram_capacity_bytes  = 8ULL << 30;
         value.kv_disk_capacity_bytes = 1ULL << 30;
         value.kv_disk_location       = directory;
         value.speculative.backend    = ninfer::SpeculativeBackend::None;
@@ -165,7 +165,7 @@ int main(int argc, char** argv) {
         options.max_context           = 256;
         options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(256);
         options.max_concurrency       = 1;
-        options.kv_ram_capacity_bytes = 1ULL << 30;
+        options.kv_ram_capacity_bytes = 8ULL << 30;
         options.speculative.backend   = ninfer::SpeculativeBackend::None;
         ninfer::Engine engine(std::move(options));
         const auto prompt =
