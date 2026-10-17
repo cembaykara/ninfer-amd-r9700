@@ -12,6 +12,7 @@ inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 7;
 
 [[nodiscard]] inline SpeculativeBackend parse_speculative_backend(std::string_view value) {
+    if (value == "none") { return SpeculativeBackend::None; }
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
@@ -60,12 +61,14 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     throw std::invalid_argument("invalid speculative backend");
 }
 
-// CLI/server defaults apply only after an explicit DFlash backend selection.
+// Resolve CLI/server defaults after backend selection; none omits speculative allocations.
 inline void resolve_speculative_cli_options(SpeculativeOptions& options, bool draft_tokens_explicit,
-                                            bool adaptive_draft_explicit) {
+                                            bool adaptive_draft_explicit,
+                                            bool proposal_head_explicit) {
     if (options.backend == SpeculativeBackend::DFlash) {
         if (!draft_tokens_explicit) { options.draft_tokens = kMaximumDFlashDraftTokens; }
         if (!adaptive_draft_explicit) { options.adaptive_draft = true; }
+        if (!proposal_head_explicit) { options.proposal_head = ProposalHead::Optimized; }
     } else if (options.backend == SpeculativeBackend::None && adaptive_draft_explicit) {
         throw std::invalid_argument(
             "--adaptive-draft and --no-adaptive-draft require --spec mtp|dflash");

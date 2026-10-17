@@ -108,13 +108,14 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--response-store-location DIR] [--response-store-max-records N] "
            "[--response-store-max-mib N] "
-           "[--spec mtp|dflash] [--draft-tokens N] "
+           "[--spec none|mtp|dflash] [--draft-tokens N] "
            "[--adaptive-draft|--no-adaptive-draft] [--dflash-verify-width N] "
            "[--dflash-p-less-draft-temperature T] "
            "[--default-max-tokens N] "
            "[--vision] [--no-device-graph] [--no-prefix-reuse] "
            "[--context-checkpoints off|a,b,c] "
-           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--system-prepend TEXT] "
+           "[--lm-head-draft|--no-lm-head-draft] [--no-thinking] [--preserve-thinking] "
+           "[--system-prepend TEXT] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--no-p-less-sampling]\n"
@@ -131,7 +132,7 @@ std::string serve_usage_text(const char* argv0) {
            "       Response history defaults to 1024 records / 256 MiB\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
-           "       --kv-capacity auto sizes KV from all free GPU memory except "
+           "       --kv-capacity defaults to auto: sizes KV from all free GPU memory except "
            "--kv-capacity-headroom "
            "MiB (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
@@ -153,7 +154,9 @@ std::string serve_usage_text(const char* argv0) {
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n"
-           "       --spec dflash defaults to 7 draft tokens and adaptive drafting; "
+           "       Speculation defaults to DFlash with the optimized draft head and adaptive "
+           "drafting up to 7 tokens; "
+           "--spec none disables speculation, --no-lm-head-draft selects the full head, and "
            "--no-adaptive-draft fixes the draft length.\n"
            "       p-less sampling is enabled by default and uses temperature (default 1.5) and "
            "seed only; top-p, top-k, min-p, and penalties from flags and requests are ignored.\n"
@@ -175,8 +178,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool draft_tokens_explicit       = false;
+    bool proposal_head_explicit      = false;
     bool adaptive_draft_explicit     = false;
-    bool kv_capacity_explicit        = false;
     std::optional<std::uint64_t> kv_capacity_headroom_mib;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
@@ -205,8 +208,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.max_context = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-context"), "max-context"));
         } else if (arg == "--kv-capacity") {
-            options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
-            kv_capacity_explicit = true;
+            options.kv_capacity = parse_kv_capacity(require_value("--kv-capacity"));
         } else if (arg == "--kv-capacity-headroom") {
             kv_capacity_headroom_mib =
                 parse_u64(require_value("--kv-capacity-headroom"), "kv-capacity-headroom");
@@ -317,6 +319,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_context_checkpoint_marks_flag(require_value("--context-checkpoints"));
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+            proposal_head_explicit            = true;
+        } else if (arg == "--no-lm-head-draft") {
+            options.speculative.proposal_head = ProposalHead::Full;
+            proposal_head_explicit            = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
@@ -355,9 +361,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
-    }
-    if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
     if (kv_capacity_headroom_mib) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
@@ -402,7 +405,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--mixed-forward-rounds must be positive");
     }
     product::resolve_speculative_cli_options(options.speculative, draft_tokens_explicit,
-                                             adaptive_draft_explicit);
+                                             adaptive_draft_explicit, proposal_head_explicit);
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");

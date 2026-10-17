@@ -423,19 +423,22 @@ def server_command(
         str(server_log),
         "--no-prefix-reuse",
     ]
+    command.extend(["--spec", point.speculative_backend])
     if point.speculative_backend != "none":
         command.extend(
             [
-                "--spec",
-                point.speculative_backend,
                 "--draft-tokens",
                 str(point.draft_tokens),
             ]
         )
-        if getattr(args, "proposal_head", "optimized") == "optimized":
-            command.append("--lm-head-draft")
-        if getattr(args, "adaptive_draft", False):
-            command.append("--adaptive-draft")
+        command.append(
+            "--lm-head-draft"
+            if getattr(args, "proposal_head", "optimized") == "optimized"
+            else "--no-lm-head-draft"
+        )
+        command.append(
+            "--adaptive-draft" if getattr(args, "adaptive_draft", False) else "--no-adaptive-draft"
+        )
     if point.sampling_mode == "greedy":
         command.extend(["--greedy", "--no-p-less-sampling"])
     elif point.sampling_mode == "stochastic":

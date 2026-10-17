@@ -11,9 +11,7 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
   --port 8080 \
   --max-context 16384 \
   --kv-capacity 32768 \
-  --max-concurrency 2 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft
+  --max-concurrency 2
 ```
 
 When `--model-id` is omitted, the server advertises and accepts the loaded container's exact
@@ -24,8 +22,9 @@ Vision is disabled by default: its weights, Vision scratch phase, and frozen req
 buffer are not allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
 server must accept image or video input. Speculative residency is likewise frozen by
-`--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
-`--lm-head-draft` additionally loads the optimized proposal head. Qwen3.8-27B DFlash2 is available
+`--spec none|mtp|dflash` and `--draft-tokens`. The default is DFlash with the optimized
+proposal head, adaptive drafting, and a maximum of seven draft tokens. `--spec none`
+omits speculative weights and state; `--no-lm-head-draft` selects the full proposal head. Qwen3.8-27B DFlash2 is available
 when `dflash/` is present and can be combined with `--vision`; the text-only companion consumes
 Vision-composed target hidden features. Verify is chain `W=k+1` for `k` in `1..7`; R9700 draft-window recommendations require local end-to-end measurements.
 `--adaptive-draft` picks live k in `{3..N}` (DFlash `--draft-tokens N>=5`; MTP `{3,4,5}`) after each round by locking
@@ -159,7 +158,7 @@ frontier `E` on an exact-hit / decode-only request into the one-slot turn-rollba
 (the same slot automatic occupy-append already writes). A later `true` at a new `E` replaces
 that pin; ladder heads stay. If a ladder or rollback head already sits at this `E`, the
 request succeeds with `captured_tokens = 0` and does not fill the rollback slot. A brand-new
-chat (`E == 0`) is the same quiet no-op. `true` on a server started without `--spec mtp|dflash`
+chat (`E == 0`) is the same quiet no-op. `true` on a server started with `--spec none`
 or with `--no-prefix-reuse` returns HTTP 400 `context_checkpoint_unavailable` before the
 request is enqueued. Anthropic Messages does not accept this object.
 `POST /v1/responses/input_tokens` allows `ninfer` only when omitted or JSON `null`.
@@ -900,7 +899,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory | `auto` |
 | `--kv-capacity-headroom MiB` | device memory `--kv-capacity auto` leaves free; requires `auto` | `64` |
 | `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache unique-object capacity in MiB; `off` disables the tier | `off` |
@@ -919,13 +918,13 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-location DIR` | optional directory for restart-persistent Responses history | unset (process-local) |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--spec mtp\|dflash` | speculative backend | off |
+| `--spec none\|mtp\|dflash` | speculative backend | `dflash` |
 | `--draft-tokens N` | MTP `1..5`, DFlash2 `1..7` | `7` with DFlash; required with MTP |
 | `--adaptive-draft` | pick live draft K in `{3..N}` (DFlash `--draft-tokens N>=5`; MTP `{3,4,5}`) by locking `E[Y]/T(k,C,L)` (nested `r_i`; least-squares T; at most one probe of an unmeasured k; 1 ms switch cost). `--draft-tokens 4` stays `{4}` | on with DFlash; off with MTP |
 | `--no-adaptive-draft` | use the fixed `--draft-tokens` length instead of adapting | off |
 | `--dflash-verify-width N` | DFlash2 chain verify width `W=k+1`, `2..8` | auto |
 | `--dflash-p-less-draft-temperature T` | Pins the DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. Unset, the engine calibrates it online per p-less `--temperature` and draft length: every chain round scores eight candidate temperatures against the verified target distribution and the next round uses the best ([model §8](maintainer/qwen3.8-27b-model.md#8-dflash2-block-diffusion-draft-model)) | calibrated |
-| `--lm-head-draft` | optimized proposal head | off |
+| `--lm-head-draft` / `--no-lm-head-draft` | enable or disable the optimized proposal head | on with DFlash |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-device-graph` | disable Device Graph decode | graphs on |
@@ -1180,8 +1179,8 @@ sequence can never cross the exact `--max-context` frontier. `--kv-capacity N` r
 capacity; `--kv-capacity auto` chooses the largest legal capacity that fits the memory remaining
 after weights are loaded, leaving `--kv-capacity-headroom` MiB free (default 64; raise it when a
 desktop or another process shares the GPU). The token embedding is held in pinned host memory, not
-VRAM. When omitted it follows
-`--max-context`, preserving one full-length request's capacity. The shared pool is fixed at startup
+VRAM. Omitting `--kv-capacity` selects automatic sizing; `--max-context` remains the
+per-request ceiling. The shared pool is fixed at startup
 and is not divided evenly among request lanes. `--kv-ram-capacity` is a separate pinned-host budget
 in MiB for completed prefix bundles and does not change GPU pool sizing. One long MTP chat with five
 context-checkpoint heads is about 6 GiB in that FIFO; `off` still keeps same-lane GDN rollback on

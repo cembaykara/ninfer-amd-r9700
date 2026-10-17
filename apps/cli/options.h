@@ -30,7 +30,7 @@ struct Options {
     std::uint32_t prefill_chunk     = kDefaultPrefillChunk;
     int device                      = 0;
 
-    SpeculativeOptions speculative;
+    SpeculativeOptions speculative{.backend = SpeculativeBackend::DFlash};
     bool enable_vision    = false;
     bool use_device_graph = true;
 

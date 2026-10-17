@@ -1,0 +1,32 @@
+{
+  "workloads": [
+    {
+      "name": "English story",
+      "fixture": "scenario_story_en_mystery"
+    },
+    {
+      "name": "Python package",
+      "fixture": "scenario_code_python",
+      "instruction": "Write all code directly in your response, starting with a fenced code block. No tools or filesystem are available. Do not emit tool calls or describe inspecting an environment.",
+      "forbid_tool_calls": true
+    },
+    {
+      "name": "Math reasoning",
+      "fixture": "long_decode_aime26_15"
+    },
+    {
+      "name": "Document summary 8K",
+      "document_tokens": 8192
+    },
+    {
+      "name": "Document summary 32K",
+      "document_tokens": 32768
+    }
+  ],
+  "document_sources": [
+    "docs/maintainer/concurrent-inference-architecture.md",
+    "docs/maintainer/paged-kv-cache.md",
+    "docs/maintainer/qwen3.8-27b-model.md"
+  ],
+  "document_instruction": "Write a detailed technical summary of the supplied documentation, organized into at least ten sections. Explain request scheduling, state ownership, caching and speculative decoding with concrete examples. Aim for 2500 words. Base your explanation on this documentation:\n\n"
+}

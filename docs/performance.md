@@ -45,14 +45,16 @@ The latest accepted measurements use:
 | compiler | AMD Clang 23 under `/opt/rocm/core-10.0` |
 | build | Release, exact `gfx1201` code object |
 
-The GPU must otherwise be idle. Timings use HIP events around the claimed physical work after
-warmup. Independent exact/FP64 oracles run before performance values are admitted.
+The GPU must otherwise be idle. Kernel and service timings use HIP events around the claimed
+physical work after warmup; serving throughput below uses explicitly identified wall intervals.
+Independent exact/FP64 oracles qualify the operators before performance values are admitted.
 
 ### README refresh and product defaults (2026-10-17)
 
-CLI and server `--spec dflash` now default to a maximum of seven drafts and adaptive
-length. `--draft-tokens N` overrides the maximum; `--no-adaptive-draft` fixes the length.
-Backend selection stays explicit. P-less sampling defaults to temperature 1.5 unless
+CLI and server default to DFlash with the optimized proposal head and adaptive length
+up to seven drafts. `--spec none` disables speculation; `--no-lm-head-draft` uses the full
+head. `--draft-tokens N` overrides the maximum; `--no-adaptive-draft` fixes the length.
+Server shared KV capacity defaults to `auto`. P-less sampling defaults to temperature 1.5 unless
 overridden; the standard sampler retains the registered model/mode temperature 2.0.
 Focused CLI/server option and sampling-resolution tests cover these defaults and overrides.
 
@@ -77,14 +79,16 @@ prompt experiment. The benchmark uses `-p 8192,32768,65536,131072,245760`,
 `--max-ctx 262144 --kv-capacity auto --prefill-chunk 2048`, and
 `--spec dflash --draft-tokens 7 --adaptive-draft --lm-head-draft --warmup 1 -r 3`.
 
-Generation measurements use the same adaptive setup with a greedy target and 256 post-prefill
+The following historical generation measurements use the same adaptive setup with a greedy
+target and 256 post-prefill
 tokens per lane, after an untimed prefix-reuse seed (`--isolate-prompt-decode`). They exclude
 prefill and model load; prompt content and sampling change DFlash acceptance and throughput.
 The C1 8K/32K/64K cells measured 192.7/207.1/223.9 output tok/s. Adaptive selection retained K7
 in all measured C1 rounds. Acceptance also changes with context on this corpus; these
 rates do not establish a general context-scaling benefit. C6 at 8K measured
 672.6 aggregate output tok/s (stddev 9.88), with 18/38/26/714 measured rounds at
-K3/K5/K6/K7. This is a phase-throughput baseline, not an optimization A/B.
+K3/K5/K6/K7. This is a phase-throughput baseline, not an optimization A/B. The workload matrix below
+replaces these single-corpus figures in the README.
 
 The refresh also reproduced C1 full-context graph preparation consuming 72 MiB against a
 stale 56-MiB allowance. The calibrated C1 budget is now 72 MiB; the startup guard remains.
@@ -109,6 +113,58 @@ The real CLI smoke omits temperature, draft count and adaptive flags and confirm
 p-less temperature 1.5, a seven-draft maximum and 32 generated tokens. Three focused
 host tests and affected clang-tidy checks pass. This refresh does not change weights
 or kernel arithmetic.
+
+
+### Workload-dependent answer generation (2026-10-17)
+
+The README now uses real chat workloads at the product's p-less temperature 1.5,
+replacing the single greedy-corpus decode number. Measurements use the production
+LQ4 artifact, one R9700/gfx1201, Release, HIP 7.15.26333 under ROCm 10, Device Graphs,
+power `auto`, adaptive DFlash up to K7, optimized proposal head, chunk 2048 and
+Compose's graph environment. Each process has a 65,536-token per-request ceiling
+and automatic shared KV sizing; RAM/SSD prefix tiers and Vision are off.
+
+The committed runner is `tools/bench/run_readme_workloads.py`, with workload
+inputs in `tools/bench/fixtures/readme_workloads.json`. Story, code and math use
+existing CLI examples; math has thinking enabled. Code explicitly requests code
+in the response with no tools. Document summaries use the named local architecture,
+cache and model documentation, truncated near 8K and 32K with the local tokenizer.
+The table reports actual Engine prompt counts, including template tokens.
+
+Each lane has a distinct prompt marker and seed. An untimed one-token request
+first seeds every lane's prefix; a concurrent wave then generates up to 512 output
+tokens per lane, with model stop tokens enabled. All admitted measured requests
+reached 512 tokens. There is one warmup wave and three measured waves per cell,
+using different fixed seeds. Reasoning tokens count toward output and throughput.
+
+The rate is committed decode tokens divided by wall time from complete 100-ms
+server throughput intervals with zero prefill, exactly C active decode lanes,
+and exactly C rows in every decode round. It includes host scheduling between
+rounds and excludes startup, prefill, and intervals after any lane finishes.
+There is no fallback to prefill-inclusive makespan or summed per-lane rates.
+This differs from the earlier Engine service-time baseline. C6 is aggregate;
+dividing by six gives the average rate per active request in the selected intervals.
+
+| Workload | Prompt tokens | C1 mean ± sample stddev tok/s | C6 aggregate mean ± sample stddev tok/s | C1 / C6 draft acceptance |
+|---|---:|---:|---:|---:|
+| English story | 146 | 88.3 ± 1.1 | 355.9 ± 3.6 | 23.1% / 23.1% |
+| Python package | 171 | 135.1 ± 22.1 | 534.6 ± 24.4 | 43.1% / 43.4% |
+| Math reasoning | 346 | 126.3 ± 8.8 | 491.1 ± 7.8 | 40.2% / 37.1% |
+| Document summary 8K | 8,192 | 92.6 ± 2.2 | 340.4 ± 12.4 | 26.0% / 29.1% |
+| Document summary 32K | 32,779 | 97.4 ± 5.6 | 299.7 ± 7.1 | 31.0% / 41.7% |
+
+These are workload samples rather than a general context-scaling curve: content,
+sampling, live K and draft acceptance all influence speed. The 32K C1 summary
+sample has higher acceptance than 8K; C6 slows at the longer context despite higher
+acceptance. Task quality is not scored by this throughput benchmark.
+
+Run the command documented in `tools/bench/README.md` with the explicit local LQ4
+artifact and BF16 tokenizer. The reports are under
+`profiles/bench/readme-workloads-20261017-run3/`; the admitted code cells use the
+corrected prompt from `profiles/bench/readme-workloads-code-20261017/`, produced by
+adding `--workload "Python package"`. The original code cells requested tools and
+are excluded. Inputs, output text, per-request counters, startup metadata and raw
+periodic timings are retained with the reports.
 
 
 ### Decode optimization profile at 512 through 64K context (2026-10-16)

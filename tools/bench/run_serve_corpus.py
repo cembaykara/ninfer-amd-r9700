@@ -825,17 +825,16 @@ def server_command(
         str(server_log),
         "--no-prefix-reuse",
     ]
+    command.extend(["--spec", spec.speculative_backend])
     if spec.speculative_backend != "none":
         command.extend(
             [
-                "--spec",
-                spec.speculative_backend,
                 "--draft-tokens",
                 str(spec.draft_tokens),
             ]
         )
-        if lm_head_draft:
-            command.append("--lm-head-draft")
+        command.append("--lm-head-draft" if lm_head_draft else "--no-lm-head-draft")
+        command.append("--no-adaptive-draft")
         if spec.dflash_verify_width:
             command.extend(["--dflash-verify-width", str(spec.dflash_verify_width)])
     if spec.sampling_mode == "greedy":

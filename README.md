@@ -79,17 +79,22 @@ chunk 2048 and the optimized DFlash proposal head.
 | 131,072 | 1,907 |
 | 245,760 | 1,354 |
 
-**Answer generation, adaptive DFlash with up to seven draft tokens:**
+**Answer generation with the default sampling settings:**
 
-| Concurrent requests | Aggregate tokens/s |
-|---:|---:|
-| 1 | 192.7 |
-| 6 | 672.6 |
+| Workload | Prompt tokens | C1 tokens/s | C6 aggregate tokens/s |
+|---|---:|---:|---:|
+| English story | 146 | 88 | 356 |
+| Python package | 171 | 135 | 535 |
+| Math reasoning | 346 | 126 | 491 |
+| Document summary 8K | 8,192 | 93 | 340 |
+| Document summary 32K | 32,779 | 97 | 300 |
 
-Generation uses 8,192 prompt tokens and 256 output tokens per request. Values are
-means of three runs after one warmup, measured separately from prompt processing
-and model loading. These use a greedy token-corpus workload; prompt content and
-sampling affect DFlash acceptance and speed. Methodology: `docs/performance.md`.
+P-less temperature 1.5, adaptive DFlash up to seven drafts, 512 output tokens per
+request (including reasoning). Means of three runs after one warmup. Decode-only
+wall intervals follow untimed prompt seeding; C6 counts intervals with all six
+requests decoding. Divide C6 by six for the average per active request.
+Prompt content and sampling affect draft acceptance and speed. Prefill above uses
+a separate greedy token-corpus workload. Methodology and variation: `docs/performance.md`.
 
 In every tested 8K/32K cell, the increase in prediction loss over the BF16 source
 was smaller than for the fixed 5090 NVFP4 reference. Standard and multikey needle retrieval
@@ -122,20 +127,20 @@ Use the selected DFlash-enabled production `.ninfer` artifact:
 ```sh
 build-r9700/apps/ninfer /path/to/qwen3.8-27b-r9700-lq4.ninfer \
   --prompt "Explain wave32 matrix instructions." \
-  --max-context 8192 --max-new 256 \
-  --spec dflash --lm-head-draft
+  --max-context 8192 --max-new 256
 
 build-r9700/apps/ninfer-serve /path/to/qwen3.8-27b-r9700-lq4.ninfer \
   --host 127.0.0.1 --port 8080 \
-  --max-context 262144 --kv-capacity auto --max-concurrency 6 \
-  --spec dflash --lm-head-draft
+  --max-context 262144 --max-concurrency 6
 ```
 
-`--spec dflash` defaults to adaptive drafting with a maximum of seven tokens.
+CLI and server default to DFlash with the optimized draft head and adaptive drafting
+up to seven tokens. `--spec none` disables speculation; `--no-lm-head-draft` selects
+the full proposal head. Server KV capacity defaults to `auto`.
 Use `--draft-tokens N --no-adaptive-draft` for a fixed length. P-less sampling
 uses temperature **1.5** by default; `--temperature` overrides it. It ignores
 top-p/top-k/min-p and penalties; `--no-p-less-sampling` enables those controls.
-Use `--greedy` for argmax. Vision and DFlash must be selected at startup.
+Use `--greedy` for argmax. Vision and speculation settings are fixed at startup.
 Each executable's `--help` lists all options.
 
 For Compose, copy `.env.example` to `.env`, keep `COMPOSE_BAKE=false`, and set the
