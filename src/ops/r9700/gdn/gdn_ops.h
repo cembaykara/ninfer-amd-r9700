@@ -5,7 +5,7 @@
 
 #include "core/cache_warm.h"
 #include "ninfer/ops/gdn_replay.h"
-#include "ops/r9700/linear/fp8lut4_linear.h"
+#include "ops/r9700/linear/lq4_linear.h"
 #include "ops/r9700/linear/fp8_activation.h"
 #include "ops/r9700/linear/r9700_linear.h"
 
@@ -109,14 +109,14 @@ namespace ninfer::ops::r9700::gdn {
 // Bitwise the pair projection followed by projection_conv_record_bf16.
 [[nodiscard]] bool gdn_pair_conv_record_supported(std::uint32_t width,
                                                   std::uint32_t batch) noexcept;
-// The same fused projection-convolution of one per-token E4M3 image over FP8LUT4 query-key
+// The same fused projection-convolution of one per-token E4M3 image over LQ4 query-key
 // [4096, 5120] and value-z [12288, 5120] weights, at batch 1 and widths 4..8 (W4 is the C1
 // DFlash K3 chain).
-[[nodiscard]] bool gdn_fp8lut4_pair_conv_record_supported(std::uint32_t width,
-                                                          std::uint32_t batch) noexcept;
-[[nodiscard]] hipError_t gdn_fp8lut4_pair_conv_record_bf16(
-    const linear::Fp8ActivationWorkspace& image, const linear::Fp8Lut4Weight& query_key,
-    const linear::Fp8Lut4Weight& value_z, const hip_bfloat16* conv_weight,
+[[nodiscard]] bool gdn_lq4_pair_conv_record_supported(std::uint32_t width,
+                                                      std::uint32_t batch) noexcept;
+[[nodiscard]] hipError_t gdn_lq4_pair_conv_record_bf16(
+    const linear::Fp8ActivationWorkspace& image, const linear::Lq4Weight& query_key,
+    const linear::Lq4Weight& value_z, const hip_bfloat16* conv_weight,
     const hip_bfloat16* conv_states, const std::int32_t* valid_columns,
     const std::int32_t* initial_state_slots, const std::int32_t* parent_index,
     hip_bfloat16* conv_record, hip_bfloat16* query, hip_bfloat16* key, hip_bfloat16* value,
@@ -166,7 +166,7 @@ namespace ninfer::ops::r9700::gdn {
     hip_bfloat16* hidden, std::uint32_t* clear_status, hipStream_t stream) noexcept;
 
 // The same front with the seam encoded as a per-token E4M3 image (bound for tokens x 5120) for
-// FP8LUT4 projections: each token's owner CTA publishes its codes, scale and status word. CTAs
+// LQ4 projections: each token's owner CTA publishes its codes, scale and status word. CTAs
 // past the front grid apply `fold` (when non-null: that layer's deferred replay fold, bitwise
 // ops::gdn_replay_fold_layer, whose state it alone touches) and then touch `warm`
 // (core/cache_warm.h).

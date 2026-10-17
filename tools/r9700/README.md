@@ -700,7 +700,7 @@ VGPRs. The overlapping bounds are not additive. This does not prove practical-ce
 that question remains open.
 
 The row-scaled E4M3 FP8 projections ran on hipBLASLt (solutions `123104`/`123100`, 168-183
-useful TFLOP/s at P2048) until 2026-09-27. They now run on the FP8LUT4 prefill GEMM with raw E4M3
+useful TFLOP/s at P2048) until 2026-09-27. They now run on the LQ4 prefill GEMM with raw E4M3
 staging (~212-217 TFLOP/s at T2048), and hipBLASLt, its catalog/prefix qualifiers and its
 shared-context regression were removed. Do not confuse these row-scaled E4M3 FP8 roles with the
 separate A8W8/IU8 CTA implementation.

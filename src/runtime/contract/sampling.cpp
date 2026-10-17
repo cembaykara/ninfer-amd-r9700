@@ -34,9 +34,10 @@ void validate(const ResolvedSamplingParameters& sampling) {
 
 ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& defaults,
                                             SamplingMode mode, const SamplingOverrides& overrides) {
-    const SamplingPreset& preset = defaults.for_mode(mode);
+    const SamplingPreset& preset    = defaults.for_mode(mode);
+    const float default_temperature = overrides.p_less ? 1.5F : preset.temperature;
     ResolvedSamplingParameters resolved{
-        .temperature       = overrides.temperature.value_or(preset.temperature),
+        .temperature       = overrides.temperature.value_or(default_temperature),
         .top_k             = overrides.top_k.value_or(preset.top_k),
         .top_p             = overrides.top_p.value_or(preset.top_p),
         .min_p             = overrides.min_p.value_or(preset.min_p),

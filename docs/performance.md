@@ -48,9 +48,72 @@ The latest accepted measurements use:
 The GPU must otherwise be idle. Timings use HIP events around the claimed physical work after
 warmup. Independent exact/FP64 oracles run before performance values are admitted.
 
+### README refresh and product defaults (2026-10-17)
+
+CLI and server `--spec dflash` now default to a maximum of seven drafts and adaptive
+length. `--draft-tokens N` overrides the maximum; `--no-adaptive-draft` fixes the length.
+Backend selection stays explicit. P-less sampling defaults to temperature 1.5 unless
+overridden; the standard sampler retains the registered model/mode temperature 2.0.
+Focused CLI/server option and sampling-resolution tests cover these defaults and overrides.
+
+Fresh measurements use the production `r9700-lq4` artifact on one R9700, HIP
+7.15.26333, Release, power `auto`, fixed G16 FP8-K/INT4-V/FP16-scale cache, chunk 2048,
+Vision off, optimized proposal head and Compose's bulk host-argument graph environment.
+No clock, voltage or power policy was changed. The 65,536-token curated benchmark corpus
+is repeated to 262,144 tokens for the context ladder. Each point discards one warmup and
+reports the mean of three repetitions. RAM/SSD prefix tiers are off.
+
+| C1 prompt tokens | Mean prefill service tok/s | Stddev tok/s | Mean trailing prefill estimate tok/s |
+|---:|---:|---:|---:|
+| 8,192 | 3,375.1 | 2.16 | 3,273.0 |
+| 32,768 | 2,903.5 | 2.15 | 2,489.3 |
+| 65,536 | 2,477.4 | 2.91 | 1,915.3 |
+| 131,072 | 1,906.6 | 0.24 | 1,308.0 |
+| 245,760 | 1,354.5 | 0.25 | 836.7 |
+
+Prefill service excludes model load, input preparation and HTTP transport. The trailing
+estimate is the Engine's prorated last-second service window, not a separate incremental
+prompt experiment. The benchmark uses `-p 8192,32768,65536,131072,245760`,
+`--max-ctx 262144 --kv-capacity auto --prefill-chunk 2048`, and
+`--spec dflash --draft-tokens 7 --adaptive-draft --lm-head-draft --warmup 1 -r 3`.
+
+Generation measurements use the same adaptive setup with a greedy target and 256 post-prefill
+tokens per lane, after an untimed prefix-reuse seed (`--isolate-prompt-decode`). They exclude
+prefill and model load; prompt content and sampling change DFlash acceptance and throughput.
+The C1 8K/32K/64K cells measured 192.7/207.1/223.9 output tok/s. Adaptive selection retained K7
+in all measured C1 rounds. Acceptance also changes with context on this corpus; these
+rates do not establish a general context-scaling benefit. C6 at 8K measured
+672.6 aggregate output tok/s (stddev 9.88), with 18/38/26/714 measured rounds at
+K3/K5/K6/K7. This is a phase-throughput baseline, not an optimization A/B.
+
+The refresh also reproduced C1 full-context graph preparation consuming 72 MiB against a
+stale 56-MiB allowance. The calibrated C1 budget is now 72 MiB; the startup guard remains.
+Other native-ceiling graph budgets are unchanged.
+Reports and commands are under `profiles/bench/readme-refresh-20261017/`.
+
+| C | Graph budget / observed, MiB | Resolved shared KV tokens |
+|---:|---:|---:|
+| 1 | 72 / 72 | 262,144 |
+| 2 | 56 / 56 | 524,288 |
+| 3 | 60 / 60 | 633,024 |
+| 4 | 60 / 60 | 624,896 |
+| 5 | 62 / 62 | 616,832 |
+| 6 | 62 / 62 | 608,704 |
+| 7 | 62 / 62 | 600,576 |
+| 8 | 62 / 62 | 592,512 |
+
+These native-ceiling (`--max-ctx 262144`) checks cover startup and short decode at
+C1..C8; the table describes allocated capacity, not a new all-lane near-capacity
+qualification. C1 additionally completes the prefill ladder through 245,760 tokens.
+The real CLI smoke omits temperature, draft count and adaptive flags and confirms
+p-less temperature 1.5, a seven-draft maximum and 32 generated tokens. Three focused
+host tests and affected clang-tidy checks pass. This refresh does not change weights
+or kernel arithmetic.
+
+
 ### Decode optimization profile at 512 through 64K context (2026-10-16)
 
-Fresh characterization of `6f069b6c`, the production `r9700-fp8lut4` artifact, fixed G16
+Fresh characterization of `6f069b6c`, the production `r9700-lq4` artifact, fixed G16
 FP8-K/INT4-V/FP16-scale cache, chunk 2048, and the Compose bulk host-argument graph environment.
 Each unprofiled point discards one repetition and measures three greedy corpus P+G128 requests
 under `auto`. These are diagnostic baselines, not an optimization A/B; some points have a slow
@@ -67,7 +130,7 @@ setting was changed.
 The first two timing columns are unprofiled. Attention columns are consumer-plus-merge duration
 sums from matching P+G128 traces and support attribution only. Attention rises from about 1.4%
 to 13.3% of plain kernel time and 14.3% of DFlash kernel time. C1 target projection cost stays
-nearly constant: plain FP8LUT4 T1 projections take about 21.1 ms/graph; DFlash persistent target
+nearly constant: plain LQ4 T1 projections take about 21.1 ms/graph; DFlash persistent target
 phases take about 25.1 ms/graph and its Q4 drafter projections about 2.4 ms/graph. The persistent
 bucket includes several Ops; this trace does not resolve its internal phases or establish current
 physical HBM saturation. Output throughput across contexts also changes with acceptance and is
@@ -93,7 +156,7 @@ Candidates identified by this initial profile (follow-up decisions below):
   amplification. This is an optimistic traffic floor, not a new bandwidth measurement or an
   achievable latency. Prior rejected rings, vector-load substitutions and chunk-count sweeps
   need a new mechanism before repetition.
-- **Plain T1 persistent hosting:** `fp8lut4_t1_kernel` is absent from the persistent registry;
+- **Plain T1 persistent hosting:** `lq4_t1_kernel` is absent from the persistent registry;
   about 245 invocations/token remain separate launches and interrupt hosted producer/projection
   runs. Hosting the exact T1 body could reduce boundaries without reducing weight traffic.
   Register/occupancy and streaming effects still require qualification and whole-decode timing;
@@ -116,7 +179,7 @@ Evidence, exact commands, ranges, per-symbol/grid attribution and control checks
 
 ### Decode profile follow-up (2026-10-16)
 
-The follow-up retains the exact T1 FP8LUT4 arithmetic in a shared CTA body and hosts its
+The follow-up retains the exact T1 LQ4 arithmetic in a shared CTA body and hosts its
 Store, residual and SiLU-pair entries in the existing persistent decode dispatcher. The
 C1/P8192/G128 ordinary-decode A/B uses six balanced processes, each with one discarded and
 three measured repetitions. Paired candidate/control ratios are 0.91654, 0.91587 and 0.91631;
@@ -176,20 +239,151 @@ whole-round gain for the DFlash bottleneck, so the format change is rejected. No
 cache format or candidate dispatch remains in production. The attention qualifier now accepts
 `--long-context 65536` for direct T1/T8 FP64, fragmented-page, publication and graph checks.
 
-**Unresolved latency spike:** repeated 512+1536-token runs reproduce roughly 0.6–0.9-second
+**Compaction latency mitigation:** initial 512+1536-token runs reproduce roughly 0.6–0.9-second
 rounds. KFD traces align these with `EVICT_USERPTR` intervals and repeated restore retries,
 while individual traced kernels remain below 2.4 ms. Spin waiting does not remove the pause.
 The profiler inserts registered system-memory queue rings, so memory-policy decisions were
 also checked without profiler interception: corrected production defaults reach 745/708 ms,
 `HSA_USE_SVM=0` reaches 758 ms, and combined legacy/GTT settings with ordinary-RAM I/O staging
-still reach 168 and 428 ms. The I/O-staging control reaches 896 ms. Tokens remain exact. No
-allocator, I/O staging, synchronization-policy or environment-setting challenger is retained.
-These results do not establish a qualified production mitigation or the specific invalidation
-caller. Further diagnosis needs privileged kernel caller-stack tracing: `perf_event_paranoid=4`,
-root-only tracefs permissions and unavailable passwordless sudo block that step here. The scoped
-`trace_userptr_root.sh` in the evidence directory is syntax-checked and ready for that follow-up;
-it has not been executed. It holds the GPU lease and cleans up its private trace instance and
-uniquely named probes without changing power, VM, driver or firmware policy.
+still reach 168 and 428 ms. The I/O-staging control reaches 896 ms. Tokens remain exact.
+Those partial allocator, staging, synchronization and runtime-setting candidates were rejected;
+the coherent process-local change selected below supersedes that initial investigation.
+
+A maintainer-executed privileged capture on 2026-10-16 identifies the caller: `kcompactd0`
+reaches `amdgpu_hmm_invalidate_hsa` through `compact_node`, `compact_zone`, `migrate_pages`,
+and `try_to_migrate_one`. Three native P512/G1536 runs reproduce 550/565/611-ms rounds.
+Surviving events within each round show per-page invalidations of shared host mappings,
+USERPTR queue eviction, and restoration page-fetch retries returning `-EAGAIN` before resume.
+Sampled process maps place the affected addresses in shared `/dev/zero (deleted)` mappings;
+their individual runtime allocation owners are not yet established. The evidence identifies
+memory compaction as an invalidation source; it does not establish a complete queue-duration
+accounting or a mitigation. Per-page stack collection overran trace buffers in all three
+attempts, so the collector correctly rejects them as complete loss-free captures. The retained
+stacks remain affirmative evidence of the caller, and the reported event counts are incomplete.
+
+The collector now bounds stack samples, streams events, records mapping/reason identities and
+restoration return codes, and validates trace loss and slow-round correlation. It runs inference
+as the invoking owner with that owner's resource limits, holds the GPU lease, and removes its
+private trace instance and uniquely named probes. It does not change power, VM, driver or
+firmware policy. Root remains necessary to attach probes; this agent's passwordless sudo is
+unavailable. A bounded-stack rerun (`userptr-20261016-182659-ckj8jjop`) reproduces 437/458/480-ms
+rounds and the same migration/restore pattern, but still overruns its per-CPU buffers. No further
+broad per-page capture is needed to identify the caller; these runs cannot support complete
+event counts or latency accounting. Evidence: `userptr-20261016-181736-pfr779xv/caller-analysis.json`
+and the later run's compact summaries in the evidence directory.
+
+A native process-local THP-disable screen uses `PR_SET_THP_DISABLE` before ROCm initialization,
+with no profiler or host-wide policy changes. The ABBA P512/G1536 runs have maximum round times
+420/474/397/414 ms (control/disabled/disabled/control); all 1,536 generated tokens match exactly.
+Disabling THP does not eliminate the pause and is rejected. The host has shmem THP disabled
+already, and this control does not prevent compaction from migrating ordinary pages. No THP
+change is retained in production. Evidence: `thp-process/analysis.json` in the evidence directory.
+
+A maintainer-authorized, native host-policy ABBA (`compaction-ab-20261016-183909-_y95eunf`)
+confirms a mitigation for the reproduced plain P512/G1536 workload:
+
+| Arm | `vm.compaction_proactiveness` | Maximum round, ms | Decode seconds | Rounds above 80 ms |
+|---|---:|---:|---:|---:|
+| Initial control | 20 | 433.892 | 39.7814 | 1 |
+| Disabled 1 | 0 | 25.831 | 39.3681 | 0 |
+| Disabled 2 | 0 | 25.857 | 39.3801 | 0 |
+| Restored control | 20 | 392.141 | 39.7546 | 1 |
+
+All 1,536 generated token IDs match across all four arms. Native median round time remains
+about 25.63 ms; the benefit is removal of the observed long pauses, with about 0.99% less decode
+time in this workload, not faster ordinary kernels. Global VM counters show approximately
+27 million daemon migration-scanned pages per control and zero during each disabled arm.
+Setting the original nonzero value can itself wake compaction; three-second transition settling
+and its counters are recorded separately from each native run. The initial unchanged-policy
+control also reproduces the pause. These are two disabled runs at one workload, not a guarantee
+against every future stall, demand-driven compaction, or different contexts/concurrency.
+
+The reviewed helper runs inference as the original owner with recovered resource limits, holds
+the GPU lease, and changes no GPU power policy. Local failure-injection checks cover normal
+restoration, interruption immediately after a successful write, failed inference and an
+intervening external policy change. The experiment restored the original value `20`; no
+persistent sysctl was applied. This host-wide workaround is superseded by the process-local
+mitigation below, so no persistent compaction-policy change is needed.
+
+A process-local implementation keeps compaction at `20`: use `HSA_USERPTR_FOR_PAGED_MEM=0` with
+normal SVM behavior, replace explicitly registered host arenas with HIP host allocations, and
+read O_DIRECT artifact and disk-cache data into ordinary aligned RAM before copying into
+pinned transfer slots.
+Memory/address/graph-transfer and artifact byte qualifications pass. Native original/candidate
+ABBA at P512/G1536 retains exact tokens and maxima 26.41/25.82/26.12/26.10 ms, but VM counters
+show no compaction in any arm. This comparison is inconclusive for mitigation. Candidate peak
+device-wide GTT usage is about 1.27 GB; direct-I/O staging adds up to 512 MiB ordinary RAM.
+The frozen implementation and evidence are under `gtt-arena-candidate/`; temporary wall
+diagnostics are removed from source.
+
+The maintainer then ran the reviewed controlled-compaction ABBA
+(`gtt-compaction-20261016-192211-qazi8q3b`), invoking one explicit host-memory compaction pass
+during each P512/G1536 decode. Proactive compaction stayed at `20` throughout:
+
+| Arm | Maximum round, ms | Rounds above 80 ms |
+|---|---:|---:|
+| Initial control | 486.753 | 2 |
+| Driver-backed host memory 1 | 25.733 | 0 |
+| Driver-backed host memory 2 | 26.562 | 0 |
+| Final control | 878.307 | 2 |
+
+All pulses overlap measured decode and scan 12–14 million pages. The new-memory runs also
+scan about 79.5/77.9 million pages through background compaction over their full requests,
+and all 1,536 generated tokens match the controls exactly. This supports mitigation under
+explicit compaction stress while compaction remains enabled; it does not guarantee immunity
+to unrelated host stalls. The binaries have different round-diagnostic instrumentation, so
+this comparison establishes removal of the large pauses, not a small steady-throughput gain.
+
+`DeviceContext` fixes the process-local policy before its first HIP call, including normal SVM
+addressing (`HSA_USE_SVM=1`); callers need no shell override. Pinned host buffers and arenas
+share the real driver GTT budget (about 62.43 GiB on this host), as well as system/cgroup
+resources. Allocation preflight checks current available GTT; actual HIP allocation remains
+authoritative under competing allocations. Requested RAM-KV capacity is never silently reduced
+or redirected to movable USERPTR memory. GTT errors are distinguished from automatic VRAM
+capacity errors. The original mmap/register arena and its bookkeeping are removed.
+
+Default-startup qualification verifies actual GTT consumption without environment overrides,
+CPU/device pointer identity, exact captured transfers over repeated replays, exhausted-GTT
+admission, and exact artifact materialization. The 8-GiB RAM-cache cancellation/publish/evict/
+restore qualification and MTP/DFlash checkpoint-state and continuation recovery pass. The full
+disk-cache qualification and real-artifact ordinary/MTP/DFlash cache-write integration, including
+disk restart and fork/cancel behavior, also pass. Disk reads retain O_DIRECT and use ordinary
+aligned page staging plus at most 4 MiB per raw-state read worker before copying into GTT.
+Page-read scratch remains allocated while the reader thread lives, including between restores;
+state-worker scratch and artifact-loading staging have temporary lifetimes. Native default-startup
+comparisons against the frozen pre-change control also retain exact tokens at C8/P8192 DFlash
+K7 (264 tokens across eight lanes) and C1/P65536 plain decode (33 tokens). Each lane retains
+the first prefill-produced token plus 32 decode tokens. All nine host tests, affected release
+builds, clang-tidy and changed-file formatting/lint checks pass. Source and probe changes
+received independent subagent review before GPU qualification.
+
+A mount-specific disk-cache comparison uses C1 DFlash K7 append-frontier restores at 8K/64K,
+raw disk-cache state, 8-GiB RAM and disk budgets, and the same retained cache on `/ssdpool2nvme`.
+This is a mirrored NVMe ZFS mount (kernel 2.4.1, 128-KiB records, lz4 and primary caching enabled).
+A diagnostic USERPTR/direct-read control shares the current HIP host arena and artifact-loading
+code; it reproduces the former restore route rather than the exact former mmap/register build.
+Model loading is excluded. Direct/staged/staged/direct arms each make five restores; the first
+restore after each Engine start is separate, leaving eight repeated samples per route/context.
+
+| Context | Direct restore hold, ms | GTT/staged restore hold, ms | Direct TTFT, ms | GTT/staged TTFT, ms |
+|---|---:|---:|---:|---:|
+| 8K | 72.374 | 78.484 | 103.237 | 109.189 |
+| 64K | 336.045 | 336.455 | 373.426 | 374.100 |
+
+These are medians: the observed combined-route cost is about 6 ms at 8K; the 0.7-ms 64K TTFT
+change is within run variation. Repeated 64K direct TTFT spans 366.6–617.9 ms versus
+372.7–375.1 ms staged; these outliers were not traced and are not attributed to compaction.
+First-restore TTFT varies substantially in both routes and does not establish a reliable
+startup penalty. An auxiliary USERPTR/staged arm has repeated median TTFT 112.7/374.9 ms
+at 8K/64K, consistent with staging contributing the small 8K cost; its later ordering and
+different pool-read volume prevent isolated memcpy-cost attribution. All 50 restores require
+HostDisk, exact cold-reference tokens/frontiers, stable entry membership and zero fallback.
+The seed saves the append frontier without ladder-head images. Positive device-wide pool read
+counters confirm physical I/O occurred, but include other processes; these are warm/repeated
+ZFS measurements, not guaranteed cold SSD reads. Compaction stays at 20, clocks at auto, and
+no filesystem/cache policy is changed. Independent review covers the harness and interpretation.
+Evidence: `disk-latency-mount/report.txt`, `setup.json`, `summary.json` and per-arm records under
+the same campaign directory.
 
 Commands, paired samples, numerical and resource evidence are retained under
 `profiles/bench/r9700-decode-fixes-20261016/`. Measurements use the same production artifact,
@@ -240,7 +434,8 @@ Raw scope-separated evidence is under `profiles/bench/r9700-graph-submit-2026101
 `phase-qual.json`, and `functional.json`. The provenance records the inherited normal-copy,
 host-argument environment as well as each matrix row's overrides.
 
-The production adaptive-K7 preset retains the measured C-specific GPU graph inventory:
+The 2026-10-16 adaptive-K7 study measured the following C-specific GPU graph inventory.
+The 2026-10-17 README refresh above updates the C1 allowance and resolved capacities:
 
 | C | Graph budget / observed, MiB | Shared KV tokens | Minimum physical/HIP free, MiB |
 |---:|---:|---:|---:|
@@ -312,7 +507,7 @@ remain a historical control; the active Compose submission policy is described a
 That revision selected `DEBUG_HIP_GRAPH_CLASSIC_PATH=1`, `ROC_SKIP_KERNEL_ARG_COPY=1`, and
 `HSA_DISABLE_FRAGMENT_ALLOCATOR=1` on the selected HIP 7.15.26333 / ROCr 1.21 runtime,
 with other driver controls at their defaults.
-The calibrated preset remains `R9700Fp8Lut4`, C1..8, max context 262144, prefill chunk 2048,
+The calibrated preset remains `R9700Lq4`, C1..8, max context 262144, prefill chunk 2048,
 adaptive DFlash K7, optimized proposal head, no Vision, RAM cache 8192 MiB and SSD cache 25600 MiB.
 
 Classic replay avoids the packet path's per-executable device argument pools. Direct argument
@@ -413,7 +608,7 @@ This historical control supplies the conservative packet-path bound retained aft
 sharing. Compose now uses the qualified bulk host-argument configuration above. Availability and minimum-free
 figures in this historical control use HIP alone; they are not physical-headroom guarantees.
 
-The production `R9700Fp8Lut4` artifact was measured independently at every C1..8 on one
+The production `R9700Lq4` artifact was measured independently at every C1..8 on one
 gfx1201 R9700 with the selected `/opt/rocm/core-10.0` toolchain (HIP 7.15.26333),
 `max_context=262144`, prefill chunk 2048, adaptive DFlash K7, optimized proposal head, no
 Vision, 8-GiB RAM cache, 25-GiB SSD cache, and GPU power mode `auto`.
@@ -561,7 +756,7 @@ existing residual-fused finish.
 
 The retained port on the initial AMD base was compared against that pulled snapshot using the explicit production
 artifact
-`/ssdpool2nvme/local_llm/models/qwen3.8-27b-r9700-fp8lut4/qwen3.8-27b-r9700-fp8lut4.ninfer`
+`/ssdpool2nvme/local_llm/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer`
 and `ninfer_bench -pg 512,128 --spec dflash --draft-tokens 7 --lm-head-draft --max-ctx 4096
 --warmup 1 -r 3 --retain-token-ids`, at fixed C1 and C8 with Device Graphs enabled. All three
 repetitions matched every generated greedy token and all speculative counters at both
@@ -606,7 +801,7 @@ is preserved.
 
 ## Current production (2026-09-28)
 
-Artifact `qwen3.8-27b-r9700-fp8lut4` (FP8LUT4 Text and output head, 21 row-scaled FP8
+Artifact `qwen3.8-27b-r9700-lq4` (LQ4 Text and output head, 21 row-scaled FP8
 protections); `compose.yaml` serving: DFlash `--draft-tokens 7 --adaptive-draft --lm-head-draft`,
 Device Graphs, prefill chunk 2048. Latest measurement of each phase; the dated sections below are
 the history behind them.
@@ -629,7 +824,7 @@ predate the 2026-09-30 reduction to 21 protections (C1 decode +2.3%, C4 unchange
 ## Prefill follow-up attribution after bulk graph submission (2026-10-16)
 
 Diagnostic on `experimental` after pulling `6f069b6c`, rebuilt Release `ninfer_bench`, production
-21-protection `r9700-fp8lut4` artifact, one R9700/gfx1201, ROCm 10, unchanged 300 W cap and
+21-protection `r9700-lq4` artifact, one R9700/gfx1201, ROCm 10, unchanged 300 W cap and
 `auto` power profile. The canonical host-argument bulk graph flags from the container were used.
 The shared GPU lease covered every inference process and was released after collection.
 
@@ -658,7 +853,7 @@ durations, which can overlap; they are attribution, not exclusive wall shares:
 
 | Kernel family | C1 prefill | C6 whole |
 |---|---:|---:|
-| FP8LUT4/raw-FP8 prefill GEMMs | 80.93% | 72.78% |
+| LQ4/raw-FP8 prefill GEMMs | 80.93% | 72.78% |
 | of which MLP gate/up and down | 56.71% | 50.49% |
 | Chunked GDN recurrence | 5.70% | 5.25% |
 | Dense prefill attention | 5.57% | 4.99% |
@@ -707,7 +902,7 @@ analysis validates measured-region containment and uses explicit stage associati
 
 The next bounded prefill experiment targets activation preparation on top of the shared-GDN
 implementation and upstream persistent-decode/deferred-GDN update. The production artifact remains
-`qwen3.8-27b/r9700-fp8lut4`; the FP8-K/INT4-V/FP16-scale cache, scheduling, precision boundaries,
+`qwen3.8-27b/r9700-lq4`; the FP8-K/INT4-V/FP16-scale cache, scheduling, precision boundaries,
 clocks and 300-W power cap are unchanged. The R9700 runs in `auto`, with Release ROCm 10 / HIP
 7.15 / AMDClang 23 and the canonical graph environment above.
 
@@ -1055,7 +1250,7 @@ Evidence: `profiles/bench/r9700-sync-open-items-20261002/`.
 ## Persistent decode kernel (2026-10-02)
 
 Every single-sequence (`B=1`) decode graph is lowered after capture (`ops::persistent_decode_lower`):
-each run of consecutive hosted launches (the FP8LUT4 and row-scaled FP8 small-T projections, the
+each run of consecutive hosted launches (the LQ4 and row-scaled FP8 small-T projections, the
 FP8 activation producers, the GDN front, pair projection with convolution and record, and Q/K
 norm-RoPE) becomes one persistent kernel of two 384-thread blocks per WGP. Each launch is a phase
 of virtual CTAs running the launch's own kernel body, separated by an atomic grid barrier
@@ -1125,7 +1320,7 @@ four 29.60), MTP K3 33.22-33.24.
 Multi-sequence (`B>1`) lowering, not adopted. Lowered as-is, C4 and C8 DFlash K7 decoded 6.6%
 and 5.5% slower: a C4 verification is 32 columns, whose two-token-tile projections were not
 hosted, so a round became 47 persistent kernels of about two phases each. Hosting the two-tile
-FP8LUT4/FP8 projections, the separately projected GDN convolution record and a per-head GDN
+LQ4/FP8 projections, the separately projected GDN convolution record and a per-head GDN
 record (all bitwise, `persistent_decode_qual` with batched GDN layers) gave 72 kernels / 577
 phases per C4 round, still 2.7% slower (45.25 vs 44.03 ms/round); C2 decoded equally (35.42 vs
 35.45) and C8 within its run-to-run noise (58.7-63.4 vs 57.7-62.2). Per-phase timestamps
@@ -1210,9 +1405,9 @@ Evidence: `profiles/bench/r9700-decode-c1-20261001/`.
 
 ## Prefill GEMM token spans: chunks above 2048 (2026-10-01)
 
-One FP8LUT4 / row-scaled FP8 prefill GEMM launch over more than ~2048 tokens lost its activation
+One LQ4 / row-scaled FP8 prefill GEMM launch over more than ~2048 tokens lost its activation
 image from cache: its CTAs walk every token tile of a row block together, so each row block
-re-streamed the whole image from DRAM. Per token (`fp8lut4_linear_qual --time-cell`, now allowed
+re-streamed the whole image from DRAM. Per token (`lq4_linear_qual --time-cell`, now allowed
 to T8192), gate/up N34816 K5120 cost 1.75 us at T2048, 2.75 at T2560, 4.36 at T4096 and 5.55 at
 T8192; N12288 0.62 -> 1.90; the narrow MLP down (N5120 K17408) stayed flat to T4096 and reached 1.49
 at T8192. The `--time-cell` cap of T2048 had hidden it, and the CLI/serve/bench default chunk
@@ -1246,7 +1441,7 @@ interleaved medians, `profiles/bench/r9700-c8-20260930/`):
 | Change | Before -> after |
 |---|---|
 | Drafter SWA: always split for long windows (direct above 48 columns) | T8xB8, 4096 window: 3.30 -> 0.36 ms per call |
-| FP8LUT4 mid-T loop drained every load per step; deep-pipelined variant at T33..64 (load ring, LDS-only barriers), attention and GDN pairs fused into one launch | attention pair T56 94 -> 66 us; GDN pair 103 -> 74 us; N5120 K17408 106 -> 88 us; K6144 43 -> 36 us; SiLU and head at T49..64 -3 to -4% |
+| LQ4 mid-T loop drained every load per step; deep-pipelined variant at T33..64 (load ring, LDS-only barriers), attention and GDN pairs fused into one launch | attention pair T56 94 -> 66 us; GDN pair 103 -> 74 us; N5120 K17408 106 -> 88 us; K6144 43 -> 36 us; SiLU and head at T49..64 -3 to -4% |
 | A8Q4 token-tile CTA (exact ceil(T/16) token fragments, LDS-shared activations, in-CTA split-K, two groups in flight) for the drafter shapes and draft head at T17..64 | N5120/K17408 T56 270 -> 115 us; N34816 T56 350 -> 193 us; draft head N131072 (was WMMA32) T56 2500 -> 709 us; C2..C4 widths T18..32 0.53-0.94x |
 
 Short prompts and prefill tails (T65..128) took the latency-bound mid-T loop until the deep
@@ -1261,7 +1456,7 @@ runs against be26d62b (`widet/short_ab.sh`):
 | Before (ms) | 34.8 | 36.3 | 43.5 | 47.1 | 52.7 | 57.3 | 81.3 |
 | After (ms) | 34.8 | 36.3 | 38.8 | 42.5 | 47.7 | 52.0 | 81.6 |
 
-Rejected: three- and four-tile small-T FP8LUT4 (8-38% slower than mid-T at T>=48, L2 activation
+Rejected: three- and four-tile small-T LQ4 (8-38% slower than mid-T at T>=48, L2 activation
 re-reads), and a fused wide GDN normalized front at T33..64 (113 us against 17 us for the
 three-launch composition).
 
@@ -1295,9 +1490,9 @@ one, about 0.004-0.005 nats/token for the 26-protection artifact. On the three 4
 (prefill) NVFP4 is +0.044, production +0.015. The 26 protections were the NVFP4 reference's
 BF16 set (15 in the split layout) plus 11 from an unqualified NVIDIA selective-FP8 experiment.
 Of those 11, attention query/key and gate/value at layers 27/31/51 stay FP8 (protected
-query/key is not demoted, and a split FP8/FP8LUT4 pair loses the fused input-projection route);
+query/key is not demoted, and a split FP8/LQ4 pair loses the fused input-projection route);
 attention output
-11 and MLP gate/up and down at layers 62/63 become GPTQ FP8LUT4. File 17.02 -> 16.75 GB.
+11 and MLP gate/up and down at layers 62/63 become GPTQ LQ4. File 17.02 -> 16.75 GB.
 Paired against production: +0.0017 / +0.0012 / +0.0003 / +0.0019 +/- 0.001-0.002 (cells as
 above); new severe 4/3/14/15 within caps 5/5/17/17. NIAH: standard and multikey greedy 20/20 each
 at 8K-128K, 5/5 each at 240K, multikey 5/5 at 260K (261,131-token prompts), sampled multikey
@@ -1310,12 +1505,12 @@ Speed, interleaved against production: ordinary decode 37.00 -> 37.62 tok/s (+1.
 DFlash acceptance over ten fixed prompts 4.07 -> 4.25 tokens/round (greedy trajectories diverge).
 Removing the remaining non-query/key protections (attention output 3/7, GDN output 4: 44 MB) is
 below measurement resolution and was not pursued. Evidence:
-`profiles/ppl/r9700-nvfp4-budget-20260929/`, `profiles/ppl/r9700-fp8lut4-p21-20260929/`,
-`profiles/bench/r9700-fp8lut4-p21-20260929/`.
+`profiles/ppl/r9700-nvfp4-budget-20260929/`, `profiles/ppl/r9700-lq4-p21-20260929/`,
+`profiles/bench/r9700-lq4-p21-20260929/`.
 
-**3-bit MLP gate/up (rejected, PPL-costing).** A sign + 2-bit format (FP8LUT4 book positions
+**3-bit MLP gate/up (rejected, PPL-costing).** A sign + 2-bit format (LQ4 book positions
 {1, 3, 5, 7}, the lowest-error 4-of-8 subset on sampled gate/up rows: relative L2 1.9x, calibrated
-output error ~3.6x the 4-bit codes) was measured exactly by encoding it as restricted FP8LUT4
+output error ~3.6x the 4-bit codes) was measured exactly by encoding it as restricted LQ4
 words (GPTQ, damping 0.1) on the 21-protection artifact. It would save ~22 MB per layer per step
 (~36 us per round at 620 GB/s; no 3-bit kernel was built). dNLL vs BF16, and minus NVFP4:
 
@@ -1329,7 +1524,7 @@ words (GPTQ, damping 0.1) on the 21-protection artifact. It would save ~22 MB pe
 Every subset puts decode behind NVFP4 or breaks a severe cap, so no 3-bit set is admissible under
 the NVFP4 bar. Per-layer calibrated error ranks the late layers cheapest, yet they carry about half
 of the all-layer NLL cost; the proxy does not predict model sensitivity. Evidence:
-`profiles/ppl/r9700-fp8lut4-lut3-20260930/` (receipts with per-layer errors; the evaluation-only
+`profiles/ppl/r9700-lq4-lut3-20260930/` (receipts with per-layer errors; the evaluation-only
 encoder option is kept there as a patch).
 
 ## Mixed prefill/decode frontier (2026-09-29)
@@ -1415,11 +1610,11 @@ Later mixed-round changes (interleaved A/B, pinned binary, two rounds each; `fsb
 
 Later bitwise changes (pinned binaries; 8K PPL mean NLL 1.8781831196376255 unchanged; greedy
 pair checks at S=1000/488 identical; score A/B at C4 with R=6):
-- **Adopted: split GDN input projections in mixed rounds.** The FP8LUT4 value-z projection
+- **Adopted: split GDN input projections in mixed rounds.** The LQ4 value-z projection
   writes the value rows and the output gate as separate targets, removing the per-layer owner
   gate copy. Score at S=1000 rose by about 0.006.
 - **Adopted: row-scaled protections on the fused prefill routes.** The 26 row-scaled E4M3
-  protections use the FP8LUT4 prefill kernels' split, accumulate and SiLU-less MLP epilogues at
+  protections use the LQ4 prefill kernels' split, accumulate and SiLU-less MLP epilogues at
   T > 128. GDN output layer 4 keeps its standalone gated RMSNorm, because the fused producer's
   per-head reduction order is not bitwise. Prefill-first rose from 3,510–3,525 to 3,530–3,532
   tok/s at T2048 and mixed prefill by ~0.6%. The score is unchanged (~1.061), because both sides
@@ -1488,7 +1683,7 @@ artifact; pinned binaries, against an upstream-only build of 0eab8185).**
   - GDN (including the single mixed convolution launch);
   - FP8 producers (with the normalized side output);
   - projected controls, normalized front and pair convolution record;
-  - FP8LUT4 front and Linear, and row-scaled Linear (small and prefill T);
+  - LQ4 front and Linear, and row-scaled Linear (small and prefill T);
   - eager and fused attention;
   - dense prefill and mid-row attention;
   - the dense-verify route discriminator (sequence batch, default, long context);
@@ -1651,7 +1846,7 @@ verify rows and host-side slice work), which is why S=1000/488 with D=2..8 domin
 D=1 at equal share.
 
 Mixed-round overheads removed during the campaign:
-- A mid-T FP8LUT4/raw-FP8 Linear route for T 33..128, 8 waves × (16-row block, K split).
+- A mid-T LQ4/raw-FP8 Linear route for T 33..128, 8 waves × (16-row block, K split).
   Whole-model T=48..128 prefill went from ~95 to 47–71 ms.
 - K5120 RMSNorm takes the row-CTA route at every width. 25..127 rows had fallen to the generic
   kernel (10× slower), and ≥128 rows used the serial token8 chain (115 → 47 µs per call at T2048).
@@ -1678,7 +1873,7 @@ Whole-model prefill step (C1, production DFlash, `ninfer_bench -p T`; ms, then t
 | tok/s | 1,534 | 2,201 | 2,859 | 2,863 | 3,225 | 3,376 | 3,430 | 3,429 |
 
 Changes:
-- **FP8LUT4/raw-FP8 prefill Linear CTA shapes.** The CTA is (G×64 tokens)×(8/G×R rows), with
+- **LQ4/raw-FP8 prefill Linear CTA shapes.** The CTA is (G×64 tokens)×(8/G×R rows), with
   256×128, 256×64 and 512×64 selected by `prefill_shape`, and 16-token fragments past T skip
   their activation loads and WMMAs. Every shape publishes identical bits (one wave's same-order K
   accumulation per output).
@@ -1728,7 +1923,7 @@ Remaining costs at T2048:
 - **Inter-kernel gaps:** about 9 ms per step, from 1,062 launches (see above).
 
 Verification:
-- `ninfer_r9700_fp8lut4_linear_qual` and `ninfer_r9700_fp8_row_scaled_linear_qual` pass at T
+- `ninfer_r9700_lq4_linear_qual` and `ninfer_r9700_fp8_row_scaled_linear_qual` pass at T
   33..128 (mid-T, including 65/80/113) and 130/200/300/640/1000/2048, with SiLU, residual, poison and split cases on every shape.
 - `a8q4_shape_sweep_qual --prefill-cta-regression` passes, with the context shapes at T
   33..1000 partial tiles.
@@ -1911,7 +2106,7 @@ DFlash K7: 31.31 ms per round, 827 kernels, 30.03 ms kernel time.
 
 | Part of a DFlash K7 round | ms | Note |
 |---|---:|---|
-| Target FP8LUT4/FP8 Linears (W8 verify, head, GDN pair) | 24.3 | 570-635 GB/s; e.g. gate/up 95 MB in 154 us (620 GB/s), head 675 MB in 1.1 ms (635 GB/s) |
+| Target LQ4/FP8 Linears (W8 verify, head, GDN pair) | 24.3 | 570-635 GB/s; e.g. gate/up 95 MB in 154 us (620 GB/s), head 675 MB in 1.1 ms (635 GB/s) |
 | Drafter Q4 Linears | 2.6 | shortlist head ~590 GB/s; narrow N6144/N4096 projections 470-530 GB/s |
 | GDN state (record 48 x 13.5 us, replay fold 0.53 ms, normalized front 48 x 9 us) | 1.6 | record/front are latency-bound, fold streams state at ~570 GB/s |
 | Activation quantization (~250 launches of 2.5-3.3 us) | 0.8 | per-token E4M3 scale needs a row-wide max |
@@ -1960,7 +2155,7 @@ Two further per-round costs were found:
 - The pinned-host Q4N16K16 token embedding cost 50 us (target) plus 16.5 us (drafter) per
   round: one row gather touches 320 interleaved 128-byte lines over PCIe. The Q4G64 embedding
   is now stored `row-split-k128-v1` (one contiguous 2,560-byte code run and 160-byte scale run
-  per row; `transcode_embedding_rows.py` revised `r9700-fp8lut4` losslessly, every other
+  per row; `transcode_embedding_rows.py` revised `r9700-lq4` losslessly, every other
   payload byte-identical and the embedding's inverse permutation exact). The gather reads one
   16-byte code chunk per 32 features. `ninfer_r9700_eager_qual` product-shape and pinned-host
   (in place, staged, shifted MTP window) embedding checks pass exactly; greedy DFlash K7
@@ -1974,9 +2169,9 @@ The DFlash2 drafter ran batched across requests only at `k == 4` (an upstream ga
 was the production setting); every other chain K looped it per request, so C4 K5 spent ~6.4 ms
 per round drafting versus ~2 ms batched. All chain rounds now draft in one batched pass. The
 A8Q4 small-batch projections gained the T14/T16/T21 cells (C2 K6/K7, C3 K6, C4 K3; the general
-WMMA route before) and T4 for every drafter shape (C1 K3), and the fused FP8LUT4 GDN pair
+WMMA route before) and T4 for every drafter shape (C1 K3), and the fused LQ4 GDN pair
 projection/convolution admits W4 (C1 K3). The new cells pass `ninfer_r9700_a8q4_small_batch_projection_qual`
-(FP64, 169 cells) and `ninfer_r9700_gdn_fp8lut4_front_qual` (bitwise against the composition).
+(FP64, 169 cells) and `ninfer_r9700_gdn_lq4_front_qual` (bitwise against the composition).
 Greedy tokens match the unchanged-path reference at every C/K (C4 K6/K7 already differed from K4
 before the change: their 28/32-row verify takes different target routes). `ninfer_bench`
 P512/G256, ms per round, before -> after:
@@ -2008,10 +2203,10 @@ reads, 80% of the read peak, so attention headroom is at most ~1.5% at 32K.
 
 ## Long-context prefill attribution and exhausted mechanisms (2026-09-27)
 
-Production `r9700-fp8lut4` artifact, C1, chunk 2048, code corpus. 128K prefill measures 1,901
+Production `r9700-lq4` artifact, C1, chunk 2048, code corpus. 128K prefill measures 1,901
 tok/s (68.96 s; kernel time 68.16 s, so host gaps are ~1%). Kernel shares
-(`profiles/rocprof/prefill-128k-fp8lut4-trace-20260927/`, attribution only): dense prefill
-attention 47.2% (~105 useful TFLOP/s averaged over the growing context), FP8LUT4 prefill GEMMs
+(`profiles/rocprof/prefill-128k-lq4-trace-20260927/`, attribution only): dense prefill
+attention 47.2% (~105 useful TFLOP/s averaged over the growing context), LQ4 prefill GEMMs
 44.3%, chunked GDN 3.2%, everything else below 1.5% each. At 240K attention is the majority.
 
 Dense prefill attention ablations (`dense_prefill_attention_qual --time 2048 131072 16`, median of
@@ -2042,16 +2237,16 @@ The kernel is WMMA plus one LDS fragment per WMMA, which an isolated loop bounds
   32K 2847/2790 -> 2875/2862 tok/s (+1-2.5%, within run-to-run spread), 128K 1905/1906 ->
   1862/1864 tok/s (-2.3%). The default stays 2048.
 
-FP8LUT4 GEMM repacking was measured by the research ports below (at most 3.3%, mixed) and the
+LQ4 GEMM repacking was measured by the research ports below (at most 3.3%, mixed) and the
 GEMM's redundant per-CTA decode cannot be shared without a cross-CTA or runtime-repacked weight
 path. No long-context prefill mechanism with a credible whole-prefill bound remains.
 
 ## Two-tile small-T FP8 Linear for T 17..32 (2026-09-28)
 
-Above T16 (C3/C4 DFlash verify) every FP8LUT4 Linear, the output head and the row-scaled FP8
+Above T16 (C3/C4 DFlash verify) every LQ4 Linear, the output head and the row-scaled FP8
 projections fell to the prefill GEMM. Both small-T kernels now add a second 16-token WMMA tile on
 the same decoded weights; T > 32 keeps the prefill GEMM. FP64-oracle qualified on all production
-shapes at T17..32 (`fp8lut4_linear_qual`, `fp8_row_scaled_linear_qual`, `attention_fused_qual`).
+shapes at T17..32 (`lq4_linear_qual`, `fp8_row_scaled_linear_qual`, `attention_fused_qual`).
 `--time-cell`, median us:
 
 | N x K | T16 | T24 before (prefill) | T24 two-tile |
@@ -2062,7 +2257,7 @@ shapes at T17..32 (`fp8lut4_linear_qual`, `fp8_row_scaled_linear_qual`, `attenti
 | 7168 x 5120 | 20 | 105 | 31 |
 | 5120 x 6144 | 18 | 118 | 28 |
 
-Evidence: `profiles/bench/r9700-fp8lut4-small-t-20260928/`.
+Evidence: `profiles/bench/r9700-lq4-small-t-20260928/`.
 
 ## Activation codec and residual rounding (rejected, 2026-09-28)
 
@@ -2096,7 +2291,7 @@ Follow-up screens used the same harness:
 | Boundary change | 8K | 32K |
 |---|---:|---:|
 | production Q4G64 token embedding (artifact bits) vs BF16 | -0.0008 +/- 0.0006 | +0.0002 +/- 0.0004 |
-| FP8LUT4 token embedding (production encoder) minus production Q4G64 | +0.0015 +/- 0.0007 | -0.0006 +/- 0.0004 |
+| LQ4 token embedding (production encoder) minus production Q4G64 | +0.0015 +/- 0.0007 | -0.0006 +/- 0.0004 |
 | chunked-GDN FP16 operand emulation (validated at 5.3e-4 relative state error) vs FP32 | +0.0006 +/- 0.0005 | -0.0004 +/- 0.0003 |
 | G64 activation scales for scored (decode) positions and head only, minus all per-token | -0.0026 +/- 0.0015 | -0.0015 +/- 0.0009 |
 
@@ -2109,7 +2304,7 @@ for T <= 32. Every small-T FP8 consumer (T1 GEMV, small-T and two-tile WMMA, pro
 row-scaled small-T, the GDN fused projection) adds each 64-column step times its group scale.
 Every producer publishes max|group| / 448. The implementation passed the producer, Linear,
 row-scaled, attention-fused and GDN-front FP64 oracles. Against the same HEAD binary on
-`r9700-fp8lut4` (`profiles/ppl/r9700-decode-g64-20260929/`, patch retained there):
+`r9700-lq4` (`profiles/ppl/r9700-decode-g64-20260929/`, patch retained there):
 
 | Cell | baseline dNLL vs BF16 | candidate | paired candidate - baseline | flips |
 |---|---:|---:|---:|---:|
@@ -2117,7 +2312,7 @@ row-scaled, attention-fused and GDN-front FP64 oracles. Against the same HEAD bi
 | decode 8K, graph | +0.0122 | +0.0121 | -0.0001 +/- 0.0018 | 7.40% / 7.30% |
 | decode 32K, graph | +0.0099 | +0.0111 | +0.0012 +/- 0.0009 | 6.60% / 6.35% |
 
-With FP8LUT4 weights the reference's predicted gain (-0.0015 at 32K) does not appear, so the code
+With LQ4 weights the reference's predicted gain (-0.0015 at 32K) does not appear, so the code
 was reverted without speed or NIAH runs.
 
 ## DFlash K6/K7 chains (2026-09-27)
@@ -2125,7 +2320,7 @@ was reverted without speed or NIAH runs.
 Fixed K6/K7 (W7/W8) chains are supported (`--draft-tokens 6|7`). Their earlier ~4 ms (C1) / ~16 ms (C4) round penalty was route fallback, removed by
 7-8-row A8Q4 small-batch drafter projections, W7/W8 GDN pair conv/record and a T<=32 normalized GDN
 front (all qualified against their FP64/exact oracles, `tools/r9700`). Production
-`qwen3.8-27b-r9700-fp8lut4`, `--lm-head-draft`, Device Graphs, 12-prompt corpus x greedy + two
+`qwen3.8-27b-r9700-lq4`, `--lm-head-draft`, Device Graphs, 12-prompt corpus x greedy + two
 p-less seeds, ABC/CBA order, paired per-request decode rate with 95% bootstrap interval:
 
 | C | arm | tokens/round | ms/round | vs baseline |
@@ -2135,7 +2330,7 @@ p-less seeds, ABC/CBA order, paired per-request decode rate with 95% bootstrap i
 | 1 | fixed K7 vs production adaptive K5 | 3.00 / 2.79 | 31.7 / 31.2 | 1.098 (1.040–1.160) |
 | 4 | fixed K7 vs production adaptive K5 | 3.01 / 2.57 | 77.0 / 43.6 | 0.672 (0.653–0.691) |
 
-At the time, C4 adaptive ran mostly K3 because every FP8LUT4 target Linear above 16 tokens
+At the time, C4 adaptive ran mostly K3 because every LQ4 target Linear above 16 tokens
 (C4 x W>=5) left the small-T route for the prefill kernel, nearly doubling the round; fixed K5/K7
 paid that cliff. Adaptive `{3..7}` then measured 0.92x adaptive K5 at C1: each request's first round
 picked the lowest measured T(k) before any hop was observed, and deeper hops never earned credit,
@@ -2166,7 +2361,7 @@ Evidence: `profiles/bench/r9700-feature-ports-20260927/`.
 | Candidate | Result |
 |---|---|
 | Fixed-budget W8 trees (K7) | root-sibling 0.87 (C1) / 0.88 (C4) of K5 chain; normalized best-first 0.97 / 1.01 (parity, never faster) |
-| Exact FP8LUT4 nibble repacking | complete-Op change 0.3% slower to 3.3% faster; word-at-a-time scheduling 35–62% slower at T1 |
+| Exact LQ4 nibble repacking | complete-Op change 0.3% slower to 3.3% faster; word-at-a-time scheduling 35–62% slower at T1 |
 | Grammar-mask overlap with target forward | default HIP serializes the graph; no measured benefit |
 | 16-key dense-prefill attention | 22.5% slower at P2048/context 65536 |
 | Conditional live-context verify split | some Ops 12–30% faster, but no matched whole-Engine gain |
@@ -2178,14 +2373,14 @@ Horizon/tree economics: graphs on, 12 manifest scenario prompts x {greedy, two p
 768-token limit, ABC/CBA order over two passes, paired per-request decode rate against K5 chain.
 Outputs differ across verify widths, so this is a matched-workload, not token-identical, comparison.
 
-## GPTQ rounding for FP8LUT4 weights (2026-09-27)
+## GPTQ rounding for LQ4 weights (2026-09-27)
 
 Converter-only change (identical format, size and kernels, so speed is unchanged): GDN and MLP
-FP8LUT4 projections are GPTQ-rounded against BF16-reference input second moments of 128 x 2048
+LQ4 projections are GPTQ-rounded against BF16-reference input second moments of 128 x 2048
 calibration tokens from real opencode/OpenWebUI sessions plus code and news (recipe in
 `qwen3.8-27b-artifact.md`). Held-out layer output error falls 40-80% for GDN projections and
 12-20% for MLP (after raising MLP-down damping to 0.3; it overfits at 0.01). Paired against the
-independently rounded artifact (`profiles/ppl/r9700-fp8lut4-gptq-20260927/`):
+independently rounded artifact (`profiles/ppl/r9700-lq4-gptq-20260927/`):
 
 | Evaluation | dNLL/token vs previous |
 |---|---:|
@@ -2212,9 +2407,9 @@ against the retained source-BF16 references; tiers from `tools/ppl/README.md`):
 Same-route graph/eager decode is bit-identical at 8K and 32K (NLL and argmax), and whole-inference
 greedy tokens match graph/eager at C1..C4 (P2048/G256) and at P20480 for ordinary and DFlash.
 
-**Output head as GPTQ FP8LUT4 (promoted into `r9700-fp8lut4`, 2026-09-28).** Measured as the
-evaluation identity `r9700-fp8lut4-head-eval`, since folded into production. The Q4G64 target head
-re-encoded as FP8LUT4 at the same 4.25 bits/weight, GPTQ-rounded against the final-norm second
+**Output head as GPTQ LQ4 (promoted into `r9700-lq4`, 2026-09-28).** Measured as the
+evaluation identity `r9700-lq4-head-eval`, since folded into production. The Q4G64 target head
+re-encoded as LQ4 at the same 4.25 bits/weight, GPTQ-rounded against the final-norm second
 moment (damping 0.1; recipe in `qwen3.8-27b-artifact.md`). Same BF16-source cells
 (`profiles/ppl/r9700-head-eval-20260927/`):
 
@@ -2230,12 +2425,12 @@ A/B, `profiles/bench/r9700-head-eval-speed-20260927/aba/`: ordinary decode 36.95
 DFlash round 31.41 vs 31.43 ms, prefill within noise). DFlash acceptance over ten 1024-token
 prompts x 512 greedy tokens (`.../accept2/`) is 3.72 vs 3.79 tokens/round: fewer rounds on 7 of
 10 prompts, the total set by one low-acceptance fixture prompt (301 vs 245 rounds) where the
-greedy continuations diverge. NIAH (`profiles/bench/r9700-niah-fp8lut4-head-20260928/`): standard
+greedy continuations diverge. NIAH (`profiles/bench/r9700-niah-lq4-head-20260928/`): standard
 and multikey greedy 20/20 each at 8K-128K and 5/5 each at 240K, sampled multikey 50/50 (8K) and
 45/45 (32K-128K), identical to production.
 
-**Attention gate/value and output GPTQ (promoted into `r9700-fp8lut4`, 2026-09-28).** The 7
-FP8LUT4 attention gate/value and 13 output projections GPTQ-rounded (damping 0.1) instead of
+**Attention gate/value and output GPTQ (promoted into `r9700-lq4`, 2026-09-28).** The 7
+LQ4 attention gate/value and 13 output projections GPTQ-rounded (damping 0.1) instead of
 independently; query/key stays independent (GPTQ there failed 8K multikey NIAH). Paired against
 the head-promoted production artifact (`profiles/ppl/r9700-attn-vo-gptq-20260928/`):
 
@@ -2258,21 +2453,21 @@ but against the attention-GPTQ production artifact it is worse in all four BF16-
 +0.0013 / +0.0043 / +0.0003 / +0.0038 nats/token (8K prefill, 8K decode, 32K prefill, 32K decode;
 `profiles/ppl/r9700-actorder-20260928/`). Not adopted; the code was removed.
 
-**Protected FP8 projections as FP8LUT4 (not selected, PPL-costing).** Re-encoding the 26
-row-scaled FP8 protections as GPTQ FP8LUT4 too (0.62 GB less per token) gives ordinary decode
+**Protected FP8 projections as LQ4 (not selected, PPL-costing).** Re-encoding the 26
+row-scaled FP8 protections as GPTQ LQ4 too (0.62 GB less per token) gives ordinary decode
 36.78 -> 38.27 tok/s (+4.0%) and prefill 8K +0.6%, at +0.003 +/- 0.002 nats/token paired against
 the GPTQ artifact (8K +0.0022, 4K prefill +0.0036, 4K decode +0.0049); NIAH passes.
 
-**Decode bound.** A DFlash P4096/G128 kernel profile of the GPTQ artifact puts the FP8LUT4 small-T
+**Decode bound.** A DFlash P4096/G128 kernel profile of the GPTQ artifact puts the LQ4 small-T
 projections at 500-555 GB/s effective weight reads (gate/up 10.6 ms, accumulating projections 7.6
 ms and GDN pair/convolution 4.3 ms per round), the drafter's A8Q4G64 at ~480 GB/s and the row
 FP8 projections at ~530 GB/s, against ~612 GB/s for a synthetic contiguous read: decode is within
 10-20% of weight bandwidth, so further gains need fewer bytes per round. Dropping the two final
-byte permutes of the FP8LUT4 decode (repacked nibble order, measured as a wrong-output ceiling)
+byte permutes of the LQ4 decode (repacked nibble order, measured as a wrong-output ceiling)
 changes T1 by nothing, T6 by 0 to -3.8% and prefill GEMMs by -0.7 to -2.7%; not pursued.
 
 **Measured or assessed out.** *KV values:* in the BF16-source cache-only scorer at 8K (FP8 keys,
-G16 values), replacing uniform INT4 levels with the FP8LUT4 non-uniform magnitude shape (and a
+G16 values), replacing uniform INT4 levels with the LQ4 non-uniform magnitude shape (and a
 per-group scale search) changes NLL by -0.0003 +/- 0.0012 against G16 INT4; a six-way per-group
 scale search on the INT4 levels gives -0.0010 +/- 0.0009, half of the cache's whole +0.0019 cost at
 best. *GDN chunk-scan split:* precomputing the chunk-local U = T beta V, W = T beta Gamma K, P and
@@ -2283,11 +2478,11 @@ fused kernel's 0.63 ms), so the estimated gain is ~1% of prefill; not implemente
 ## Protected FP8 projections on the prefill GEMM (2026-09-27)
 
 The 26 selective-cap FP8 projections ran T > 16 through hipBLASLt (MT128x128x32 solutions, 4.8%
-of 32K prefill kernel time). They now run on the FP8LUT4 prefill GEMM with raw E4M3 staging
+of 32K prefill kernel time). They now run on the LQ4 prefill GEMM with raw E4M3 staging
 (`fp8_row_scaled_prefill_linear`), with scales and per-token poison in the epilogue. Per call at
 T2048 (hipBLASLt from the 32K trace, ours from a scratch event-timed harness with random data):
 gate/up 4059 -> 3441 us, down 5120x17408 3063 -> 1717 us, attention input 7168x5120 910 -> 705 us,
-output 5120x6144 764 -> 600 us. The kernel sits at the same ~212-217 TFLOP/s as FP8LUT4, which
+output 5120x6144 764 -> 600 us. The kernel sits at the same ~212-217 TFLOP/s as LQ4, which
 matches the recorded power bound at 300 W rather than a decode cost.
 
 Qualification: the hipBLASLt-era FP8 gate/up qualifier's selective-protected and shared-context
@@ -2305,8 +2500,8 @@ FP64 oracle, per-token poison).
 
 ## Long-context prefill: six waves per SIMD and interleaved weight staging (2026-09-26, night)
 
-A 32K prefill trace (`profiles/rocprof/prefill-32k-fp8lut4-trace-20260926/`, attribution only)
-put 66% of kernel time in the FP8LUT4 prefill GEMM and 18% in fused dense prefill attention.
+A 32K prefill trace (`profiles/rocprof/prefill-32k-lq4-trace-20260926/`, attribution only)
+put 66% of kernel time in the LQ4 prefill GEMM and 18% in fused dense prefill attention.
 Both kernels sat just above the gfx1201 240-VGPR cliff (255 and 243 VGPRs, occupancy 5), so a
 WGP held one attention CTA or two GEMM CTAs and staging/barriers ran exposed.
 
@@ -2316,9 +2511,9 @@ WGP held one attention CTA or two GEMM CTAs and staging/barriers ran exposed.
   WGP. T2048 (`dense_prefill_attention_qual --time 2048 <context> 16 30`): 3.86 / 15.48 / 32.56
   ms -> 3.50 / 13.97 / 27.96 ms at context 8K / 32K / 64K (~116 useful TFLOP/s at 64K). The
   split verification kernel shares the block arithmetic and is unchanged (234 VGPRs).
-- **FP8LUT4 prefill GEMM** is capped at 240 VGPRs (three CTAs per WGP instead of two) and
+- **LQ4 prefill GEMM** is capped at 240 VGPRs (three CTAs per WGP instead of two) and
   decodes/stages the next slab before the last of the four 16-column chunks instead of after the
-  last WMMA. T2048 (`ninfer_r9700_fp8lut4_linear_qual --time`, random activations): gate/up
+  last WMMA. T2048 (`ninfer_r9700_lq4_linear_qual --time`, random activations): gate/up
   176 -> 207, down 180 -> 209, GDN v/z 175 -> 210, attention 188 -> 216, output 190 -> 216,
   GDN q/k 189 -> 216 TFLOP/s.
 
@@ -2341,10 +2536,10 @@ the isolated FP8 WMMA ceiling is ~340 TFLOP/s. The chunked GDN prefill (0.63 ms 
 it to the intra-chunk A/P products and ~13% to the q/k normalization loads, which a parallel
 precompute pass with a workspace would take off the serial chain (estimated 1-2% of prefill).
 
-## FP8LUT4 Text weights and per-token E4M3 activations (2026-09-26, evening)
+## LQ4 Text weights and per-token E4M3 activations (2026-09-26, evening)
 
 The Text-layer Q4G64 projections of the selective-cap DFlash2 base were re-encoded from BF16 as
-`FP8LUT4` (now `r9700-fp8lut4`; codec in `tensor-formats.md`,
+`LQ4` (now `r9700-lq4`; codec in `tensor-formats.md`,
 recipe in `qwen3.8-27b-artifact.md`). Each 32-column group selects an eight-magnitude codebook
 whose values are exact E4M3, so every Linear runs FP8 x FP8 WMMA with only the FP32 row scale
 and the per-token activation scale applied after the K sum: prefill is a 256-token x 128-row
@@ -2356,13 +2551,13 @@ product directly. QK/PV attention and the typed cache are unchanged (no FP8 atte
 Interleaved A/B against the production Q4 selective-cap artifact, same binary, R9700 at the
 300 W cap:
 
-| Workload | Q4 selective-cap | FP8LUT4 |
+| Workload | Q4 selective-cap | LQ4 |
 |---|---:|---:|
 | prefill 4K tok/s | ~2380 | ~3050 (+28%) |
-| prefill 8K / 32K / 64K (earlier FP8LUT4 build) | | +36% / +18% / +16% |
+| prefill 8K / 32K / 64K (earlier LQ4 build) | | +36% / +18% / +16% |
 | P4096/G128 DFlash ms/round | 31.37 | 31.43 |
 | P4096 ordinary decode tok/s (512 tokens) | 36.70 | 36.92 |
-| P65536 DFlash ms/round (earlier FP8LUT4 build) | 34.87 | 35.49 |
+| P65536 DFlash ms/round (earlier LQ4 build) | 34.87 | 35.49 |
 
 Quality (`profiles/ppl/r9700-cb4-final-20260926/`, same windows): 4K prefill PPL wiki -0.33%,
 technical -1.48%, code -0.95% relative to Q4; 128-position decode-path spans +2.68%, +4.37%,
@@ -2371,9 +2566,9 @@ technical -1.48%, code -0.95% relative to Q4; 128-position decode-path spans +2.
 (paired -0.0123 +/- 0.0054), flips 382 vs 437, severe 3 vs 10. NIAH exact-answer 8K..128K x five
 positions passes 20/20 (standard) and 20/20 (multikey)
 (`profiles/bench/r9700-niah-cb4-20260926/`). Kernels are checked against an FP64 oracle of the
-decoded codebook (`ninfer_r9700_fp8lut4_linear_qual`, T1..2048, pair, SiLU-pair, residual,
+decoded codebook (`ninfer_r9700_lq4_linear_qual`, T1..2048, pair, SiLU-pair, residual,
 per-token poison), the producers against theirs (`ninfer_r9700_fp8_producers_qual`), and the
-fused GDN front bitwise against its composition (`ninfer_r9700_gdn_fp8lut4_front_qual`).
+fused GDN front bitwise against its composition (`ninfer_r9700_gdn_lq4_front_qual`).
 
 The per-token E4M3 image now carries one status word per token, plain-stored by the producing
 CTA; consumers poison only a flagged token's outputs. This removed the serial status CTA (40 us

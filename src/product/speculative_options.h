@@ -60,4 +60,17 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     throw std::invalid_argument("invalid speculative backend");
 }
 
+// CLI/server defaults apply only after an explicit DFlash backend selection.
+inline void resolve_speculative_cli_options(SpeculativeOptions& options, bool draft_tokens_explicit,
+                                            bool adaptive_draft_explicit) {
+    if (options.backend == SpeculativeBackend::DFlash) {
+        if (!draft_tokens_explicit) { options.draft_tokens = kMaximumDFlashDraftTokens; }
+        if (!adaptive_draft_explicit) { options.adaptive_draft = true; }
+    } else if (options.backend == SpeculativeBackend::None && adaptive_draft_explicit) {
+        throw std::invalid_argument(
+            "--adaptive-draft and --no-adaptive-draft require --spec mtp|dflash");
+    }
+    validate_speculative_cli_options(options);
+}
+
 } // namespace ninfer::product

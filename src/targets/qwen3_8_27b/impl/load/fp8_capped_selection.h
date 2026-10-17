@@ -19,9 +19,9 @@ inline constexpr Matrix matrices[] = {
 #undef NINFER_QWEN38_FP8_CAP_RECIPE
 };
 
-// The FP8LUT4 Text profile has its own protection set; every other profile uses its base recipe's.
+// The LQ4 Text profile has its own protection set; every other profile uses its base recipe's.
 constexpr artifact::NumericFormat matrix_format(WeightsProfile profile, std::string_view name) {
-    if (!is_fp8lut4_text_profile(profile)) {
+    if (!is_lq4_text_profile(profile)) {
         profile = fp8_capped_base_profile(profile);
         if (profile == WeightsProfile::R9700Q4Fp8SelectiveCapDFlash2Q4Evaluation)
             profile = WeightsProfile::R9700Q4Fp8SelectiveCapEvaluation;

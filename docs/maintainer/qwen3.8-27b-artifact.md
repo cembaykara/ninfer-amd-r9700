@@ -67,7 +67,7 @@ address. The load summary reports it as `mapped_host_bytes` (CLI `weight pinned 
 table, 1,350,860,800 for W8G32) goes to the automatic KV pool. `text/output_head` and all other
 tensors stay in VRAM. A quantized table is stored `row-split-k128-v1`, so one row is a contiguous
 run of codes (2,560 bytes for Q4G64) and of FP16 scales (160 bytes); there is no runtime
-repacking. `convert_fp8lut4` writes the embedding in that layout (an exact permutation of the
+repacking. `convert_lq4` writes the embedding in that layout (an exact permutation of the
 base's N16K16 table), and `transcode_embedding_rows.py` revises an existing artifact.
 
 The table is only row-gathered, through two routes with bit-identical results
@@ -90,9 +90,9 @@ The table is only row-gathered, through two routes with bit-identical results
 
 ### Selected local compact deployment
 
-The admitted production deployment is the FP8LUT4 Text recipe `r9700-fp8lut4` (below, GPTQ
+The admitted production deployment is the LQ4 Text recipe `r9700-lq4` (below, GPTQ
 conversion), installed under
-`/ssdpool2nvme/local_llm/models/qwen3.8-27b-r9700-fp8lut4/` and named by
+`/ssdpool2nvme/local_llm/models/qwen3.8-27b-r9700-lq4/` and named by
 `.env.example`/`compose.yaml`. Its conversion base, the Q4 selective-cap DFlash2 companion
 `r9700-q4-fp8-selective-cap-n16k16-dflash2-q4-eval` (17,002,543,616 bytes), remains installed
 under `/ssdpool2nvme/local_llm/models/qwen3.8-27b-r9700-q4-fp8-selective-cap/`, with exact
@@ -116,14 +116,14 @@ the nonzero mixed prefill A4 families remain evaluators.
 The current build/run configuration is G16, dense, chunk2048, W8 activation bits8;
 see `docs/performance.md` for quality tradeoffs and delivery evidence.
 
-### FP8LUT4 Text recipe
+### LQ4 Text recipe
 
-`r9700-fp8lut4` (profile `R9700Fp8Lut4`, 16,752,796,160 bytes; admitted 2026-09-27, output head
+`r9700-lq4` (profile `R9700Lq4`, 16,752,796,160 bytes; admitted 2026-09-27, output head
 added 2026-09-28, protections reduced to 21 on 2026-09-30, see `docs/performance.md`) is the
 selective-cap DFlash2 companion with every Text-layer projection outside its 21 FP8 protections,
 and the target output head (248320 x 5120), re-encoded from the original BF16 checkpoint as
-`FP8LUT4` in `r9700-fp8lut4-n16k64-v1` (see `tensor-formats.md`), including GDN value_z. The
-protections are the `R9700Fp8Lut4` entries of `fp8_capped_selection.inc`, read by both the binder
+`LQ4` in `r9700-lq4-n16k64-v1` (see `tensor-formats.md`), including GDN value_z. The
+protections are the `R9700Lq4` entries of `fp8_capped_selection.inc`, read by both the binder
 and the converter: the 5090 NVFP4 reference's BF16 set (attention query/key and gate/value at
 layers 3, 7, 11, 15, 19 and 23, attention output 3 and 7, GDN output 4) plus attention query/key
 and gate/value at layers 27, 31 and 51, kept as FP8 pairs so each layer's input projections share
@@ -132,12 +132,12 @@ byte-exact from the base; the base's other five FP8 matrices (attention output 1
 down at layers 62 and 63) are re-encoded like every other projection. MLP gate/up rows are stored
 gate/up interleaved in 16-row tiles (stored row `16 b + i` is gate feature `8 b + i` for `i < 8`,
 else up feature `8 b + i - 8`) so the projection publishes the SiLU-gated activation directly; no
-other object is permuted. The head runs through the `ops::linear` FP8LUT4 route at every width.
+other object is permuted. The head runs through the `ops::linear` LQ4 route at every width.
 
-The FP8LUT4 words except attention query/key are GPTQ-rounded: the BF16 reference
+The LQ4 words except attention query/key are GPTQ-rounded: the BF16 reference
 (`tools/reference/qwen3_8_27b_bf16`) evaluates 128 calibration sequences of 2048 tokens
 layer-major, in lock-step with the object order, and each projection is rounded
-column-sequentially against its inputs' second moments (`fp8lut4_codec.Calibration`; mean-diagonal
+column-sequentially against its inputs' second moments (`lq4_codec.Calibration`; mean-diagonal
 damping 0.3 for MLP down, 0.1 otherwise, chosen on held-out calibration sequences); the output
 head is rounded the same way against the second moment of the final-RMSNorm output (damping
 0.1). Attention gate/value and output joined on 2026-09-28; attention query/key keeps
@@ -146,22 +146,22 @@ The calibration set (`calibration_corpus.py`) is 64 windows of rendered opencode
 OpenWebUI conversations, 28 of llama.cpp sources and 16 of news text; no window shares a 32-token
 span with the PPL corpora, and its manifest records every input file. Conversion needs the GPU
 (~45 min), is create-only, and validates its readback; the installed file is
-`/ssdpool2nvme/local_llm/models/qwen3.8-27b-r9700-fp8lut4/qwen3.8-27b-r9700-fp8lut4.ninfer`.
+`/ssdpool2nvme/local_llm/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer`.
 
 ```bash
-python3.11 -m tools.convert.qwen3_8_27b_r9700.convert_fp8lut4 \
+python3.11 -m tools.convert.qwen3_8_27b_r9700.convert_lq4 \
   --base <qwen3.8-27b-r9700-q4-fp8-selective-cap-n16k16-dflash2-q4-eval.ninfer> \
   --model /ssdpool2nvme/local_llm/models/qwen3.8-27b-bf16 \
   --calibration /ssdpool2nvme/local_llm/models/qwen3.8-27b-calibration/calibration-usage-128x2048.ids \
   --out <new.ninfer>
 ```
 
-`--reuse-layers <existing r9700-fp8lut4.ninfer>` copies each Text-layer object byte-exact from an
+`--reuse-layers <existing r9700-lq4.ninfer>` copies each Text-layer object byte-exact from an
 artifact of the same calibration and damping whose receipt records the same rounding (GPTQ or
 independent) for it (digests checked against that receipt); the calibration pass, the head and
 any object whose rounding changed are encoded afresh.
 
-FP8LUT4 Linears run per-token E4M3 activations: prefill a 256-token x 128-row FP8 WMMA GEMM with the
+LQ4 Linears run per-token E4M3 activations: prefill a 256-token x 128-row FP8 WMMA GEMM with the
 group scale folded into the decoded weight bytes, verification widths a small-T WMMA kernel, one
 token an FP8 dot4 GEMV. Quality and speed evidence are in `docs/performance.md`.
 

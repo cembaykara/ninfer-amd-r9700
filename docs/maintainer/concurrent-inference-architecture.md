@@ -110,7 +110,7 @@ capture 同样借用 staging：compute stream 先等待 staging 上一轮 copy�
 D2D 把 lane current GDN 和 DFlash local lane 拷入 staging，`copy_stream` 再把 staging 以逐层线性
 D2H 拷入该 lane 的 pinned rewrite image，与后续 prefill/decode 重叠。`device.stream` 上的
 `synchronize()` 只排空 compute，不排空 copy_stream。Checkpoint host images（每条 lane 的 rewrite
-image 与 MTP/DFlash context-checkpoint head pool）在启动时从一块 prefault 并注册的 pinned slab 切出，
+image 与 MTP/DFlash context-checkpoint head pool）在启动时从一块 driver-backed HIP/GTT pinned slab 切出，
 由 Program 拥有；head 离队后回池，后续 freeze、turn-rollback 与 RAM/disk restore 复用同一 image 与
 completion event，serving 期间不调用 `hipHostMalloc`/`hipHostFree`。Pool 容量是每 lane 一个 rollback
 head，加上所有 lane 在共享 KV capacity 内能同时持有的 ladder head 数（`--max-context` 之上的 mark
@@ -1487,7 +1487,7 @@ independent operator tests and real-artifact integration remain the numerical au
 ### 9.1a `B=1` persistent lowering
 
 `B=1` definition 在 capture 后、instantiate 前由 `ops::persistent_decode_lower` 原地改写：图中每段至少两个
-连续的 hosted kernel nodes（small-T FP8LUT4 / row-scaled FP8 projections、FP8 activation producers、
+连续的 hosted kernel nodes（small-T LQ4 / row-scaled FP8 projections、FP8 activation producers、
 GDN front / pair-conv / record、Q/K norm-RoPE）替换为一个 persistent kernel node。该 kernel 以每 WGP 两个
 384-thread blocks 常驻，把每个 captured launch 作为一个 phase，用其原 kernel body（GDN record 为同一 Op
 的 per-(sequence, head) re-tiled body，宽度 >8 时保持 kernel node）、原参数和 virtual block/grid indices 执行，phase 之间是 grid barrier；输出与原 kernel nodes bitwise 相同。其余 nodes

@@ -1,4 +1,4 @@
-"""Build the fixed-length token-id calibration set for activation-aware FP8LUT4 conversion.
+"""Build the fixed-length token-id calibration set for activation-aware LQ4 conversion.
 
 The input is a JSON list of groups `{"label", "kind", "sequences", "files"[, "max_file_tokens"]}`.
 `kind` "text" tokenizes each file with the checkpoint tokenizer (no special tokens), optionally

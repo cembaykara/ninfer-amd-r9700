@@ -84,8 +84,8 @@ NInfer is a from-scratch C++/HIP inference engine for maximum single-GPU inferen
 compiled only for `gfx1201` and tuned on one AMD Radeon AI PRO R9700. The sole supported model is
 Qwen3.8-27B. Its growing Text/MTP cache has exactly three planes: FP8 E4M3FN keys, signed INT4
 values, and FP16 value scales; there is no cache dtype selector, K scale, alternate cache path, or
-retained compatibility backend. The production weights are `qwen3.8-27b/r9700-fp8lut4` (profile
-`R9700Fp8Lut4`): GPTQ-rounded FP8LUT4 Text projections and output head with 21 row-scaled FP8
+retained compatibility backend. The production weights are `qwen3.8-27b/r9700-lq4` (profile
+`R9700Lq4`): GPTQ-rounded LQ4 Text projections and output head with 21 row-scaled FP8
 protections (2026-09-30), admitted by the BF16-source PPL, NIAH, exact-token, and whole-inference
 gates. The weight-precision bar is no worse than the 5090 NVFP4 build on every BF16-source cell
 (measured with the frozen 5090 scorer); protected attention query/key projections are not demoted
@@ -253,6 +253,12 @@ HIP build is `build-r9700/`; profiler output is under `profiles/rocprof/` and `p
 hardware is one AMD Radeon AI PRO R9700, `gfx1201`, wave32, with the selected ROCm 10 toolchain
 under `/opt/rocm`.
 Engine, CLI, serve, and PPL use the one fixed FP8-K/INT4-V cache and expose no cache dtype selector.
+Before its first HIP call, `DeviceContext` fixes process-local ROCr host allocation to
+`HSA_USERPTR_FOR_PAGED_MEM=0` and normal SVM/unified addressing (`HSA_USE_SVM=1`). Pinned
+host arenas use HIP/GTT backing; direct artifact and disk-cache reads use ordinary-RAM staging.
+RAM KV, checkpoints, mapped weights and runtime pinned buffers share the driver GTT budget.
+This policy changes no host compaction sysctl; requested RAM capacity fails clearly if it
+cannot be allocated rather than silently shrinking or falling back to USERPTR memory.
 Use the selected Python 3.11 interpreter explicitly; do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified
 "latest" name; large artifacts, source checkpoints, and profiler outputs are local prerequisites,

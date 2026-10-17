@@ -121,7 +121,7 @@ of staging, plus a 2-MiB physical allocation bound for each scatter table (54 Mi
 This reservation is independent of physical KV page count and preserves the affine curve;
 it does not consume the external headroom.
 
-For the measured production `R9700Fp8Lut4` build at `S=262144`, adaptive DFlash K7 with
+For the measured production `R9700Lq4` build at `S=262144`, adaptive DFlash K7 with
 the optimized proposal head, no Vision, and prefill chunk 2048, the target bounds the
 complete immutable Device Graph residency by its measured C1..8 inventory. This includes one
 executable for every captured profile and the lowered persistent decode definitions. Other startup
@@ -403,7 +403,11 @@ only the entry's heads at or before the restored base into the Program's startup
 those copies wait for their own fences and are excluded from the entry's copy fence, which gates
 the lane's first prefill chunk, while a separate block fence keeps the retired block allocated
 until they land. Disk restore decodes saved heads straight into pool heads handed in with the
-restore target, after each head's previous DMA or host-copy owner has finished.
+restore target, after each head's previous DMA or host-copy owner has finished. Direct disk reads
+use ordinary aligned staging before copying into pinned GTT: one reusable page-record buffer per
+reader thread and at most 4 MiB per raw-state read worker. Header and CRC checks precede page
+publication; state chunks retain their logical CRC order. Page-read scratch remains allocated
+for reuse until its reader thread exits; state-worker scratch is released after that state read.
 
 A closed preserve-off turn is captured cut at its turn checkpoint. The request stopped on a stop
 token or string without a tool call, and its `TurnClosure` checkpoint `F` is its own generation
@@ -421,8 +425,15 @@ assistant prefill, re-prefills the reply.
 RAM image version 6 binds both semantic and per-plane physical fingerprints. Capture explicitly
 returns captured, needs-eviction, or dropped; the caller owns spill/eviction decisions. Optional
 pinned allocation failure leaves the request able to proceed without retained cache capture.
-The startup pinned arena is mmap-backed, prefaulted, and registered independently of GPU compute;
-its preparation can overlap artifact materialization.
+The startup pinned arena uses driver-backed HIP/GTT host memory and is zero-initialized;
+its preparation can overlap artifact materialization. Device startup fixes
+`HSA_USERPTR_FOR_PAGED_MEM=0` with normal SVM/unified addressing before HIP initialization,
+so these buffers do not use the movable USERPTR backing implicated in compaction stalls.
+RAM KV capacity, checkpoint slabs, mapped weights, transfer staging and runtime host buffers
+share the device's GTT budget as well as host-memory resources. Each allocation checks current
+GTT availability; HIP allocation remains authoritative under concurrent usage. Engine startup
+fails clearly when its requested capacity cannot be allocated; it never silently shrinks the
+RAM tier or falls back to registered pageable memory.
 
 `--kv-disk-capacity` and `--kv-disk-location` enable an inclusive persistent SSD tier; a nonzero RAM
 tier is required. Each RAM capture requests a write-behind spill on the disk worker, so entries
