@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -128,6 +129,19 @@ class ServeCorpusTest(unittest.TestCase):
         )
         self.assertEqual(command[command.index("--prefill-chunk") + 1], "8192")
         self.assertEqual(command[command.index("--max-concurrency") + 1], "1")
+        self.assertEqual(command[command.index("--spec") + 1], "none")
+        dflash = dataclasses.replace(spec, speculative_backend="dflash", draft_tokens=5)
+        full = server_command(
+            Path("/tmp/ninfer-serve"),
+            dflash,
+            Path("/tmp/server.jsonl"),
+            8080,
+            0,
+            2048,
+            lm_head_draft=False,
+        )
+        self.assertIn("--no-lm-head-draft", full)
+        self.assertIn("--no-adaptive-draft", full)
 
         start = {
             "artifact_type": "ninfer_serve_request_log",

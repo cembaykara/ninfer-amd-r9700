@@ -16,7 +16,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--weights", type=Path, required=True)
     ap.add_argument("--server", type=Path, default=Path("/build/apps/ninfer-serve"))
-    ap.add_argument("--spec", choices=("off", "mtp", "dflash"), default="dflash")
+    ap.add_argument("--spec", choices=("none", "mtp", "dflash"), default="dflash")
     ap.add_argument("--no-device-graph", action="store_true")
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--payload-items", type=int, default=700)
@@ -57,8 +57,9 @@ def main():
         "--request-log-jsonl",
         str(output / "requests.jsonl"),
     ]
-    if args.spec != "off":
-        command += ["--spec", args.spec, "--draft-tokens", "5"]
+    command += ["--spec", args.spec]
+    if args.spec != "none":
+        command += ["--draft-tokens", "5", "--no-adaptive-draft"]
         if args.spec == "dflash":
             command += ["--lm-head-draft"]
     if args.no_device_graph:

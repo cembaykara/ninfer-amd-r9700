@@ -41,6 +41,40 @@ int main() {
     failures += check(conflict_rejected, "CLI accepted competing output constraints");
 
 
+    const auto default_spec = parse({"ninfer", "model.ninfer", "--prompt", "hi"});
+    failures += check(default_spec.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
+                          default_spec.speculative.draft_tokens == 7 &&
+                          default_spec.speculative.adaptive_draft &&
+                          default_spec.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+                      "defaults must enable DFlash, adaptive K7, and the optimized head");
+    const auto no_spec = parse({"ninfer", "model.ninfer", "--prompt", "hi", "--spec", "none"});
+    failures +=
+        check(no_spec.speculative.backend == ninfer::SpeculativeBackend::None &&
+                  no_spec.speculative.draft_tokens == 0 && !no_spec.speculative.adaptive_draft &&
+                  no_spec.speculative.proposal_head == ninfer::ProposalHead::Full,
+              "--spec none retained speculative allocations");
+    const auto full_head =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--no-lm-head-draft"});
+    failures += check(full_head.speculative.proposal_head == ninfer::ProposalHead::Full,
+                      "--no-lm-head-draft did not select the full proposal head");
+    const auto optimized_head = parse(
+        {"ninfer", "model.ninfer", "--prompt", "hi", "--no-lm-head-draft", "--lm-head-draft"});
+    failures += check(optimized_head.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+                      "last proposal-head option did not win");
+    const auto mtp =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--spec", "mtp", "--draft-tokens", "3"});
+    failures += check(mtp.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          mtp.speculative.draft_tokens == 3 && !mtp.speculative.adaptive_draft &&
+                          mtp.speculative.proposal_head == ninfer::ProposalHead::Full,
+                      "DFlash defaults leaked into MTP");
+    bool stray_spec_options_rejected = false;
+    try {
+        (void)parse(
+            {"ninfer", "model.ninfer", "--prompt", "hi", "--lm-head-draft", "--spec", "none"});
+    } catch (const std::invalid_argument&) { stray_spec_options_rejected = true; }
+    failures +=
+        check(stray_spec_options_rejected, "--spec none accepted an enabled speculative head");
+
     const auto dflash_defaults =
         parse({"ninfer", "model.ninfer", "--prompt", "hi", "--spec", "dflash"});
     failures += check(dflash_defaults.speculative.draft_tokens == 7 &&
