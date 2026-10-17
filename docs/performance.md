@@ -176,20 +176,151 @@ whole-round gain for the DFlash bottleneck, so the format change is rejected. No
 cache format or candidate dispatch remains in production. The attention qualifier now accepts
 `--long-context 65536` for direct T1/T8 FP64, fragmented-page, publication and graph checks.
 
-**Unresolved latency spike:** repeated 512+1536-token runs reproduce roughly 0.6–0.9-second
+**Compaction latency mitigation:** initial 512+1536-token runs reproduce roughly 0.6–0.9-second
 rounds. KFD traces align these with `EVICT_USERPTR` intervals and repeated restore retries,
 while individual traced kernels remain below 2.4 ms. Spin waiting does not remove the pause.
 The profiler inserts registered system-memory queue rings, so memory-policy decisions were
 also checked without profiler interception: corrected production defaults reach 745/708 ms,
 `HSA_USE_SVM=0` reaches 758 ms, and combined legacy/GTT settings with ordinary-RAM I/O staging
-still reach 168 and 428 ms. The I/O-staging control reaches 896 ms. Tokens remain exact. No
-allocator, I/O staging, synchronization-policy or environment-setting challenger is retained.
-These results do not establish a qualified production mitigation or the specific invalidation
-caller. Further diagnosis needs privileged kernel caller-stack tracing: `perf_event_paranoid=4`,
-root-only tracefs permissions and unavailable passwordless sudo block that step here. The scoped
-`trace_userptr_root.sh` in the evidence directory is syntax-checked and ready for that follow-up;
-it has not been executed. It holds the GPU lease and cleans up its private trace instance and
-uniquely named probes without changing power, VM, driver or firmware policy.
+still reach 168 and 428 ms. The I/O-staging control reaches 896 ms. Tokens remain exact.
+Those partial allocator, staging, synchronization and runtime-setting candidates were rejected;
+the coherent process-local change selected below supersedes that initial investigation.
+
+A maintainer-executed privileged capture on 2026-10-16 identifies the caller: `kcompactd0`
+reaches `amdgpu_hmm_invalidate_hsa` through `compact_node`, `compact_zone`, `migrate_pages`,
+and `try_to_migrate_one`. Three native P512/G1536 runs reproduce 550/565/611-ms rounds.
+Surviving events within each round show per-page invalidations of shared host mappings,
+USERPTR queue eviction, and restoration page-fetch retries returning `-EAGAIN` before resume.
+Sampled process maps place the affected addresses in shared `/dev/zero (deleted)` mappings;
+their individual runtime allocation owners are not yet established. The evidence identifies
+memory compaction as an invalidation source; it does not establish a complete queue-duration
+accounting or a mitigation. Per-page stack collection overran trace buffers in all three
+attempts, so the collector correctly rejects them as complete loss-free captures. The retained
+stacks remain affirmative evidence of the caller, and the reported event counts are incomplete.
+
+The collector now bounds stack samples, streams events, records mapping/reason identities and
+restoration return codes, and validates trace loss and slow-round correlation. It runs inference
+as the invoking owner with that owner's resource limits, holds the GPU lease, and removes its
+private trace instance and uniquely named probes. It does not change power, VM, driver or
+firmware policy. Root remains necessary to attach probes; this agent's passwordless sudo is
+unavailable. A bounded-stack rerun (`userptr-20261016-182659-ckj8jjop`) reproduces 437/458/480-ms
+rounds and the same migration/restore pattern, but still overruns its per-CPU buffers. No further
+broad per-page capture is needed to identify the caller; these runs cannot support complete
+event counts or latency accounting. Evidence: `userptr-20261016-181736-pfr779xv/caller-analysis.json`
+and the later run's compact summaries in the evidence directory.
+
+A native process-local THP-disable screen uses `PR_SET_THP_DISABLE` before ROCm initialization,
+with no profiler or host-wide policy changes. The ABBA P512/G1536 runs have maximum round times
+420/474/397/414 ms (control/disabled/disabled/control); all 1,536 generated tokens match exactly.
+Disabling THP does not eliminate the pause and is rejected. The host has shmem THP disabled
+already, and this control does not prevent compaction from migrating ordinary pages. No THP
+change is retained in production. Evidence: `thp-process/analysis.json` in the evidence directory.
+
+A maintainer-authorized, native host-policy ABBA (`compaction-ab-20261016-183909-_y95eunf`)
+confirms a mitigation for the reproduced plain P512/G1536 workload:
+
+| Arm | `vm.compaction_proactiveness` | Maximum round, ms | Decode seconds | Rounds above 80 ms |
+|---|---:|---:|---:|---:|
+| Initial control | 20 | 433.892 | 39.7814 | 1 |
+| Disabled 1 | 0 | 25.831 | 39.3681 | 0 |
+| Disabled 2 | 0 | 25.857 | 39.3801 | 0 |
+| Restored control | 20 | 392.141 | 39.7546 | 1 |
+
+All 1,536 generated token IDs match across all four arms. Native median round time remains
+about 25.63 ms; the benefit is removal of the observed long pauses, with about 0.99% less decode
+time in this workload, not faster ordinary kernels. Global VM counters show approximately
+27 million daemon migration-scanned pages per control and zero during each disabled arm.
+Setting the original nonzero value can itself wake compaction; three-second transition settling
+and its counters are recorded separately from each native run. The initial unchanged-policy
+control also reproduces the pause. These are two disabled runs at one workload, not a guarantee
+against every future stall, demand-driven compaction, or different contexts/concurrency.
+
+The reviewed helper runs inference as the original owner with recovered resource limits, holds
+the GPU lease, and changes no GPU power policy. Local failure-injection checks cover normal
+restoration, interruption immediately after a successful write, failed inference and an
+intervening external policy change. The experiment restored the original value `20`; no
+persistent sysctl was applied. This host-wide workaround is superseded by the process-local
+mitigation below, so no persistent compaction-policy change is needed.
+
+A process-local implementation keeps compaction at `20`: use `HSA_USERPTR_FOR_PAGED_MEM=0` with
+normal SVM behavior, replace explicitly registered host arenas with HIP host allocations, and
+read O_DIRECT artifact and disk-cache data into ordinary aligned RAM before copying into
+pinned transfer slots.
+Memory/address/graph-transfer and artifact byte qualifications pass. Native original/candidate
+ABBA at P512/G1536 retains exact tokens and maxima 26.41/25.82/26.12/26.10 ms, but VM counters
+show no compaction in any arm. This comparison is inconclusive for mitigation. Candidate peak
+device-wide GTT usage is about 1.27 GB; direct-I/O staging adds up to 512 MiB ordinary RAM.
+The frozen implementation and evidence are under `gtt-arena-candidate/`; temporary wall
+diagnostics are removed from source.
+
+The maintainer then ran the reviewed controlled-compaction ABBA
+(`gtt-compaction-20261016-192211-qazi8q3b`), invoking one explicit host-memory compaction pass
+during each P512/G1536 decode. Proactive compaction stayed at `20` throughout:
+
+| Arm | Maximum round, ms | Rounds above 80 ms |
+|---|---:|---:|
+| Initial control | 486.753 | 2 |
+| Driver-backed host memory 1 | 25.733 | 0 |
+| Driver-backed host memory 2 | 26.562 | 0 |
+| Final control | 878.307 | 2 |
+
+All pulses overlap measured decode and scan 12–14 million pages. The new-memory runs also
+scan about 79.5/77.9 million pages through background compaction over their full requests,
+and all 1,536 generated tokens match the controls exactly. This supports mitigation under
+explicit compaction stress while compaction remains enabled; it does not guarantee immunity
+to unrelated host stalls. The binaries have different round-diagnostic instrumentation, so
+this comparison establishes removal of the large pauses, not a small steady-throughput gain.
+
+`DeviceContext` fixes the process-local policy before its first HIP call, including normal SVM
+addressing (`HSA_USE_SVM=1`); callers need no shell override. Pinned host buffers and arenas
+share the real driver GTT budget (about 62.43 GiB on this host), as well as system/cgroup
+resources. Allocation preflight checks current available GTT; actual HIP allocation remains
+authoritative under competing allocations. Requested RAM-KV capacity is never silently reduced
+or redirected to movable USERPTR memory. GTT errors are distinguished from automatic VRAM
+capacity errors. The original mmap/register arena and its bookkeeping are removed.
+
+Default-startup qualification verifies actual GTT consumption without environment overrides,
+CPU/device pointer identity, exact captured transfers over repeated replays, exhausted-GTT
+admission, and exact artifact materialization. The 8-GiB RAM-cache cancellation/publish/evict/
+restore qualification and MTP/DFlash checkpoint-state and continuation recovery pass. The full
+disk-cache qualification and real-artifact ordinary/MTP/DFlash cache-write integration, including
+disk restart and fork/cancel behavior, also pass. Disk reads retain O_DIRECT and use ordinary
+aligned page staging plus at most 4 MiB per raw-state read worker before copying into GTT.
+Page-read scratch remains allocated while the reader thread lives, including between restores;
+state-worker scratch and artifact-loading staging have temporary lifetimes. Native default-startup
+comparisons against the frozen pre-change control also retain exact tokens at C8/P8192 DFlash
+K7 (264 tokens across eight lanes) and C1/P65536 plain decode (33 tokens). Each lane retains
+the first prefill-produced token plus 32 decode tokens. All nine host tests, affected release
+builds, clang-tidy and changed-file formatting/lint checks pass. Source and probe changes
+received independent subagent review before GPU qualification.
+
+A mount-specific disk-cache comparison uses C1 DFlash K7 append-frontier restores at 8K/64K,
+raw disk-cache state, 8-GiB RAM and disk budgets, and the same retained cache on `/ssdpool2nvme`.
+This is a mirrored NVMe ZFS mount (kernel 2.4.1, 128-KiB records, lz4 and primary caching enabled).
+A diagnostic USERPTR/direct-read control shares the current HIP host arena and artifact-loading
+code; it reproduces the former restore route rather than the exact former mmap/register build.
+Model loading is excluded. Direct/staged/staged/direct arms each make five restores; the first
+restore after each Engine start is separate, leaving eight repeated samples per route/context.
+
+| Context | Direct restore hold, ms | GTT/staged restore hold, ms | Direct TTFT, ms | GTT/staged TTFT, ms |
+|---|---:|---:|---:|---:|
+| 8K | 72.374 | 78.484 | 103.237 | 109.189 |
+| 64K | 336.045 | 336.455 | 373.426 | 374.100 |
+
+These are medians: the observed combined-route cost is about 6 ms at 8K; the 0.7-ms 64K TTFT
+change is within run variation. Repeated 64K direct TTFT spans 366.6–617.9 ms versus
+372.7–375.1 ms staged; these outliers were not traced and are not attributed to compaction.
+First-restore TTFT varies substantially in both routes and does not establish a reliable
+startup penalty. An auxiliary USERPTR/staged arm has repeated median TTFT 112.7/374.9 ms
+at 8K/64K, consistent with staging contributing the small 8K cost; its later ordering and
+different pool-read volume prevent isolated memcpy-cost attribution. All 50 restores require
+HostDisk, exact cold-reference tokens/frontiers, stable entry membership and zero fallback.
+The seed saves the append frontier without ladder-head images. Positive device-wide pool read
+counters confirm physical I/O occurred, but include other processes; these are warm/repeated
+ZFS measurements, not guaranteed cold SSD reads. Compaction stays at 20, clocks at auto, and
+no filesystem/cache policy is changed. Independent review covers the harness and interpretation.
+Evidence: `disk-latency-mount/report.txt`, `setup.json`, `summary.json` and per-arm records under
+the same campaign directory.
 
 Commands, paired samples, numerical and resource evidence are retained under
 `profiles/bench/r9700-decode-fixes-20261016/`. Measurements use the same production artifact,

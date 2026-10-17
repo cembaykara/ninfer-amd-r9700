@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -40,7 +41,14 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char*
 
 class Slot {
 public:
-    explicit Slot(std::size_t bytes) : buffer(bytes + Reader::direct_io_alignment - 1) {
+    explicit Slot(std::size_t bytes)
+        : buffer(bytes + Reader::direct_io_alignment - 1),
+          read_buffer_(static_cast<std::byte*>(std::aligned_alloc(
+                           Reader::direct_io_alignment, (bytes + Reader::direct_io_alignment - 1) /
+                                                            Reader::direct_io_alignment *
+                                                            Reader::direct_io_alignment)),
+                       std::free) {
+        if (read_buffer_ == nullptr) { throw std::bad_alloc(); }
         const auto address = reinterpret_cast<std::uintptr_t>(buffer.data());
         const auto aligned = (address + Reader::direct_io_alignment - 1) /
                              Reader::direct_io_alignment * Reader::direct_io_alignment;
@@ -62,12 +70,17 @@ public:
 
     [[nodiscard]] std::byte* data() const noexcept { return data_; }
 
+    [[nodiscard]] std::byte* read_data() const noexcept { return read_buffer_.get(); }
+
+    void stage(std::size_t bytes) { std::memcpy(data_, read_buffer_.get(), bytes); }
+
     PinnedHostBuffer buffer;
     hipEvent_t event = nullptr;
     bool pending     = false;
 
 private:
     std::byte* data_ = nullptr;
+    std::unique_ptr<std::byte, decltype(&std::free)> read_buffer_;
 };
 
 class DirectReadPool {
@@ -343,14 +356,14 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     for (std::size_t i = 0; i < slot_count; ++i) {
         slots.push_back(std::make_unique<Slot>(largest_request));
     }
-    out.stats_.peak_staging_bytes = static_cast<std::uint64_t>(largest_request) * slot_count;
+    out.stats_.peak_staging_bytes = 2U * static_cast<std::uint64_t>(largest_request) * slot_count;
 
     DirectReadPool read_pool(slot_count);
     std::vector<std::future<std::size_t>> reads(slot_count);
     const auto submit_read = [&](std::size_t chunk_index, hipEvent_t reusable_after = nullptr) {
         Slot& slot             = *slots[chunk_index % slot_count];
         const ReadChunk& chunk = chunks[chunk_index];
-        auto destination       = std::span<std::byte>(slot.data(), chunk.request);
+        auto destination       = std::span<std::byte>(slot.read_data(), chunk.request);
         reads[chunk_index % slot_count] =
             read_pool.submit(reader, chunk.source, destination, reusable_after);
     };
@@ -366,6 +379,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         if (bytes_read < chunk.required) {
             throw ArtifactError("direct artifact read ended before the planned tensor range");
         }
+        slot.stage(bytes_read);
         out.stats_.file_bytes =
             checked_add(out.stats_.file_bytes, bytes_read, "artifact read bytes overflow u64");
         const std::uint64_t chunk_end =

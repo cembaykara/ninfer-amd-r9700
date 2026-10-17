@@ -2,8 +2,11 @@
 #include "../../src/core/arena.h"
 #include "../../src/core/decode_graph.h"
 
+#include <algorithm>
 #include <array>
 #include <iostream>
+#include <limits>
+#include <string_view>
 
 int main() {
     try {
@@ -76,6 +79,59 @@ int main() {
             return 1;
         }
         ninfer::HostPinnedArena pinned_arena(1024);
+        {
+            // Prove the startup policy selected driver-backed memory, even when
+            // the caller supplies no ROCr environment overrides.
+            constexpr std::size_t bytes = 64ULL << 20;
+            const std::size_t before    = ninfer::available_pinned_host_memory();
+            ninfer::HostPinnedArena driver_backed(bytes);
+            const std::size_t after = ninfer::available_pinned_host_memory();
+            if (after >= before || before - after < bytes / 2) {
+                std::cerr << "HIP host arena did not consume driver GTT backing: before=" << before
+                          << " after=" << after << " requested=" << bytes << '\n';
+                return 1;
+            }
+        }
+        bool rejected_gtt_capacity = false;
+        try {
+            ninfer::HostPinnedArena oversized(std::numeric_limits<std::size_t>::max());
+        } catch (const std::runtime_error& error) {
+            rejected_gtt_capacity =
+                std::string_view(error.what()).find("GTT budget") != std::string_view::npos;
+        }
+        if (!rejected_gtt_capacity) {
+            std::cerr << "HIP pinned arena did not reject exhausted GTT capacity\n";
+            return 1;
+        }
+        for (void* host : {pinned.data(), pinned_arena.base()}) {
+            void* gpu = nullptr;
+            HIP_CHECK(hipHostGetDevicePointer(&gpu, host, 0));
+            if (gpu != host || reinterpret_cast<std::uintptr_t>(host) % 256U != 0U) {
+                std::cerr << "HIP mapped host allocation has invalid address or alignment\n";
+                return 1;
+            }
+            auto* words = static_cast<std::uint32_t*>(host);
+            std::copy(source.begin(), source.end(), words);
+            ninfer::DecodeGraphDefinition host_graph;
+            host_graph.capture(device.stream, [&] {
+                HIP_CHECK(hipMemcpyAsync(buffer.data(), host, sizeof(source), hipMemcpyHostToDevice,
+                                         device.stream));
+            });
+            ninfer::DecodeGraphExecutable host_executable;
+            host_executable.instantiate(host_graph);
+            for (std::uint32_t replay = 0; replay < 3; ++replay) {
+                words[0] = source[0] + replay;
+                host_executable.launch(device.stream);
+                device.synchronize();
+                buffer.copy_to_host(copied.data(), sizeof(copied));
+                auto expected = source;
+                expected[0] += replay;
+                if (copied != expected) {
+                    std::cerr << "HIP mapped host graph replay did not preserve bytes\n";
+                    return 1;
+                }
+            }
+        }
         void* pinned_first  = pinned_arena.try_alloc(17, 256);
         void* pinned_second = pinned_arena.try_alloc(300, 512);
         if (pinned_first == nullptr || pinned_second == nullptr ||

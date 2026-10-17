@@ -19,16 +19,29 @@ FP8LUT4 artifact was admitted; it remains in git history.
 
 ## Live items
 
-- [ ] `DECODE-PROFILE-FIXES` **Blocked on privileged KFD caller tracing.** T1 hosting,
-  the measured >32-token GDN fold/record crossover and phase-metadata publication ordering
-  are implemented and verified. Final decode time reductions: 8.13% at C1/P8192,
-  7.31% at C1/P65536, and 1.29% at C6/P8192/K7. Three attention candidates were
-  rejected by physical timing. The remaining 0.6–0.9-second spikes are KFD USERPTR
-  queue evictions; unprofiled wait/memory-policy controls do not remove them. Tracefs is
-  root-only, perf is restricted and sudo requires a password. Ready follow-up:
-  `profiles/bench/r9700-decode-fixes-20261016/trace_userptr_root.sh`.
-  Evidence and checker limitations are in `docs/performance.md`. No clock, voltage,
-  power, allocator or runtime-environment policy change was retained.
+- [x] `DECODE-PROFILE-FIXES` **Closed 2026-10-16: process-local mitigation qualified.**
+  T1 hosting, the measured >32-token GDN fold/record crossover and phase-metadata publication
+  ordering are promoted. Decode time reductions: 8.13% at C1/P8192, 7.31% at C1/P65536,
+  and 1.29% at C6/P8192/K7; three attention candidates were rejected by physical timing.
+  Privileged stacks identify `kcompactd0` migration triggering USERPTR invalidation and queue
+  eviction. Process-local THP disabling fails. An authorized host-policy ABBA removes the
+  observed pause at proactive compaction `0` (about 0.99% decode time at P512/G1536), then restores
+  `20`; no persistent host policy is changed. The selected process-local mitigation uses
+  driver-backed HIP/GTT host allocations with normal unified addressing and ordinary aligned
+  staging for O_DIRECT artifact/disk-cache reads. Controlled compaction ABBA with policy `20`
+  gives control maximum rounds 486.753/878.307 ms versus 25.733/26.562 ms with mitigation;
+  all 1,536 output tokens match and compaction scans remain active. Native quiet-arm timing
+  alone is inconclusive, and differently instrumented binaries do not establish a small
+  throughput gain. Startup verifies real GTT backing, pointer identity and graph transfers;
+  artifact bytes, 8-GiB RAM-cache cancellation/evict/restore, MTP/DFlash recovery, full disk-cache
+  tests, real cache-write integration (including disk restart), and affected clang-tidy checks
+  pass. C8/P8192 DFlash K7 (264 retained tokens) and C1/P65536 plain decode (33 retained tokens)
+  match the frozen pre-change control exactly. Pinned allocations share the real GTT budget
+  (about 62.43 GiB here),
+  preserve explicit requested capacity and fail clearly if it cannot fit. Artifact reads add up
+  to 512 MiB ordinary staging; disk reads use bounded reusable page/4-MiB worker staging.
+  Evidence and limits are in `docs/performance.md` and
+  `profiles/bench/r9700-decode-fixes-20261016/`. No clock, voltage or power policy changes.
 
 - [x] `LONGCTX-PREFILL` Long-context (32K-240K) prefill, closed 2026-09-27: 128K attribution
   (attention 47%, FP8LUT4 GEMMs 44%), attention ablations, paired-wave split rejected at Layer 0,

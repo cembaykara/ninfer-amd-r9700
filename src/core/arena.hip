@@ -1,13 +1,8 @@
 #include "arena.h"
+#include "device.h"
 
 #include <algorithm>
-#include <cerrno>
-#include <cstdio>
 #include <cstring>
-#include <system_error>
-#include <thread>
-#include <sys/mman.h>
-#include <unistd.h>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -41,76 +36,28 @@ void free_pinned(void*& data) noexcept {
                              hipGetErrorString(error));
 }
 
-constexpr std::size_t kMaximumHostPrefaultWorkers = 8;
-constexpr std::size_t kHostPrefaultBytesPerWorker = 64ULL * 1024ULL * 1024ULL;
-
-std::size_t system_page_size() {
-    const long page_size = ::sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) { throw std::runtime_error("sysconf(_SC_PAGESIZE) failed"); }
-    return static_cast<std::size_t>(page_size);
+void require_pinned_capacity(std::size_t bytes) {
+    const std::size_t available = available_pinned_host_memory();
+    if (bytes > available) {
+        throw PinnedHostAllocationError(
+            "pinned host allocation requests " + std::to_string(bytes) + " bytes but only " +
+            std::to_string(available) +
+            " bytes of the amdgpu GTT budget remain; pinned host buffers, "
+            "checkpoint slabs and the RAM KV cache share that budget");
+    }
 }
 
-std::size_t align_up_size(std::size_t value, std::size_t alignment) {
-    if (value > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
-        throw std::overflow_error("host arena capacity alignment overflow");
+void* allocate_pinned_host(std::size_t capacity_bytes) {
+    require_pinned_capacity(capacity_bytes);
+    void* mapping          = nullptr;
+    const hipError_t error = hipHostMalloc(&mapping, capacity_bytes);
+    if (error != hipSuccess) {
+        throw PinnedHostAllocationError(
+            arena_error_message("hipHostMalloc HostPinnedArena", error) + " for " +
+            std::to_string(capacity_bytes) + " bytes");
     }
-    return (value + alignment - 1) / alignment * alignment;
-}
-
-void* allocate_registered_host(std::size_t capacity_bytes, std::size_t& mapping_bytes) {
-    const std::size_t page_size = system_page_size();
-    mapping_bytes               = align_up_size(capacity_bytes, page_size);
-    void* mapping =
-        ::mmap(nullptr, mapping_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mapping == MAP_FAILED) {
-        mapping_bytes = 0;
-        throw std::system_error(errno, std::generic_category(), "mmap HostPinnedArena");
-    }
-#ifdef MADV_NOHUGEPAGE
-    // HIP registration must pin every base page. Avoid first building transparent huge pages
-    // that the driver immediately has to split while registering the same range.
-    (void)::madvise(mapping, mapping_bytes, MADV_NOHUGEPAGE);
-#endif
-
-    const std::size_t requested_workers = 1 + (mapping_bytes - 1) / kHostPrefaultBytesPerWorker;
-    const std::size_t worker_count      = std::min(kMaximumHostPrefaultWorkers, requested_workers);
-    const std::size_t page_count        = mapping_bytes / page_size;
-    const std::size_t pages_per_worker  = 1 + (page_count - 1) / worker_count;
-    try {
-        std::vector<std::jthread> workers;
-        workers.reserve(worker_count);
-        for (std::size_t worker = 0; worker < worker_count; ++worker) {
-            const std::size_t begin_page = worker * pages_per_worker;
-            const std::size_t end_page   = std::min(page_count, begin_page + pages_per_worker);
-            if (begin_page == end_page) { break; }
-            workers.emplace_back([mapping, page_size, begin_page, end_page] {
-                auto* begin = static_cast<unsigned char*>(mapping) + begin_page * page_size;
-                std::memset(begin, 0, (end_page - begin_page) * page_size);
-            });
-        }
-    } catch (...) {
-        (void)::munmap(mapping, mapping_bytes);
-        mapping_bytes = 0;
-        throw;
-    }
-
-    const hipError_t registration = hipHostRegister(mapping, mapping_bytes, hipHostRegisterDefault);
-    if (registration != hipSuccess) {
-        (void)::munmap(mapping, mapping_bytes);
-        mapping_bytes = 0;
-        allocation_error("hipHostRegister failed", registration);
-    }
+    std::memset(mapping, 0, capacity_bytes);
     return mapping;
-}
-
-void free_registered_host(void*& ptr, std::size_t& mapping_bytes) noexcept {
-    if (ptr == nullptr) { return; }
-    (void)hipHostUnregister(ptr);
-    if (::munmap(ptr, mapping_bytes) != 0) {
-        std::fprintf(stderr, "host arena cleanup failed during munmap: %s\n", std::strerror(errno));
-    }
-    ptr           = nullptr;
-    mapping_bytes = 0;
 }
 
 } // namespace
@@ -303,6 +250,7 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, std::size_t alignment
         throw std::overflow_error("PinnedHostBuffer allocation size overflow");
     }
 
+    require_pinned_capacity(size_bytes + alignment - 1);
     void* ptr            = nullptr;
     const hipError_t err = hipHostMalloc(&ptr, size_bytes + alignment - 1);
     if (err != hipSuccess) {
@@ -312,7 +260,9 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, std::size_t alignment
                 throw std::runtime_error(
                     arena_error_message("hipHostMalloc pending error", pending));
             }
-            throw std::bad_alloc();
+            throw PinnedHostAllocationError(
+                "hipHostMalloc exhausted the pinned-host/GTT budget for " +
+                std::to_string(size_bytes + alignment - 1) + " bytes");
         }
         throw std::runtime_error(arena_error_message("hipHostMalloc failed", err));
     }
@@ -350,30 +300,28 @@ PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept
 HostPinnedArena::HostPinnedArena(std::size_t capacity_bytes) : capacity_(capacity_bytes) {
     if (capacity_ == 0) { throw std::invalid_argument("HostPinnedArena capacity must be nonzero"); }
     free_.push_back({0, capacity_});
-    base_ = allocate_registered_host(capacity_, mapping_bytes_);
+    base_ = allocate_pinned_host(capacity_);
 }
 
-HostPinnedArena::~HostPinnedArena() { free_registered_host(base_, mapping_bytes_); }
+HostPinnedArena::~HostPinnedArena() { free_pinned(base_); }
 
 HostPinnedArena::HostPinnedArena(HostPinnedArena&& other) noexcept
     : base_(other.base_), capacity_(other.capacity_), used_(other.used_),
-      mapping_bytes_(other.mapping_bytes_), free_(std::move(other.free_)),
-      live_(std::move(other.live_)) {
+      free_(std::move(other.free_)), live_(std::move(other.live_)) {
     other.base_     = nullptr;
-    other.capacity_ = other.used_ = other.mapping_bytes_ = 0;
+    other.capacity_ = other.used_ = 0;
 }
 
 HostPinnedArena& HostPinnedArena::operator=(HostPinnedArena&& other) noexcept {
     if (this != &other) {
-        free_registered_host(base_, mapping_bytes_);
+        free_pinned(base_);
         base_           = other.base_;
         capacity_       = other.capacity_;
         used_           = other.used_;
-        mapping_bytes_  = other.mapping_bytes_;
         free_           = std::move(other.free_);
         live_           = std::move(other.live_);
         other.base_     = nullptr;
-        other.capacity_ = other.used_ = other.mapping_bytes_ = 0;
+        other.capacity_ = other.used_ = 0;
     }
     return *this;
 }
