@@ -33,7 +33,8 @@ Vision-composed target hidden features. Verify is chain `W=k+1` for `k` in `1..7
 (shared slope, per-k intercept). An unmeasured k is probed at most once and dropped when
 dominated; switching k costs 1 ms. That is a sticky policy, not a once-per-launch latch: see
 [adaptive drafting](maintainer/qwen3.8-27b-model.md). Frozen `--draft-tokens 4` stays `{4}`.
-A later request cannot enable a capability omitted at startup.
+`--spec dflash` defaults to seven drafts and adaptive length; `--no-adaptive-draft`
+selects a fixed length. A later request cannot enable a capability omitted at startup.
 
 ## Endpoints
 
@@ -911,8 +912,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`, DFlash2 `1..7` | unset |
-| `--adaptive-draft` | pick live draft K in `{3..N}` (DFlash `--draft-tokens N>=5`; MTP `{3,4,5}`) by locking `E[Y]/T(k,C,L)` (nested `r_i`; least-squares T; at most one probe of an unmeasured k; 1 ms switch cost). `--draft-tokens 4` stays `{4}` | off |
+| `--draft-tokens N` | MTP `1..5`, DFlash2 `1..7` | `7` with DFlash; required with MTP |
+| `--adaptive-draft` | pick live draft K in `{3..N}` (DFlash `--draft-tokens N>=5`; MTP `{3,4,5}`) by locking `E[Y]/T(k,C,L)` (nested `r_i`; least-squares T; at most one probe of an unmeasured k; 1 ms switch cost). `--draft-tokens 4` stays `{4}` | on with DFlash; off with MTP |
+| `--no-adaptive-draft` | use the fixed `--draft-tokens` length instead of adapting | off |
 | `--dflash-verify-width N` | DFlash2 chain verify width `W=k+1`, `2..8` | auto |
 | `--dflash-p-less-draft-temperature T` | Pins the DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. Unset, the engine calibrates it online per p-less `--temperature` and draft length: every chain round scores eight candidate temperatures against the verified target distribution and the next round uses the best ([model §8](maintainer/qwen3.8-27b-model.md#8-dflash2-block-diffusion-draft-model)) | calibrated |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -935,17 +937,18 @@ curl http://127.0.0.1:8080/v1/models \
 | `--greedy` | force exact argmax for all requests | off |
 | `--no-p-less-sampling` | opt out of p-less and use top-p/top-k/min-p/penalties | p-less on |
 
-The configured `--draft-tokens` value is fixed for the server lifetime. Startup creates only the
-matching speculative Device Graph profiles; requests cannot select a different live K. An
-automatic K policy requires fresh same-candidate execution-parity, acceptance, and complete-round timing evidence on
-the selected R9700 artifact at each supported concurrency before it can become a product option.
+The configured maximum `--draft-tokens` and adaptive policy are fixed for the server lifetime.
+Startup captures the required graph set; adaptive DFlash selects live K in `{3..N}` for
+maximum N>=5. `--no-adaptive-draft` uses the fixed configured length.
 
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
-Qwen3.8-27B uses temperature `2.0` and presence penalty `0` in both modes
+With the standard sampler (`--no-p-less-sampling`), Qwen3.8-27B uses temperature
+`2.0` and presence penalty `0` in both modes
 (`2.0/0.95/20/0/0` thinking, `2.0/0.80/20/0/0` non-thinking).
 Frequency penalty is `0` for all registered presets. Process flags override
 registered values, request fields override process flags, and `--greedy` finally forces
-temperature `0`. P-less is enabled by default; it keeps temperature and seed and ignores top-p,
+temperature `0`. P-less is enabled by default with temperature `1.5` unless overridden;
+it keeps temperature and seed and ignores top-p,
 top-k, min-p, and presence/frequency penalties from both process flags and request bodies. Startup
 logs a one-time warning. Ignored request fields must still satisfy their normal input ranges before
 sampler resolution.

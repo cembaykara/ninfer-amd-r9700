@@ -1,11 +1,11 @@
 #pragma once
 
-// FP8LUT4 small-T projection kernel (T <= 16 per token tile; kTiles = 2 serves T 17..32): one CTA
+// LQ4 small-T projection kernel (T <= 16 per token tile; kTiles = 2 serves T 17..32): one CTA
 // context per 16 rows of the first or the second projection. Shared by the Linear launcher
-// (fp8lut4_linear.hip) and the persistent decode kernel.
+// (lq4_linear.hip) and the persistent decode kernel.
 #include "ops/r9700/linear/fp8_activation.h"
-#include "ops/r9700/linear/fp8lut4_linear.h"
-#include "ops/r9700/linear/fp8lut4_pipeline_impl.h"
+#include "ops/r9700/linear/lq4_linear.h"
+#include "ops/r9700/linear/lq4_pipeline_impl.h"
 #include "ops/r9700/persistent/persistent_cta.h"
 
 #include <hip/hip_runtime.h>
@@ -13,11 +13,11 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::r9700::linear::fp8lut4_kernels {
+namespace ninfer::ops::r9700::linear::lq4_kernels {
 
-using fp8lut4::decode8;
-using fp8lut4::F32x8;
-using fp8lut4::I32x2;
+using lq4::decode8;
+using lq4::F32x8;
+using lq4::I32x2;
 using U32x4 = std::uint32_t __attribute__((ext_vector_type(4)));
 
 inline constexpr std::uint16_t kCanonicalBf16QuietNan = 0x7FC0U;
@@ -36,10 +36,10 @@ __device__ __forceinline__ float bf16_float(std::uint16_t bits) {
 
 // One launch projects `weight` (and, small T, `second` in CTAs past weight.rows / 16).
 struct KernelArgs {
-    Fp8Lut4Weight weight{};
-    Fp8Lut4Output output{};
-    Fp8Lut4Weight second{};
-    Fp8Lut4Output second_output{};
+    Lq4Weight weight{};
+    Lq4Output output{};
+    Lq4Weight second{};
+    Lq4Output second_output{};
     const std::uint8_t* activation = nullptr;
     const float* token_scales      = nullptr;
     const std::uint32_t* status    = nullptr;
@@ -47,9 +47,9 @@ struct KernelArgs {
 };
 
 // Element (token, row) of one published output.
-__device__ __forceinline__ std::uint16_t* output_at(const Fp8Lut4Weight& weight,
-                                                    const Fp8Lut4Output& output,
-                                                    std::uint32_t token, std::uint32_t row) {
+__device__ __forceinline__ std::uint16_t* output_at(const Lq4Weight& weight,
+                                                    const Lq4Output& output, std::uint32_t token,
+                                                    std::uint32_t row) {
     const std::uint32_t rows = weight.rows, split = output.split;
     const bool leading        = split == 0U || row < split;
     const std::uint32_t width = split == 0U ? rows : (leading ? split : rows - split);
@@ -85,10 +85,10 @@ __device__ __forceinline__ void t1_body(const Cta& cta, T1Shared& shared, const 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
     const std::uint32_t first_blocks = a.weight.rows / 32U;
     const bool second                = cta.block().x >= first_blocks;
-    const Fp8Lut4Weight weight       = second ? a.second : a.weight;
-    const Fp8Lut4Output output       = second ? a.second_output : a.output;
+    const Lq4Weight weight           = second ? a.second : a.weight;
+    const Lq4Output output           = second ? a.second_output : a.output;
     const std::uint32_t row_base = (second ? cta.block().x - first_blocks : cta.block().x) * 32U;
-    fp8lut4::load_table(shared.table, cta.thread(), 32U * kGemvSplit);
+    lq4::load_table(shared.table, cta.thread(), 32U * kGemvSplit);
     const std::uint32_t lane = cta.thread() & 31U, wave = cta.thread() >> 5U;
     const std::uint32_t row     = row_base + lane;
     const std::uint32_t columns = weight.columns, steps_total = columns / 64U;
@@ -196,7 +196,7 @@ __device__ __forceinline__ void t1_body(const Cta& cta, T1Shared& shared, const 
 }
 
 template <bool kAccumulate, bool kSiluPair>
-__global__ __launch_bounds__(32U * kGemvSplit) void fp8lut4_t1_kernel(KernelArgs a) {
+__global__ __launch_bounds__(32U * kGemvSplit) void lq4_t1_kernel(KernelArgs a) {
     __shared__ T1Shared shared;
     t1_body<kAccumulate, kSiluPair>(persistent::LaunchCta{}, shared, a);
 }
@@ -216,10 +216,10 @@ small_t_body(const Cta& cta, SmallTShared<kSiluPair, kSplit, kTiles>& shared, co
     const std::uint32_t block        = cta.block().x;
     const bool second                = block >= first_blocks;
     // By value: the CTA-uniform selection stays in scalar registers.
-    const Fp8Lut4Weight weight   = second ? a.second : a.weight;
-    const Fp8Lut4Output output   = second ? a.second_output : a.output;
+    const Lq4Weight weight       = second ? a.second : a.weight;
+    const Lq4Output output       = second ? a.second_output : a.output;
     const std::uint32_t row_base = (second ? block - first_blocks : block) * 16U;
-    fp8lut4::load_table(shared.table, cta.thread(), 32U * kSplit);
+    lq4::load_table(shared.table, cta.thread(), 32U * kSplit);
     const auto publish = [&](std::uint32_t token, std::uint32_t row, float value) {
         if constexpr (kSiluPair) {
             shared.staged[row - row_base][token] = value;
@@ -234,9 +234,8 @@ small_t_body(const Cta& cta, SmallTShared<kSiluPair, kSplit, kTiles>& shared, co
             *out = round_bf16(value);
         }
     };
-    fp8lut4::small_t_rows<kSplit, kSteps, kTiles>(cta, weight, row_base, a.activation,
-                                                  a.token_scales, a.tokens, shared.table,
-                                                  shared.partial, publish);
+    lq4::small_t_rows<kSplit, kSteps, kTiles>(cta, weight, row_base, a.activation, a.token_scales,
+                                              a.tokens, shared.table, shared.partial, publish);
     if constexpr (kSiluPair) {
         cta.sync();
         const std::uint32_t features = weight.rows / 2U;
@@ -254,7 +253,7 @@ small_t_body(const Cta& cta, SmallTShared<kSiluPair, kSplit, kTiles>& shared, co
 
 template <bool kAccumulate, bool kSiluPair, std::uint32_t kSplit, std::uint32_t kSteps,
           std::uint32_t kTiles>
-__global__ __launch_bounds__(32U * kSplit) void fp8lut4_small_t_kernel(KernelArgs a) {
+__global__ __launch_bounds__(32U * kSplit) void lq4_small_t_kernel(KernelArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
     __shared__ SmallTShared<kSiluPair, kSplit, kTiles> shared;
     small_t_body<kAccumulate, kSiluPair, kSplit, kSteps, kTiles>(persistent::LaunchCta{}, shared,
@@ -264,4 +263,4 @@ __global__ __launch_bounds__(32U * kSplit) void fp8lut4_small_t_kernel(KernelArg
 #endif
 }
 
-} // namespace ninfer::ops::r9700::linear::fp8lut4_kernels
+} // namespace ninfer::ops::r9700::linear::lq4_kernels

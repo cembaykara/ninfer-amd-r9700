@@ -55,7 +55,7 @@ Q5G64_F16S = QuantFormat("Q5G64_F16S", 5, 64, -16, 15)
 Q6G64_F16S = QuantFormat("Q6G64_F16S", 6, 64, -32, 31)
 W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
 F8E4M3_ROW_F32S = RowScaledFormat("F8E4M3_ROW_F32S")
-FP8LUT4 = CodebookFormat("FP8LUT4", 32)
+LQ4 = CodebookFormat("LQ4", 32)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, I32)})
@@ -63,7 +63,7 @@ QUANT_FORMATS = MappingProxyType(
     {item.name: item for item in (Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, W8G32_F16S)}
 )
 ROW_SCALED_FORMATS = MappingProxyType({item.name: item for item in (F8E4M3_ROW_F32S,)})
-CODEBOOK_FORMATS = MappingProxyType({item.name: item for item in (FP8LUT4,)})
+CODEBOOK_FORMATS = MappingProxyType({item.name: item for item in (LQ4,)})
 NUMERIC_FORMATS = MappingProxyType(
     {**DIRECT_FORMATS, **QUANT_FORMATS, **ROW_SCALED_FORMATS, **CODEBOOK_FORMATS}
 )
@@ -118,21 +118,21 @@ def round_e4m3fn_magnitude(numerator: int, exponent: int) -> int:
     return (biased << 3) | (units - 8)
 
 
-FP8LUT4_BASE_SIXTEENTHS = (0, 13, 27, 41, 56, 74, 94, 120)
+LQ4_BASE_SIXTEENTHS = (0, 13, 27, 41, 56, 74, 94, 120)
 
 
-def fp8lut4_group_magnitudes(group_code: int) -> tuple[int, ...]:
-    """The eight E4M3FN magnitude words of one FP8LUT4 group code.
+def lq4_group_magnitudes(group_code: int) -> tuple[int, ...]:
+    """The eight E4M3FN magnitude words of one LQ4 group code.
 
     Code byte b holds m = b & 7 and E = (b >> 3) - 26; magnitude j (0..7) is the E4M3FN rounding
     of (n_j / 16) * (1 + m / 8) * 2**E = n_j * (8 + m) * 2**(E - 7) with the fixed base
-    n = FP8LUT4_BASE_SIXTEENTHS (a zero level plus a Lloyd fit of group-normalized weights).
+    n = LQ4_BASE_SIXTEENTHS (a zero level plus a Lloyd fit of group-normalized weights).
     """
 
     if type(group_code) is not int or not 0 <= group_code <= 0xFF:
-        raise ValueError("FP8LUT4 group code must be an integer in [0, 255]")
+        raise ValueError("LQ4 group code must be an integer in [0, 255]")
     m, e = group_code & 7, (group_code >> 3) - 26
-    return tuple(round_e4m3fn_magnitude(n * (8 + m), e - 7) for n in FP8LUT4_BASE_SIXTEENTHS)
+    return tuple(round_e4m3fn_magnitude(n * (8 + m), e - 7) for n in LQ4_BASE_SIXTEENTHS)
 
 
 def get_format(name: str) -> NumericFormat:
@@ -149,10 +149,10 @@ __all__ = [
     "CODEBOOK_FORMATS",
     "DIRECT_FORMATS",
     "F8E4M3_ROW_F32S",
-    "FP8LUT4",
-    "FP8LUT4_BASE_SIXTEENTHS",
     "FP32",
     "I32",
+    "LQ4",
+    "LQ4_BASE_SIXTEENTHS",
     "NUMERIC_FORMATS",
     "Q4G64_F16S",
     "Q5G64_F16S",
@@ -166,7 +166,7 @@ __all__ = [
     "QuantFormat",
     "RowScaledFormat",
     "decode_e4m3fn_word",
-    "fp8lut4_group_magnitudes",
     "get_format",
+    "lq4_group_magnitudes",
     "round_e4m3fn_magnitude",
 ]

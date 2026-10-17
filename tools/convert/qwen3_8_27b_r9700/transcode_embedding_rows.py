@@ -1,11 +1,11 @@
 """Create-only, embedding-only lossless layout revision of a Qwen3.8-27B R9700 artifact.
 
 Rewrites the Q4G64 `text/token_embedding` from `r9700-q4g64-n16-k16-v1` to `row-split-k128-v1`,
-the layout `convert_fp8lut4` now writes: the embedding is only row-gathered from pinned host
+the layout `convert_lq4` now writes: the embedding is only row-gathered from pinned host
 memory, and a row-split row is one contiguous run of codes and of scales. Codes and FP16 scale
 words are permuted, never re-encoded; every other object is copied byte-exact. When the source
 has a `.conversion.json` receipt, the output receives the same receipt with the embedding's
-origin and digest updated, so `convert_fp8lut4 --validate` holds for it.
+origin and digest updated, so `convert_lq4 --validate` holds for it.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from tools.artifact.container import (
 )
 from tools.artifact.layouts import transcode_q4_n16k16
 
-from .convert_fp8lut4 import EMBEDDING, ROW_SPLIT, copied, recorded, row_split
+from .convert_lq4 import EMBEDDING, ROW_SPLIT, copied, recorded, row_split
 
 N16K16 = "r9700-q4g64-n16-k16-v1"
 CHUNK = 8 << 20

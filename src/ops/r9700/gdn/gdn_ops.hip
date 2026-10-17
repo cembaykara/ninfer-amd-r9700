@@ -3,7 +3,7 @@
 #include "ops/r9700/gdn_recurrence/gdn_replay_fold_internal.h"
 #include "ops/r9700/linear/a8g64_codec.h"
 #include "ops/r9700/linear/a8q4_pipeline_impl.h"
-#include "ops/r9700/linear/fp8lut4_pipeline_impl.h"
+#include "ops/r9700/linear/lq4_pipeline_impl.h"
 #include "ops/r9700/linear/fp8_encode_impl.h"
 #include "ops/r9700/linear/r9700_linear.h"
 
@@ -20,12 +20,12 @@ namespace {
 
 using front_kernels::conv_record_channel;
 using front_kernels::FrontFold;
-using front_kernels::gdn_fp8lut4_pair_conv_record_kernel;
+using front_kernels::gdn_lq4_pair_conv_record_kernel;
 using front_kernels::gdn_normalized_front_kernel;
 using front_kernels::kControlColumns;
 using front_kernels::kControlHeads;
 using front_kernels::kControlT1Threads;
-using front_kernels::kFp8Lut4PairSplit;
+using front_kernels::kLq4PairSplit;
 using front_kernels::kFrontFoldTiles;
 using front_kernels::kFrontMaximumTokens;
 using front_kernels::kMaximumVerifyWidth;
@@ -1000,7 +1000,7 @@ bool gdn_pair_conv_record_supported(std::uint32_t width, std::uint32_t batch) no
     return batch == 1U && width >= 5U && width <= 8U;
 }
 
-bool gdn_fp8lut4_pair_conv_record_supported(std::uint32_t width, std::uint32_t batch) noexcept {
+bool gdn_lq4_pair_conv_record_supported(std::uint32_t width, std::uint32_t batch) noexcept {
     return batch == 1U && width >= 4U && width <= 8U;
 }
 
@@ -1047,20 +1047,20 @@ hipError_t gdn_pair_conv_record_bf16(
     });
 }
 
-hipError_t gdn_fp8lut4_pair_conv_record_bf16(
-    const linear::Fp8ActivationWorkspace& image, const linear::Fp8Lut4Weight& query_key,
-    const linear::Fp8Lut4Weight& value_z, const hip_bfloat16* conv_weight,
+hipError_t gdn_lq4_pair_conv_record_bf16(
+    const linear::Fp8ActivationWorkspace& image, const linear::Lq4Weight& query_key,
+    const linear::Lq4Weight& value_z, const hip_bfloat16* conv_weight,
     const hip_bfloat16* conv_states, const std::int32_t* valid_columns,
     const std::int32_t* initial_state_slots, const std::int32_t* parent_index,
     hip_bfloat16* conv_record, hip_bfloat16* query, hip_bfloat16* key, hip_bfloat16* value,
     hip_bfloat16* z, std::uint32_t width, std::uint32_t state_slots, hipStream_t stream) noexcept {
-    const bool valid = gdn_fp8lut4_pair_conv_record_supported(width, 1U) && image.tokens == width &&
+    const bool valid = gdn_lq4_pair_conv_record_supported(width, 1U) && image.tokens == width &&
                        image.padded_columns == kControlColumns && image.codes != nullptr &&
                        image.scales != nullptr && image.status != nullptr &&
                        query_key.rows == kProjectionQueryRows + kProjectionKeyRows &&
                        value_z.rows == kProjectionValueZRows &&
                        query_key.columns == kControlColumns && value_z.columns == kControlColumns &&
-                       linear::fp8lut4_linear_supported(width, query_key.rows, query_key.columns) &&
+                       linear::lq4_linear_supported(width, query_key.rows, query_key.columns) &&
                        query_key.codes != nullptr && value_z.codes != nullptr &&
                        conv_weight != nullptr && conv_states != nullptr &&
                        initial_state_slots != nullptr && conv_record != nullptr &&
@@ -1069,26 +1069,26 @@ hipError_t gdn_fp8lut4_pair_conv_record_bf16(
     return checked_launch(valid, [&] {
         const dim3 grid((query_key.rows + value_z.rows) / 16U);
         const auto launch = [&](auto kernel) {
-            hipLaunchKernelGGL(kernel, grid, dim3(32U * kFp8Lut4PairSplit), 0, stream, image.codes,
+            hipLaunchKernelGGL(kernel, grid, dim3(32U * kLq4PairSplit), 0, stream, image.codes,
                                image.scales, image.status, query_key, value_z, conv_weight,
                                conv_states, valid_columns, initial_state_slots, parent_index,
                                conv_record, query, key, value, z, state_slots);
         };
         switch (width) {
         case 4U:
-            launch(gdn_fp8lut4_pair_conv_record_kernel<4>);
+            launch(gdn_lq4_pair_conv_record_kernel<4>);
             break;
         case 5U:
-            launch(gdn_fp8lut4_pair_conv_record_kernel<5>);
+            launch(gdn_lq4_pair_conv_record_kernel<5>);
             break;
         case 6U:
-            launch(gdn_fp8lut4_pair_conv_record_kernel<6>);
+            launch(gdn_lq4_pair_conv_record_kernel<6>);
             break;
         case 7U:
-            launch(gdn_fp8lut4_pair_conv_record_kernel<7>);
+            launch(gdn_lq4_pair_conv_record_kernel<7>);
             break;
         default:
-            launch(gdn_fp8lut4_pair_conv_record_kernel<8>);
+            launch(gdn_lq4_pair_conv_record_kernel<8>);
             break;
         }
     });

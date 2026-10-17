@@ -4,7 +4,7 @@ Status: live work ledger. Every unchecked item is assigned work unless the user 
 it. Completed work and its evidence belong in `docs/performance.md`; product state is in
 `AGENTS.md` and `README.md`. The previous campaign ledger (Q4/W8 recipe selection, XAttention and
 DFlash-recipe chains, terminal selection and cutover) was retired on 2026-09-27 when the GPTQ
-FP8LUT4 artifact was admitted; it remains in git history.
+LQ4 artifact was admitted; it remains in git history.
 
 ## Standing constraints
 
@@ -44,15 +44,15 @@ FP8LUT4 artifact was admitted; it remains in git history.
   `profiles/bench/r9700-decode-fixes-20261016/`. No clock, voltage or power policy changes.
 
 - [x] `LONGCTX-PREFILL` Long-context (32K-240K) prefill, closed 2026-09-27: 128K attribution
-  (attention 47%, FP8LUT4 GEMMs 44%), attention ablations, paired-wave split rejected at Layer 0,
+  (attention 47%, LQ4 GEMMs 44%), attention ablations, paired-wave split rejected at Layer 0,
   staging latency unhideable on gfx1201 at the 240-VGPR budget, chunk 4096 mixed (default 2048).
   No mechanism with a credible whole-prefill bound remains; `docs/performance.md` has the evidence.
 - [ ] `QUALITY-GAINS` Cheap quality improvements measured against the BF16 8K/32K admission
-  cells. Done 2026-09-28: the GPTQ FP8LUT4 output head (-0.006 to -0.008 nats/token, promoted
-  into `r9700-fp8lut4`); GPTQ on attention gate/value and output (-0.0013 to -0.0028, NIAH
+  cells. Done 2026-09-28: the GPTQ LQ4 output head (-0.006 to -0.008 nats/token, promoted
+  into `r9700-lq4`); GPTQ on attention gate/value and output (-0.0013 to -0.0028, NIAH
   passes; query/key stays independent). Rejected: group-wise GPTQ activation ordering (+0.0003 to
   +0.0043). Remaining: a larger usage calibration set. Decode
-  is not a lever here: Q4G64 and FP8LUT4 are the same size and the Q4 drafter kernels already
+  is not a lever here: Q4G64 and LQ4 are the same size and the Q4 drafter kernels already
   read at ~600 GB/s.
 - [x] `ATTN-MIDROWS` Closed 2026-09-28: 9..127-row causal chunks run the dense prefill tile split
   over context chunks with the packed route's FP32 merge (19 rows at 22K: 34 -> 0.24 ms/layer;
@@ -60,7 +60,7 @@ FP8LUT4 artifact was admitted; it remains in git history.
 - [x] `DFLASH-BATCHED-DRAFT` Closed 2026-09-28: every chain K drafts batched at C2..C4, with
   T14/T16/T21 small-batch cells; corpus aggregate +7.6% / +5.1% / +4.0% at C2 / C3 / C4. The
   fused GDN pair stays batch-1 (C>1 split path is weight-bound at the same cost).
-- [x] `DFLASH-K3-ROUTES` Closed 2026-09-28: T4 drafter cells and the W4 FP8LUT4 GDN pair;
+- [x] `DFLASH-K3-ROUTES` Closed 2026-09-28: T4 drafter cells and the W4 LQ4 GDN pair;
   C1 K3 33.1 -> 30.6 ms/round.
 - [x] `DECODE-BANDWIDTH` Closed 2026-09-29 (`docs/performance.md`, Decode step attribution):
   weight streaming runs at ~95% of the read peak; the four small-kernel candidates (quantization
@@ -85,6 +85,6 @@ FP8LUT4 artifact was admitted; it remains in git history.
   §2.5, §7.3, §8.9.
 - [x] `C8-CONCURRENCY` [changed the product contract] Done 2026-10-01 (83175b29). The startup-fixed
   maximum concurrency is C=1..8, including DFlash adaptive draft and mixed rounds. C5..C8
-  verify-width kernels (SWA split, FP8LUT4 deep mid-T, A8Q4 token-tile) match their C4 per-call
+  verify-width kernels (SWA split, LQ4 deep mid-T, A8Q4 token-tile) match their C4 per-call
   efficiency; `--mixed-forward auto` (1024) is the best width at C5..C8. `docs/performance.md`
   has the evidence.
