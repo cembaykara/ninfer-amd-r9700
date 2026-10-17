@@ -11,6 +11,51 @@ XAttention candidate. Commands, resume rules, corpus requirements and focused tr
 are in `context_ladder.md`. Timing and quality are separate evidence; cyclic timing inputs do
 not establish natural long-context quality.
 
+## README workload matrix
+
+`run_readme_workloads.py` measures C1/C6 on the committed
+`fixtures/readme_workloads.json`: English story writing, Python code, math reasoning,
+and document summaries near 8K and 32K prompt tokens. The first three use existing
+CLI example fixtures; the code case explicitly requests code in chat with no tool calls.
+Document prompts concatenate the named local documentation,
+cycle only if needed, and truncate with the local tokenizer while preserving the chat
+boundaries. Reports contain the actual prompt and output lengths, input messages,
+responses, draft acceptance, server startup metadata, and each measured rate.
+
+```bash
+flock --exclusive /path/to/local/.ninfer-coordination/gpu.lock \
+  env DEBUG_HIP_GRAPH_CLASSIC_PATH=0 ROC_ENABLE_LARGE_BAR=0 ROC_SKIP_KERNEL_ARG_COPY=0 \
+      HSA_DISABLE_FRAGMENT_ALLOCATOR=1 DEBUG_HIP_GRAPH_BATCH_SIZE=16384 \
+  /path/to/python3.11 tools/bench/run_readme_workloads.py \
+    --artifact /path/to/qwen3.8-27b-r9700-lq4.ninfer \
+    --tokenizer /path/to/qwen3.8-27b-bf16 \
+    --concurrency 1 6 --tokens 512 --warmup 1 --repetitions 3 \
+    --output profiles/bench/readme-workloads
+```
+
+The server runs adaptive DFlash up to K7, the optimized draft head, Device Graphs,
+prefill chunk 2048, automatic KV sizing, and p-less sampling at temperature 1.5.
+The script requires a new output directory. Change `--manifest` for other workloads;
+`--serve`, `--concurrency`, `--tokens`, and `--port` select the executable and workload
+shape. `--workload "Python package"` runs just that named cell at each concurrency.
+It needs the existing benchmark Python environment and a local tokenizer;
+it does not download weights or dependencies.
+
+Each lane first runs a one-token request to seed its prompt cache. A synchronized
+wave then generates up to the output budget per lane; natural stop tokens remain
+enabled. One warmup wave precedes three measured waves per cell. Only complete
+100-ms server intervals with no prefill and exactly C active decode lanes count.
+The reported rate is total committed decode tokens divided by those intervals'
+wall time, including host scheduling between rounds. It excludes prefill, startup,
+and intervals where some lanes have finished. Missing full-batch intervals fail
+the run rather than substitute an end-to-end or per-request rate. C6 is aggregate;
+divide by six for the average rate per active request in those intervals.
+
+`summary.json` and `summary.md` contain the results; per-cell JSON and server JSONL
+retain inputs and timing evidence under `--output`. Keep generated reports under
+`profiles/`; commit the runner, workload manifest, and summarized results in the
+active performance documentation.
+
 ## Corpus baker
 
 `ninfer_bench` benchmarks prefill at an exact length, cycling corpus IDs when `P` exceeds its
