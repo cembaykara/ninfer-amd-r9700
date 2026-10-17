@@ -114,9 +114,9 @@ std::string usage_text(const char* argv0) {
            "       [--kv-ram-capacity off|N] [--kv-disk-capacity off|N] [--kv-disk-location PATH]\n"
            "       [--kv-disk-compress off|zstd] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
-           "       [--spec mtp|dflash] [--draft-tokens N]\n"
+           "       [--spec none|mtp|dflash] [--draft-tokens N]\n"
            "       [--adaptive-draft|--no-adaptive-draft] [--dflash-verify-width N] "
-           "[--lm-head-draft]\n"
+           "[--lm-head-draft|--no-lm-head-draft]\n"
            "       [--dflash-p-less-draft-temperature T]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -145,7 +145,9 @@ std::string usage_text(const char* argv0) {
            "replaces the default marks and requires --spec mtp or dflash.\n"
            "--capture-context-checkpoint pins the current resume frontier on an exact-hit "
            "(no-op on a fresh one-shot run).\n"
-           "--spec dflash defaults to 7 draft tokens and adaptive drafting; "
+           "Speculation defaults to DFlash with the optimized draft head and adaptive drafting up "
+           "to 7 tokens; "
+           "--spec none disables speculation, --no-lm-head-draft selects the full head, and "
            "--no-adaptive-draft fixes the draft length.\n"
            "P-less sampling is enabled by default and uses temperature (default 1.5) and seed "
            "only; top-p, top-k, min-p, and penalties are ignored.\n"
@@ -161,6 +163,7 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path        = argv[1];
     bool draft_tokens_explicit   = false;
+    bool proposal_head_explicit  = false;
     bool adaptive_draft_explicit = false;
     bool kv_capacity_explicit    = false;
     std::optional<std::uint64_t> kv_capacity_headroom_mib;
@@ -221,6 +224,10 @@ Options parse_options(int argc, char** argv) {
             options.speculative.dflash_verify_width = parse_u32(value(arg), "dflash-verify-width");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+            proposal_head_explicit            = true;
+        } else if (arg == "--no-lm-head-draft") {
+            options.speculative.proposal_head = ProposalHead::Full;
+            proposal_head_explicit            = true;
         } else if (arg == "--raw-output") {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {
@@ -317,7 +324,7 @@ Options parse_options(int argc, char** argv) {
     validate_kv_disk_options(options.kv_ram_capacity_bytes, options.kv_disk_capacity_bytes,
                              options.kv_disk_location);
     product::resolve_speculative_cli_options(options.speculative, draft_tokens_explicit,
-                                             adaptive_draft_explicit);
+                                             adaptive_draft_explicit, proposal_head_explicit);
     if (!options.enable_thinking && options.reasoning_effort) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
     }

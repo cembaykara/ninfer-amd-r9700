@@ -35,17 +35,18 @@ template's default. An artifact whose template does not expose effort rejects th
 
 GPU residency is frozen when the Engine starts:
 
-- no `--spec` omits MTP/DFlash weights and state and the optimized proposal head;
+- the default loads DFlash2 and its optimized proposal head;
+- `--spec none` omits speculative weights, state, and the optimized proposal head;
 - `--spec mtp` loads only MTP; `--spec dflash` loads the Qwen3.8-27B DFlash2 companion when `dflash/` is present;
-- a speculative backend with the full proposal head omits the optimized proposal head;
+- `--no-lm-head-draft` uses the full proposal head, omitting the optimized head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
 - `--vision` loads those allocations and enables image/video input.
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: an
 Engine without `--vision` rejects media and cannot enable Vision later. Qwen3.8-27B DFlash2 can be
-combined with Vision when both are selected at startup. The
-default speculative and Vision settings produce the smallest resident profile.
+combined with Vision when both are selected at startup. Use `--spec none` with Vision off
+for the smallest resident profile.
 
 ## Structured messages
 
@@ -111,17 +112,18 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-Speculative decoding is disabled by default. MTP and DFlash2 support one to five draft positions.
+The CLI defaults to DFlash2 with the optimized proposal head and adaptive drafting up to seven
+tokens. `--spec none` disables speculation. MTP supports one to five draft positions.
 DFlash2 supports Vision-composed target hidden features and target MRoPE verification positions.
-`--lm-head-draft` selects the optimized proposal head and requires a selected backend:
+`--no-lm-head-draft` selects the full proposal head. `--lm-head-draft` enables the
+optimized head explicitly and requires a speculative backend:
 
 ```bash
 ./build-r9700/apps/ninfer models/qwen3_8_27b_r9700_candidate.ninfer \
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 \
   --max-new 512 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft
+  --spec dflash
 ```
 
 For Qwen3.8-27B DFlash2, the R9700 artifact must contain the appended `dflash/` objects. The native
@@ -161,13 +163,13 @@ R9700 speed recommendations require R9700 end-to-end measurements; NVIDIA timing
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `2048` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | HIP device index | `0` |
-| `--spec mtp\|dflash` | speculative backend | off |
+| `--spec none\|mtp\|dflash` | speculative backend | `dflash` |
 | `--draft-tokens N` | MTP `1..5`, DFlash2 `1..7` | `7` with DFlash; required with MTP |
 | `--adaptive-draft` | pick live draft K in `{3..N}` (DFlash `--draft-tokens N>=5`; MTP `{3,4,5}`) by locking `E[Y]/T(k,C,L)` (nested `r_i`; least-squares T; at most one probe of an unmeasured k; 1 ms switch cost). `--draft-tokens 4` stays `{4}` | on with DFlash; off with MTP |
 | `--no-adaptive-draft` | use the fixed `--draft-tokens` length instead of adapting | off |
 | `--dflash-verify-width N` | DFlash2 chain verify width `W=k+1`, `2..8` | auto |
 | `--dflash-p-less-draft-temperature T` | Pins the DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. Unset, the engine calibrates it online per p-less `--temperature` and draft length: every chain round scores eight candidate temperatures against the verified target distribution and the next round uses the best ([model §8](maintainer/qwen3.8-27b-model.md#8-dflash2-block-diffusion-draft-model)) | calibrated |
-| `--lm-head-draft` | optimized proposal head | off |
+| `--lm-head-draft` / `--no-lm-head-draft` | enable or disable the optimized proposal head | on with DFlash |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-device-graph` | disable Device Graph decode | graphs on |
 | `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks (24576, 36864, 53248, 77824, 102400, 151552). Custom lists require `--spec mtp` or `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark, not the raw named size. | default ladder |

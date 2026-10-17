@@ -33,6 +33,38 @@ int main() {
 
     static_assert(ninfer::kMaximumConcurrency == 8);
 
+    const auto default_spec = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(default_spec.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
+                          default_spec.speculative.draft_tokens == 7 &&
+                          default_spec.speculative.adaptive_draft &&
+                          default_spec.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+                      "defaults must enable DFlash, adaptive K7, and the optimized head");
+    const auto no_spec = parse({"ninfer-serve", "model.ninfer", "--spec", "none"});
+    failures +=
+        check(no_spec.speculative.backend == ninfer::SpeculativeBackend::None &&
+                  no_spec.speculative.draft_tokens == 0 && !no_spec.speculative.adaptive_draft &&
+                  no_spec.speculative.proposal_head == ninfer::ProposalHead::Full,
+              "--spec none retained speculative allocations");
+    const auto full_head = parse({"ninfer-serve", "model.ninfer", "--no-lm-head-draft"});
+    failures += check(full_head.speculative.proposal_head == ninfer::ProposalHead::Full,
+                      "--no-lm-head-draft did not select the full proposal head");
+    const auto optimized_head =
+        parse({"ninfer-serve", "model.ninfer", "--no-lm-head-draft", "--lm-head-draft"});
+    failures += check(optimized_head.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+                      "last proposal-head option did not win");
+    const auto mtp =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"});
+    failures += check(mtp.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          mtp.speculative.draft_tokens == 3 && !mtp.speculative.adaptive_draft &&
+                          mtp.speculative.proposal_head == ninfer::ProposalHead::Full,
+                      "DFlash defaults leaked into MTP");
+    bool stray_spec_options_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--lm-head-draft", "--spec", "none"});
+    } catch (const std::invalid_argument&) { stray_spec_options_rejected = true; }
+    failures +=
+        check(stray_spec_options_rejected, "--spec none accepted an enabled speculative head");
+
     const auto dflash_defaults = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash"});
     failures += check(dflash_defaults.speculative.draft_tokens == 7 &&
                           dflash_defaults.speculative.adaptive_draft,
@@ -64,11 +96,12 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
-    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
-                          defaults.kv_capacity.explicit_tokens == defaults.max_context,
-                      "default KV capacity does not follow max context");
-    failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
-                      "speculative decoding is not disabled by default");
+    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          defaults.kv_capacity.automatic_headroom_bytes ==
+                              ninfer::kDefaultKvCapacityHeadroomBytes,
+                      "default KV capacity must use automatic sizing");
+    failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::DFlash,
+                      "DFlash is not enabled by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
                       "Responses store defaults mismatch");
@@ -124,12 +157,12 @@ int main() {
     failures += check(dflash_w6.speculative.dflash_verify_width == 6,
                       "--dflash-verify-width did not preserve the chain width");
 
-    bool dflash_width_without_spec_rejected = false;
+    bool mtp_width_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--dflash-verify-width", "6"});
-    } catch (const std::invalid_argument&) { dflash_width_without_spec_rejected = true; }
-    failures += check(dflash_width_without_spec_rejected,
-                      "--dflash-verify-width was accepted without --spec dflash");
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                     "--dflash-verify-width", "6"});
+    } catch (const std::invalid_argument&) { mtp_width_rejected = true; }
+    failures += check(mtp_width_rejected, "--dflash-verify-width was accepted with MTP");
 
     const ServeOptions dflash_vision = parse(
         {"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "5", "--vision"});
@@ -137,11 +170,10 @@ int main() {
                           dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash,
                       "DFlash and Vision were not accepted together");
 
-    bool implicit_backend_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--draft-tokens", "3"});
-    } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
-    failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
+    const auto implicit_backend = parse({"ninfer-serve", "model.ninfer", "--draft-tokens", "3"});
+    failures += check(implicit_backend.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
+                          implicit_backend.speculative.draft_tokens == 3,
+                      "--draft-tokens did not configure the default DFlash backend");
 
     const ServeOptions configured = parse(
         {"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency", "4",
@@ -327,9 +359,9 @@ int main() {
 
     const ServeOptions inherited =
         parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});
-    failures += check(inherited.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
-                          inherited.kv_capacity.explicit_tokens == 16384,
-                      "omitted --kv-capacity did not follow --max-context");
+    failures += check(inherited.max_context == 16384 &&
+                          inherited.kv_capacity.mode == ninfer::KvCapacityMode::Automatic,
+                      "changing max context disabled automatic KV sizing");
 
     const ServeOptions automatic = parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto"});
     failures += check(automatic.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
@@ -337,15 +369,16 @@ int main() {
                           automatic.kv_capacity.automatic_headroom_bytes ==
                               ninfer::kDefaultKvCapacityHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
-    const ServeOptions headroom = parse(
-        {"ninfer-serve", "model.ninfer", "--kv-capacity-headroom", "512", "--kv-capacity", "auto"});
+    const ServeOptions headroom =
+        parse({"ninfer-serve", "model.ninfer", "--kv-capacity-headroom", "512"});
     failures +=
         check(headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
                   headroom.kv_capacity.automatic_headroom_bytes == 512ULL * 1024ULL * 1024ULL,
               "--kv-capacity-headroom did not set automatic headroom in MiB");
     bool headroom_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--kv-capacity-headroom", "512"});
+        (void)parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "8192",
+                     "--kv-capacity-headroom", "512"});
     } catch (const std::invalid_argument&) { headroom_rejected = true; }
     failures += check(headroom_rejected, "--kv-capacity-headroom without auto was accepted");
 
