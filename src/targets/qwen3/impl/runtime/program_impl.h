@@ -56,7 +56,7 @@ std::optional<std::size_t> available_host_memory_bytes() {
     return std::nullopt;
 }
 
-// Pinned, prefaulted checkpoint images cannot be reclaimed or swapped, so startup leaves this
+// Driver-backed pinned checkpoint images cannot be reclaimed or swapped, so startup leaves this
 // much host memory available after carving them instead of courting the OOM killer.
 inline constexpr std::size_t kCheckpointSlabHostHeadroomBytes = std::size_t{4} << 30;
 
@@ -453,7 +453,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         device, model.token_embedding, plan.persistent.prompt_embedding_image.bind(backing),
         plan.persistent.prompt_embedding_ids);
     {
-        // Every pinned checkpoint image is carved here from one prefaulted, registered slab, so
+        // Every pinned checkpoint image is carved here from one driver-backed HIP/GTT slab, so
         // no serving path allocates or frees pinned memory for checkpoints.
         const std::size_t conv_bytes      = decoder->linear_attention.conv_host_image_bytes();
         const std::size_t recurrent_bytes = decoder->linear_attention.recurrent_host_image_bytes();
