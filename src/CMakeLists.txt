@@ -230,7 +230,8 @@ target_link_libraries(ninfer_r9700_qwen_image_21_runtime PUBLIC
   hip::host)
 
 add_library(ninfer_r9700_qwen_image_vae_runtime STATIC
-  targets/qwen_image_vae/impl/vae_forward.hip)
+  targets/qwen_image_vae/impl/vae_forward.hip
+  targets/qwen_image_vae/impl/load/bindings.cpp)
 ninfer_r9700_internal_includes(ninfer_r9700_qwen_image_vae_runtime)
 set_target_properties(ninfer_r9700_qwen_image_vae_runtime PROPERTIES
   HIP_ARCHITECTURES gfx1201)
