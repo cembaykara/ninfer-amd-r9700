@@ -30,6 +30,7 @@ def _candidate_tensor(spec: TensorSpec) -> TensorSpec:
 TENSOR_SPECS: tuple[TensorSpec, ...] = tuple(
     _candidate_tensor(spec) for spec in source_inventory.TENSOR_SPECS
 )
+OBJECT_SPECS = TENSOR_SPECS  # Piece 2: no frontend resources yet
 FORMAT_COUNTS: dict[str, int] = dict(Counter(spec.format for spec in TENSOR_SPECS))
 
 
