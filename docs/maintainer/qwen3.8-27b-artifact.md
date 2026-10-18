@@ -92,10 +92,10 @@ The table is only row-gathered, through two routes with bit-identical results
 
 The admitted production deployment is the LQ4 Text recipe `r9700-lq4` (below, GPTQ
 conversion), installed under
-`/path/to/local/models/qwen3.8-27b-r9700-lq4/` and named by
+`/path/to/models/qwen3.8-27b-r9700-lq4/` and named by
 `.env.example`/`compose.yaml`. Its conversion base, the Q4 selective-cap DFlash2 companion
 `r9700-q4-fp8-selective-cap-n16k16-dflash2-q4-eval` (17,002,543,616 bytes), remains installed
-under `/path/to/local/models/qwen3.8-27b-r9700-q4-fp8-selective-cap/`, with exact
+under `/path/to/models/qwen3.8-27b-r9700-q4-fp8-selective-cap/`, with exact
 identity as filename stem after `qwen3.8-27b-`; the companion-free selective-cap base and the
 donors below were deleted as superseded (2026-09-28) and are recreated only with the commands below. The adjacent README records executable creation/build/run
 commands; conversion receipts retain source paths and every payload origin/hash. Selection
@@ -105,7 +105,7 @@ Creation uses `convert_fp8_capped --recipe r9700-q4-fp8-selective-cap-n16k16-eva
 with `out/qwen3.8-27b-r9700-q4g64-n16k16-eval.ninfer` as base,
 `out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-eval.ninfer` as four-role donor,
 `out/qwen3.8-27b-r9700-q4-selective-protected-n16k16-eval.ninfer` as selective donor,
-and `/path/to/local/models/qwen3.8-27b-bf16` as source. The companion uses
+and `/path/to/models/qwen3.8-27b-bf16` as source. The companion uses
 `compose_fp8_capped_dflash` with that base and the installed selective-protected tiled-head
 Q4 DFlash donor described below. Outputs are create-only; do not reconvert on installation.
 
@@ -146,13 +146,13 @@ The calibration set (`calibration_corpus.py`) is 64 windows of rendered opencode
 OpenWebUI conversations, 28 of llama.cpp sources and 16 of news text; no window shares a 32-token
 span with the PPL corpora, and its manifest records every input file. Conversion needs the GPU
 (~45 min), is create-only, and validates its readback; the installed file is
-`/path/to/local/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer`.
+`/path/to/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer`.
 
 ```bash
 python3.11 -m tools.convert.qwen3_8_27b_r9700.convert_lq4 \
   --base <qwen3.8-27b-r9700-q4-fp8-selective-cap-n16k16-dflash2-q4-eval.ninfer> \
-  --model /path/to/local/models/qwen3.8-27b-bf16 \
-  --calibration /path/to/local/models/qwen3.8-27b-calibration/calibration-usage-128x2048.ids \
+  --model /path/to/models/qwen3.8-27b-bf16 \
+  --calibration /path/to/models/qwen3.8-27b-calibration/calibration-usage-128x2048.ids \
   --out <new.ninfer>
 ```
 
@@ -177,7 +177,7 @@ excluding runtime workspace and caches. Conversion is CPU-only and create-only:
 ```bash
 python3 -m tools.convert.qwen3_8_27b_r9700.convert_selective_protected \
   --base out/qwen3.8-27b-r9700-q4g64-n16k16-eval.ninfer \
-  --model /path/to/local/models/qwen3.8-27b-bf16 \
+  --model /path/to/models/qwen3.8-27b-bf16 \
   --out out/qwen3.8-27b-r9700-q4-selective-protected-n16k16-eval.ninfer
 ```
 
@@ -199,7 +199,7 @@ the selective base's conversion receipt to its exact artifact hash and never rep
 ```bash
 python3.11 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 \
   --base out/qwen3.8-27b-r9700-q4-selective-protected-n16k16-eval.ninfer \
-  --dflash-model /path/to/local/models/qwen3.8-27b-dflash2 --preflight-only
+  --dflash-model /path/to/models/qwen3.8-27b-dflash2 --preflight-only
 ```
 
 Materialization uses the same arguments plus an explicit fresh `--out` and `--device cpu`.

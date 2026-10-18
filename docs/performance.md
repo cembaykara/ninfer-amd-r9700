@@ -3,6 +3,13 @@
 This document reports only measurements produced by the current native HIP/gfx1201 migration.
 Measurements from the retired backend are not comparable and are not product evidence.
 
+Historical `profiles/` paths below refer to local evidence, removed from the current
+tracked tree for publication. The original files remain in a private recovery bundle and a
+verified maintainer archive; `bench/results/historical-evidence.json` records the
+source commit, archive checksum and restore command. Paths in prose are normalized
+examples. Published summaries, benchmark tools and fixtures remain in the source
+distribution. This cleanup changes no measured values or artifact payloads.
+
 ## Evidence levels
 
 NInfer distinguishes four scopes:
@@ -157,6 +164,10 @@ These are workload samples rather than a general context-scaling curve: content,
 sampling, live K and draft acceptance all influence speed. The 32K C1 summary
 sample has higher acceptance than 8K; C6 slows at the longer context despite higher
 acceptance. Task quality is not scored by this throughput benchmark.
+
+The public machine-readable summary is
+`bench/results/readme-workloads-20261017.json`; raw reports below are local evidence,
+not files required to reproduce the benchmark.
 
 Run the command documented in `tools/bench/README.md` with the explicit local LQ4
 artifact and BF16 tokenizer. The reports are under
@@ -414,7 +425,7 @@ builds, clang-tidy and changed-file formatting/lint checks pass. Source and prob
 received independent subagent review before GPU qualification.
 
 A mount-specific disk-cache comparison uses C1 DFlash K7 append-frontier restores at 8K/64K,
-raw disk-cache state, 8-GiB RAM and disk budgets, and the same retained cache on `/path/to/storage`.
+raw disk-cache state, 8-GiB RAM and disk budgets, and the same retained cache on `the local storage pool`.
 This is a mirrored NVMe ZFS mount (kernel 2.4.1, 128-KiB records, lz4 and primary caching enabled).
 A diagnostic USERPTR/direct-read control shares the current HIP host arena and artifact-loading
 code; it reproduces the former restore route rather than the exact former mmap/register build.
@@ -812,7 +823,7 @@ existing residual-fused finish.
 
 The retained port on the initial AMD base was compared against that pulled snapshot using the explicit production
 artifact
-`/path/to/local/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer`
+`/path/to/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer`
 and `ninfer_bench -pg 512,128 --spec dflash --draft-tokens 7 --lm-head-draft --max-ctx 4096
 --warmup 1 -r 3 --retain-token-ids`, at fixed C1 and C8 with Device Graphs enabled. All three
 repetitions matched every generated greedy token and all speculative counters at both
@@ -3481,7 +3492,7 @@ fused attention. Direct comparisons found no long-context speed crossover in
 favor of those incumbents at the tested points through the native 262,144-token
 limit. The following table is operator evidence, not a server throughput claim.
 
-R9700/gfx1201, ROCm 10, device 0 / PCI `0000:13:00.0`, power `auto`, G16,
+R9700/gfx1201, ROCm 10, device 0 on the measured R9700, power `auto`, G16,
 token-fastest FP8 K and feature-fastest INT4 V / FP16 scales, BF16 Q, 24 query
 heads / 4 KV heads / dimension 256. The table reports median direct-launcher
 attention latency in milliseconds after a 256 MiB eviction pass outside each
@@ -3928,7 +3939,7 @@ calls, including ordinary decode and small DFlash verify, stay A8. No new kernel
 or weight conversion was needed. Broader A4 profiles remain evaluators, not defaults.
 
 Both artifacts and their creation receipts remain installed in
-`/path/to/local/models/qwen3.8-27b-r9700-q4-fp8-selective-cap/`:
+`/path/to/models/qwen3.8-27b-r9700-q4-fp8-selective-cap/`:
 base15,793,065,984 bytes; canonical-Q4/BF16-codebook DFlash companion17,002,543,616 bytes.
 The adjacent README logs exact creation/build/run commands. These evaluation identities are
 not renamed, and the independent BF16-source production-admission status is unchanged.
@@ -4172,7 +4183,7 @@ below predate these kernel changes and remain historical comparison evidence.
 Original selection for subsequent optimization: **Q4/FP8 selective-cap, uniform Q4 A8 execution**.
 The selected local delivery above now uses gate/up-only A4 prefill with these same weights.
 The15,793,065,984-byte artifact is saved at
-`/path/to/local/models/qwen3.8-27b-r9700-q4-fp8-selective-cap/qwen3.8-27b-r9700-q4-fp8-selective-cap-n16k16-eval.ninfer`.
+`/path/to/models/qwen3.8-27b-r9700-q4-fp8-selective-cap/qwen3.8-27b-r9700-q4-fp8-selective-cap-n16k16-eval.ninfer`.
 It is10.7% smaller than the17.68 GB selective base and26.7% smaller than four-role.
 It does not contain a DFlash companion and does not replace final BF16-source production
 admission. Existing model files remain unchanged.
@@ -4234,8 +4245,8 @@ Further kernel tuning and DFlash integration are separate follow-ups, not comple
 ## Matched NVFP4 quality and AMD recipe comparison (2026-09-23)
 
 The bounded comparison uses the user's standard 5090 artifact
-`/path/to/local/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`
-and a frozen scorer from `ninfer-reference` at `dfc818ae32c4e0e1ded7b9252b87930338fb8455`.
+`/path/to/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`
+and a frozen scorer from the frozen NVIDIA checkout at `dfc818ae32c4e0e1ded7b9252b87930338fb8455`.
 Its source, build, and model bytes were not changed. Three identical4096-token inputs cover
 WikiText, technical prose, and C++ source. Both embedded tokenizers and native tokenization
 match. Prefill PPL scores2047 next-token positions after2048 warmup tokens; a separate
@@ -4441,7 +4452,7 @@ retained under `profiles/rocprof/r9700-dflash-c1-c2-k4-20260922/` (`analysis.md`
 ## Selective-protected DFlash decode (2026-09-22)
 
 The currently selected evaluation artifact is
-`/path/to/local/models/qwen3.8-27b-r9700-q4-selective-protected-dflash2-q4/qwen3.8-27b-r9700-q4-selective-protected-n16k16-dflash2-q4-head-n16k16-eval.ninfer`
+`/path/to/models/qwen3.8-27b-r9700-q4-selective-protected-dflash2-q4/qwen3.8-27b-r9700-q4-selective-protected-n16k16-dflash2-q4-head-n16k16-eval.ninfer`
 (18,887,772,672 bytes). It losslessly reorders only the W8 output-head codes and scales;
 1,189 other payloads remain byte-identical to the original combined artifact. The original
 `qwen3.8-27b-r9700-q4-selective-protected-n16k16-dflash2-q4-eval.ninfer` is retained with its

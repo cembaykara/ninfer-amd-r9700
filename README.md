@@ -3,6 +3,9 @@
 C++/HIP inference for **Qwen3.8-27B on one AMD Radeon AI PRO R9700**, with
 **1–8 concurrent requests**.
 
+An AMD port of [Neroued/NInfer](https://github.com/Neroued/ninfer), distributed under
+Apache-2.0. Model weights are separate; see `docs/acknowledgements.md` for credits.
+
 ## What it does
 
 - **Works with chat clients.** Run from the terminal or connect a client that uses
@@ -95,16 +98,30 @@ wall intervals follow untimed prompt seeding; C6 counts intervals with all six
 requests decoding. Divide C6 by six for the average per active request.
 Prompt content and sampling affect draft acceptance and speed. Prefill above uses
 a separate greedy token-corpus workload. Methodology and variation: `docs/performance.md`.
+Machine-readable results: `bench/results/readme-workloads-20261017.json`.
 
 In every tested 8K/32K cell, the increase in prediction loss over the BF16 source
-was smaller than for the fixed 5090 NVFP4 reference. Standard and multikey needle retrieval
+was smaller than for the fixed 5090 NVFP4 reference. This compares next-token
+prediction loss, not answer quality or speed against another GPU.
+Standard and multikey needle retrieval
 passed through 240K; multikey also passed at 260K. Test conditions and limitations
 are in `docs/performance.md`.
 
 ## Build
 
+On Ubuntu 24.04, after installing the supported ROCm 10 toolchain:
+
+```sh
+sudo apt-get install build-essential cmake ninja-build git patch pkg-config python3 curl \
+  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+  libcurl4-openssl-dev libzstd-dev
+
+git clone https://github.com/jmander11/ninfer-amd-r9700.git
+cd ninfer-amd-r9700
+```
+
 Requires 64-bit Linux, the R9700, ROCm 10 with `gfx1201` and rocprofiler SDK ROCTx,
-CMake ≥3.28, Ninja, C++20, pkg-config, and FFmpeg, libcurl and zstd development
+CMake ≥3.28, Ninja, C++20, Python 3, pkg-config, and FFmpeg, libcurl and zstd development
 libraries. CMake fetches a pinned XGrammar dependency. Python conversion/reference
 tools additionally need Python 3.11, PyTorch and safetensors.
 
@@ -118,7 +135,9 @@ cmake --build build-r9700 --parallel 8 \
 ```
 
 Only `gfx1201` is supported; Ninja compile/link concurrency is capped at 8 jobs.
-Model artifacts are supplied separately. Conversion and binding: `docs/maintainer/qwen3.8-27b-artifact.md`.
+Model artifacts are supplied separately. **A public model download is not yet
+available.** The commands below require the selected converted artifact;
+`docs/model-artifact.md` records its identity, checksum and conversion references.
 
 ## Run
 
@@ -143,13 +162,27 @@ top-p/top-k/min-p and penalties; `--no-p-less-sampling` enables those controls.
 Use `--greedy` for argmax. Vision and speculation settings are fixed at startup.
 Each executable's `--help` lists all options.
 
-For Compose, copy `.env.example` to `.env`, keep `COMPOSE_BAKE=false`, and set the
-explicit model, ROCm and self-contained Python paths. Create the cache directory
-and external `proxy` network as described in `docs/containers.md`, then run
-`docker compose up -d --wait`. Startup builds the image and reuses cached objects.
-Defaults: C6, adaptive DFlash up to K7, temperature 1.5, 262,144-token context,
-8 GiB RAM prefix cache and 25 GiB persistent disk cache. The server is reachable
-on the `proxy` network at `ninfer-r9700:8080`; no host port is published.
+To check the server from a second terminal:
+
+```sh
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"Say hello."}],"max_tokens":128}'
+```
+
+For a localhost container, copy `.env.example` to `.env` and set your model,
+ROCm and self-contained Python paths, then:
+
+```sh
+mkdir -p .cache/ninfer
+docker compose -f compose.yaml -f compose.local.yaml up -d --wait
+```
+
+This publishes `127.0.0.1:8080` and needs Compose ≥2.24.4. Defaults: C6,
+adaptive DFlash up to K7, temperature 1.5, 262,144-token context, 8 GiB RAM
+prefix cache and 25 GiB persistent disk cache. `docs/containers.md` covers
+prerequisites and the separate external-proxy deployment.
 
 ## Documentation
 

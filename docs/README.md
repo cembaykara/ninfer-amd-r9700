@@ -7,6 +7,8 @@ product commands. Executable `--help` output is the exact authority for option s
 
 | Document | Purpose |
 |---|---|
+| `model-artifact.md` | selected artifact, availability and checksum |
+| `acknowledgements.md` | upstream credits, model sources and licenses |
 | `cli.md` | text, structured messages, media, sampling, MTP/DFlash2, context, and memory |
 | `serving.md` | OpenAI/Anthropic HTTP schemas, streaming, state, concurrency, and logging |
 | `performance.md` | R9700 measurement policy and admitted results |
@@ -36,9 +38,11 @@ Artifact and target ownership:
   final recipe-selection contract.
 - `maintainer/qwen3.8-27b-artifact.md`: sole target inventory, conversion, and binding contract.
 
-## Live execution state
+## Maintainer workflow and evidence
 
-- `../plans/r9700-autonomous-todos.md`: live work ledger.
+- `maintainer/local-development.md`: private host paths, GPU coordination and test prerequisites.
+
+- `../plans/r9700-autonomous-todos.md`: maintainer work ledger, separate from installation.
 - `maintainer/upstream-sync.md`: upstream baseline and port dispositions.
 - `maintainer/merging-to-master.md`: full AMD promotion gates for experimental-to-master merges.
 - `maintainer/code-quality.md`: static gates and the gfx1201 device checks (memcheck, initcheck,

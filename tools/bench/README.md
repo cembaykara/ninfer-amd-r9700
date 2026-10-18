@@ -23,7 +23,7 @@ boundaries. Reports contain the actual prompt and output lengths, input messages
 responses, draft acceptance, server startup metadata, and each measured rate.
 
 ```bash
-flock --exclusive /path/to/local/.ninfer-coordination/gpu.lock \
+flock --exclusive "$NINFER_GPU_LOCK" \
   env DEBUG_HIP_GRAPH_CLASSIC_PATH=0 ROC_ENABLE_LARGE_BAR=0 ROC_SKIP_KERNEL_ARG_COPY=0 \
       HSA_DISABLE_FRAGMENT_ALLOCATOR=1 DEBUG_HIP_GRAPH_BATCH_SIZE=16384 \
   /path/to/python3.11 tools/bench/run_readme_workloads.py \
@@ -50,6 +50,8 @@ wall time, including host scheduling between rounds. It excludes prefill, startu
 and intervals where some lanes have finished. Missing full-batch intervals fail
 the run rather than substitute an end-to-end or per-request rate. C6 is aggregate;
 divide by six for the average rate per active request in those intervals.
+
+The published 2026-10-17 summary is `../../bench/results/readme-workloads-20261017.json`.
 
 `summary.json` and `summary.md` contain the results; per-cell JSON and server JSONL
 retain inputs and timing evidence under `--output`. Keep generated reports under
@@ -405,8 +407,8 @@ prerequisites to rerun; the completed shared chunk authority remains unchanged.
 ```bash
 # Run from the repository root, with exclusive GPU ownership. Never resume dated outputs.
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH=/path/to/local/ninfer/out/numerical-reference-venv/lib/python3.11/site-packages
-/home/maintainer/.local/bin/python3.11 - <<'PY'
+export PYTHONPATH=/path/to/reference-environment/lib/python3.11/site-packages
+python3.11 - <<'PY'
 from pathlib import Path
 import subprocess, sys
 from tools.bench.validate_low_context_prefill import resolve_selected_dense_route
@@ -437,16 +439,16 @@ PY
 
 # Below-target throughput remains diagnostic, not an admission failure; malformed evidence fails.
 export NINFER_LOW_CONTEXT_EVALUATION=profiles/bench/r9700-selected-low-context-20260921-evaluation.json
-NINFER_SELECTED_ARTIFACT=$(/home/maintainer/.local/bin/python3.11 -c 'import json,os; print(json.load(open(os.environ["NINFER_LOW_CONTEXT_EVALUATION"]))["artifact"]["path"])')
-NINFER_SELECTED_WEIGHTS_ID=$(/home/maintainer/.local/bin/python3.11 -c 'import json,os; print(json.load(open(os.environ["NINFER_LOW_CONTEXT_EVALUATION"]))["artifact"]["weights_id"])')
-NINFER_SELECTED_GROUP=$(/home/maintainer/.local/bin/python3.11 -c 'import json,os; print(json.load(open(os.environ["NINFER_LOW_CONTEXT_EVALUATION"]))["expected_kv_value_group"])')
-NINFER_SELECTED_PREFILL_CHUNK=$(/home/maintainer/.local/bin/python3.11 -c 'import json,os; print(json.load(open(os.environ["NINFER_LOW_CONTEXT_EVALUATION"]))["selected_prefill_chunk"])')
-NINFER_SELECTED_DENSE_BENCH=$(/home/maintainer/.local/bin/python3.11 -c 'import json,os; print(json.load(open(os.environ["NINFER_LOW_CONTEXT_EVALUATION"]))["bench"]["path"])')
+NINFER_SELECTED_ARTIFACT=$(python3.11 -c 'import json,os; print(json.load(open(os.environ["NINFER_LOW_CONTEXT_EVALUATION"]))["artifact"]["path"])')
+NINFER_SELECTED_WEIGHTS_ID=$(python3.11 -c 'import json,os; print(json.load(open(os.environ["NINFER_LOW_CONTEXT_EVALUATION"]))["artifact"]["weights_id"])')
+NINFER_SELECTED_GROUP=$(python3.11 -c 'import json,os; print(json.load(open(os.environ["NINFER_LOW_CONTEXT_EVALUATION"]))["expected_kv_value_group"])')
+NINFER_SELECTED_PREFILL_CHUNK=$(python3.11 -c 'import json,os; print(json.load(open(os.environ["NINFER_LOW_CONTEXT_EVALUATION"]))["selected_prefill_chunk"])')
+NINFER_SELECTED_DENSE_BENCH=$(python3.11 -c 'import json,os; print(json.load(open(os.environ["NINFER_LOW_CONTEXT_EVALUATION"]))["bench"]["path"])')
 
 # If P2048 remains an unresolved selected-route bottleneck, prepare its one-repetition selected-
 # region trace from the exact validated ladder/evaluation/terminal-selection authorities. This
 # does not rerun the 3/1 timing authority or require that the explicit throughput gate passed.
-/home/maintainer/.local/bin/python3.11 -m tools.bench.prepare_whole_profile \
+python3.11 -m tools.bench.prepare_whole_profile \
   --low-context-manifest profiles/bench/r9700-selected-low-context-20260921/manifest.json \
   --low-context-evaluation profiles/bench/r9700-selected-low-context-20260921-evaluation.json \
   --terminal-selection profiles/bench/r9700-terminal-base-phase-sum-20260921/select/result.json \
@@ -461,7 +463,7 @@ NINFER_SELECTED_DENSE_BENCH=$(/home/maintainer/.local/bin/python3.11 -c 'import 
 # plan. Replace the regex with the exact trace-observed family or bounded alternation. Its generated
 # script requires auto initially, temporarily selects profile_standard, and restores auto with an
 # EXIT trap; its duration is attribution-only.
-/home/maintainer/.local/bin/python3.11 -m tools.bench.prepare_whole_profile \
+python3.11 -m tools.bench.prepare_whole_profile \
   --low-context-manifest profiles/bench/r9700-selected-low-context-20260921/manifest.json \
   --low-context-evaluation profiles/bench/r9700-selected-low-context-20260921-evaluation.json \
   --terminal-selection profiles/bench/r9700-terminal-base-phase-sum-20260921/select/result.json \
@@ -722,12 +724,13 @@ run_mixed_selection_pair 32 build-r9700-dense-selection-g32 \
 # Configuration/host-planner checks do not replace actual companion loading and parity gates.
 # Conversion is explicitly CPU-only Python 3.11; provide a local dependency path if necessary.
 # Output is a new recipe-separated namespace. Preparation does not materialize or launch a GPU run.
-/home/maintainer/.local/bin/python3.11 -m tools.bench.prepare_selected_dflash prepare \
+python3.11 -m tools.bench.prepare_selected_dflash prepare \
   --selection /absolute/path/to/terminal-base.json \
   --bench /absolute/path/to/matching-phase-sum-build/bench/ninfer_bench \
   --planner /absolute/path/to/matching-phase-sum-build/src/ninfer_r9700_runtime_planner_qual \
-  --conversion-python /home/maintainer/.local/bin/python3.11 \
+  --conversion-python /absolute/path/to/python3.11 \
   --conversion-pythonpath /absolute/path/to/cpu-python311/site-packages \
+  --source /absolute/path/to/qwen3.8-27b-dflash2 \
   --out /absolute/path/to/new-dflash-campaign
 # Inspect the generated commands.sh before explicit execution. It creates canonical Q4,
 # source-MSE Q4, and source-MSE W8 companions, each preserving base payloads, optimized
@@ -792,7 +795,7 @@ must not be described as ordinary decode performance.
 
 ```bash
 OUT=profiles/bench/ordinary-none-xattention-s16-tau900-all-q4-g16-c1-8k-20260904
-test "$(tr -d '\n' </sys/class/drm/card2/device/power_dpm_force_performance_level)" = auto
+test "$(tr -d '\n' <"/sys/bus/pci/devices/$NINFER_R9700_PCI_BUS_ID/power_dpm_force_performance_level")" = auto
 test ! -e "$OUT"
 python3 tools/bench/run_ninfer_bench_matrix.py --preset ordinary-diagnostic \
   --bench build-r9700-xattention-model-s16-tau900/bench/ninfer_bench --no-build \
@@ -1144,7 +1147,7 @@ workload (the decode build command compiles a separate attribution-only binary):
 
 ```bash
 NINFER_PROFILE_SELECTION=profiles/bench/r9700-terminal-base-phase-sum-20260921/select/result.json
-NINFER_PROFILE_PYTHON=/home/maintainer/.local/bin/python3.11
+NINFER_PROFILE_PYTHON=python3.11
 "$NINFER_PROFILE_PYTHON" -m tools.bench.prepare_selected_static_audit \
   --selection "$NINFER_PROFILE_SELECTION" \
   --out profiles/bench/r9700-selected-hardware-static-20260921.json
@@ -1164,7 +1167,7 @@ mkdir profiles/rocprof/r9700-selected-decode-profile-build-20260921
 Prepare the selected C1 8K/32K whole traces from their measured ordinary matrix (no GPU launch):
 
 ```bash
-/home/maintainer/.local/bin/python3.11 - <<'PY'
+python3.11 - <<'PY'
 import json
 from pathlib import Path
 from tools.bench.verify_selected_hardware_use import selected_route
@@ -1346,11 +1349,11 @@ proposal-state and generated-quality gates. Winning every per-C frontier is not 
 Mixing per-C recipes/widths or selecting a narrower supported concurrency contract is forbidden.
 
 ```sh
-/home/maintainer/.local/bin/python3.11 -m tools.bench.assemble_dflash_selection admit \
+python3.11 -m tools.bench.assemble_dflash_selection admit \
   --evaluation /absolute/path/to/schema-v5-dflash-evaluation.json \
   --recipe source-mse-w8g32 --draft-tokens 4 --verify-width 5 \
   --out /absolute/path/to/single-resident-admission.json
-/home/maintainer/.local/bin/python3.11 -m tools.bench.assemble_dflash_selection validate-admission \
+python3.11 -m tools.bench.assemble_dflash_selection validate-admission \
   --admission /absolute/path/to/single-resident-admission.json
 ```
 
@@ -1538,8 +1541,8 @@ prefixes cannot turn later cells into suffix prefills.
 # If Ninja would do so, stop and establish a separately bound selected-build successor first.
 # Preparation requires the terminal schema-v7 authority and a fresh output directory.
 PYTHONDONTWRITEBYTECODE=1 \
-PYTHONPATH=/path/to/local/ninfer/out/numerical-reference-venv/lib/python3.11/site-packages \
-/home/maintainer/.local/bin/python3.11 -m tools.bench.prepare_selected_niah \
+PYTHONPATH=/path/to/reference-environment/lib/python3.11/site-packages \
+python3.11 -m tools.bench.prepare_selected_niah \
   --selection profiles/bench/r9700-terminal-base-phase-sum-20260921/select/result.json \
   --out profiles/bench/r9700-selected-niah-20260921
 
@@ -1568,3 +1571,7 @@ ladders and the complete 6-length x 5-position matrix are optional broader cover
 XAttention admission. Run the full matrix as a post-change regression after a production attention
 change and preserve the per-cell outputs with the corresponding hardware, artifact, and
 server-build provenance.
+
+Benchmark HTTP credentials come only from explicit CLI options or the documented
+`NINFER_API_KEY` / `LLAMA_CPP_LOCAL_API_KEY` environment variables. The runners do
+not search personal Docker directories or parent-directory `.env` files.

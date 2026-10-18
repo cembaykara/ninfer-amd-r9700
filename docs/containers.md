@@ -7,8 +7,8 @@ temperature **1.5**, **8 GiB pinned RAM prefix cache**, **25 GiB disk cache**, c
 2048, C6/adaptive K up to 7 and a 262144-token context limit. The cache options use MiB:
 `NINFER_RAM_CACHE_MIB=8192` and `NINFER_DISK_CACHE_MIB=25600`. Cache sizes are
 capacities, not upfront disk allocations. A bind mount stores disk prefixes under
-`/path/to/local/cache_r9700/prefix`, beside (not shared with) the 5090
-cache. Override its parent with `NINFER_DISK_CACHE_DIR`. This host directory
+`./.cache/ninfer/prefix` by default. Set `NINFER_DISK_CACHE_DIR` to choose another
+host cache directory; use a separate directory for each model/server deployment. This host directory
 survives container replacement and `docker compose down --volumes`.
 Disk cache is prefix reuse, not active-context offload. RAM contents do not survive
 restart; durable disk entries can be restored for the same model fingerprint.
@@ -39,14 +39,52 @@ Automatic sizing also reads the matching PCI device's amdgpu VRAM counters under
 uses the smaller of physical and HIP availability. The counters must remain readable inside
 the container so the external 64-MiB headroom is backed by physical availability.
 
+### First run on localhost
+
+Install Docker Engine with Buildx and Compose ≥2.24.4. Supply the ROCm 10 tree,
+a self-contained Python 3.11 distribution and the selected `.ninfer` artifact
+(see `model-artifact.md`). `.env.example` contains paths to edit, not downloads.
+A system Python virtual environment is not a self-contained distribution.
+
 ```sh
 cp .env.example .env
-# Edit the explicit model, ROCm and self-contained Python paths for your machine.
-mkdir -p /path/to/local/cache_r9700
-docker compose config --quiet
+# Edit NINFER_PYTHON_CONTEXT, NINFER_ROCM_CONTEXT and NINFER_MODELS_DIR.
+# Set NINFER_MODEL relative to NINFER_MODELS_DIR.
+mkdir -p .cache/ninfer
+# If you changed NINFER_DISK_CACHE_DIR, create that directory instead.
+docker compose -f compose.yaml -f compose.local.yaml config --quiet
+docker compose -f compose.yaml -f compose.local.yaml up -d --wait
+curl http://127.0.0.1:8080/health
+```
+
+`compose.local.yaml` replaces the service's proxy network with a private default
+network and publishes only `127.0.0.1:8080`. Use the same two `-f` arguments for
+later `logs`, `stop`, `down` and update commands. No external network is needed.
+The native README HTTP example works against this address.
+
+Local release-prep validation (2026-10-17): both Compose configurations resolve
+successfully with edited paths. An isolated source checkout built all four README
+targets from scratch on Ubuntu 24.04 with the existing ROCm 10 prerequisites.
+The fresh CLI generated with default DFlash, and the fresh native server passed
+`/health` and the README Chat Completions request using the selected local artifact.
+This checks the native build/run instructions and Compose configuration; it does
+not establish a fresh container-image build or a clean-machine ROCm installation.
+
+### Existing reverse-proxy deployment
+
+The base `compose.yaml` preserves the maintainer deployment: no host port,
+external network `proxy`, service alias `ninfer-r9700`. Create the network if
+needed, then use the base file alone:
+
+```sh
+docker network inspect proxy >/dev/null 2>&1 || docker network create proxy
 docker compose up -d --wait
 docker compose logs -f server
 ```
+
+Other containers on that network use `http://ninfer-r9700:8080/v1` for OpenAI
+clients. No API key is configured by default; joining the network does not create
+a public reverse-proxy route.
 
 Buildx is required to build, not to run an already-built image. It is Docker's
 BuildKit frontend: it supplies build caching, multi-stage builds and the named
@@ -93,12 +131,6 @@ docker compose up -d --wait
 The compile-job default is 8, with no builder memory limit. The builder CPU quota
 allows 14 logical CPUs; it is not a Linux load-average cap. Compose's memory limit
 applies only to the running server. Reuse the builder for subsequent builds.
-
-The service listens on container port 8080 with no API key and joins the existing
-external Docker network `proxy`. It publishes no host port. Other containers on
-that network reach it at `ninfer-r9700:8080` (use `/v1` for OpenAI clients).
-Joining the network does not create a public reverse-proxy route.
-The `proxy` network must already exist before creating the service.
 
 `.env` can override model path, C1..8, maximum draft count and cache
 capacities. Defaults are C6 and DFlash adaptive K up to 7, the recommended AMD
@@ -190,8 +222,8 @@ The runtime image contains the three applications, not the benchmark or test too
 
 There is a registered CTest suite for host contracts and physical GPU Ops/runtime
 qualifiers, plus separate real-model and live-HTTP checks. No single command proves
-every model/context/precision combination. Run GPU tests only after stopping the
-server and any other GPU owner; never overlap them with builds or model conversion.
+every model/context/precision combination. Run GPU tests only after coordinating with any resident GPU owner. On the shared
+maintainer host, hold the GPU lock specified in `AGENTS.md`; builds need no GPU lock.
 
 ```sh
 docker compose stop server
@@ -214,32 +246,11 @@ temperature override, checks generated output, requires both cache tiers enabled
 reports per-request copy times plus the scheduler, device-KV and tier snapshot. It does not prove disk restoration; the separate
 restart qualifier explicitly requires a disk hit and cold-output parity.
 
-Validation on2026-09-24: rebuilt native gfx1201 suite86/86 passed, including physical
-GPU tests. Corrected stale qualifier expectations for temperature2.0, K<=5/widthK+1,
-W4 WMMA graph routing and reused selector scratch; engine arithmetic was unchanged.
-The selected17.00GB DFlash artifact served all four HTTP smoke routes using the
-then-current Compose defaults (4 GiB RAM / 32 GiB disk; only host port/cache path differed). Request logs confirm
-temperature1.5, RAM restoration and a12-token disk restore after clean restart.
-The separate ordinary-greedy Engine qualifier passed cancellation/RAM continuation
-and disk restart with38 reused tokens/16 output tokens exact to cold execution.
-Local native request logs are under
-`profiles/bench/r9700-compose-validation-20260924/`.
-Compose configuration and actual image/runtime validation also pass after installing
-Buildx. `local/ninfer-r9700:compose` was built from this checkout with the local
-ROCm/Python contexts and a24GiB/no-swap builder. All three apps compiled; the
-Compose server became healthy, passed Chat/Responses/Anthropic/SSE, logged
-temperature1.5, restored RAM prefixes and restored12 prompt tokens from disk after
-restart (22 generated tokens). The image and stopped service
-are retained; `docker compose up -d --no-build --pull never` starts an existing image without building.
-Generated profiler dumps and local qualifier binaries are excluded from build context.
-
-The final Compose mount was separately verified as a writable bind from
-`/path/to/local/cache_r9700` to `/cache`. All four HTTP smoke routes and
-RAM reuse pass; after restart, the request restores12 prompt tokens from
-`host_disk` and generates21 tokens. An observed disk save was84ms. These are
-functional observations, not a controlled storage benchmark. The earlier named
-volume on Docker's ZFS data root had2.8–3.8s writes; that unused volume is retained,
-not migrated or deleted. No 5090 cache or Docker data-root settings were changed.
+Earlier native and container integration checks exercised Chat, Responses,
+Anthropic and SSE, RAM prefix reuse and SSD restoration after restart. Historical
+local reports are under `profiles/bench/r9700-compose-validation-20260924/`;
+they used older cache sizes and do not establish current throughput. Current
+performance measurements are in `performance.md`.
 
 The native runner uses an already configured `build-r9700` with `BUILD_TESTING=ON`;
 `NINFER_BUILD_DIR` changes that explicit path. `--builder` selects the dedicated

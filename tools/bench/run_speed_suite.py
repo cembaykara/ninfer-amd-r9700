@@ -58,16 +58,6 @@ def load_key(api_key: str | None) -> str:
     for name in ("NINFER_API_KEY", "LLAMA_CPP_LOCAL_API_KEY"):
         if os.environ.get(name):
             return os.environ[name]
-    for env in (
-        Path("/home/maintainer/docker/.env"),
-        ROOT.parent.parent / ".env",  # <workspace>/.env when repo is <workspace>/ninfer/repo
-        Path.cwd() / ".env",
-    ):
-        if env.exists():
-            for line in env.read_text().splitlines():
-                for prefix in ("LLAMA_CPP_REMOTE_API_KEY=", "LLAMA_CPP_LOCAL_API_KEY="):
-                    if line.startswith(prefix):
-                        return line.split("=", 1)[1].strip().strip('"')
     return ""
 
 
@@ -297,7 +287,9 @@ def main() -> int:
         "--model", default=None, help="served model id (default: first from /v1/models)"
     )
     ap.add_argument(
-        "--api-key", default=None, help="override bearer key (else NINFER_API_KEY/.env)"
+        "--api-key",
+        default=None,
+        help="override bearer key (else NINFER_API_KEY or LLAMA_CPP_LOCAL_API_KEY)",
     )
     ap.add_argument(
         "--cases", type=Path, default=ROOT / "tools" / "bench" / "speed_suite_cases.json"

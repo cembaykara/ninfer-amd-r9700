@@ -295,9 +295,9 @@ cmake -S . -B build-r9700-xattention-model-s16-tau900 -G Ninja \
 cmake --build build-r9700-xattention-model-s16-tau900 --parallel 8 \
   --target ninfer-ppl ninfer-serve ninfer_bench ninfer_r9700_runtime_planner_qual
 
-/path/to/local/.venv-ninfer-r9700/bin/python tools/ppl/run.py \
+python3.11 tools/ppl/run.py \
   --bf16-reference-ppl-bin tools/reference/qwen3_8_27b_bf16/ppl.py \
-  --bf16-reference-weights /path/to/local/models/qwen3.8-27b-bf16 \
+  --bf16-reference-weights /path/to/models/qwen3.8-27b-bf16 \
   --g16-ppl-bin build-r9700-xattention-model-s16-tau900/apps/ninfer-ppl \
   --g16-weights "$NINFER_XATTENTION_ARTIFACT" \
   --profiles bf16-reference,r9700-g16 \

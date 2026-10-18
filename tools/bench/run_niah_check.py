@@ -496,16 +496,6 @@ def load_key(api_key: str | None) -> str:
     for name in ("NINFER_API_KEY", "LLAMA_CPP_LOCAL_API_KEY"):
         if os.environ.get(name):
             return os.environ[name]
-    for env in (
-        Path("/home/maintainer/docker/.env"),
-        ROOT.parent.parent / ".env",
-        Path.cwd() / ".env",
-    ):
-        if env.exists():
-            for line in env.read_text().splitlines():
-                for prefix in ("LLAMA_CPP_REMOTE_API_KEY=", "LLAMA_CPP_LOCAL_API_KEY="):
-                    if line.startswith(prefix):
-                        return line.split("=", 1)[1].strip().strip('"')
     return ""
 
 

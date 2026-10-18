@@ -167,7 +167,7 @@ four-role baseline. Its sole initial companion is
 matrices, unchanged BF16 selector codebooks/non-matrix state, and every base payload copied
 byte-exact. The converter admits no source-MSE variant for this base before acceptance evidence.
 Its complete 1,190-object plan projects to an 18,874,746,880-byte tensor arena; source remains
-the explicit local BF16 checkpoint `/path/to/local/models/qwen3.8-27b-dflash2`.
+the explicit local BF16 checkpoint `/path/to/models/qwen3.8-27b-dflash2`.
 The existing selective base and its conversion receipt are preserved.
 
 Nine explicit evaluation identities append the source DFlash2 checkpoint to one of three
@@ -239,9 +239,9 @@ before any output is opened. `--matrix-recipe` accepts `canonical-q4g64` (defaul
 `source-mse-q4g64`, or `source-mse-w8g32` in preflight, conversion, and report recovery:
 
 ```text
-python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4g64-n16k16-eval.ninfer --dflash-model /path/to/local/models/qwen3.8-27b-dflash2 --preflight-only
-python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4-w8-mse-n16k16-eval.ninfer --dflash-model /path/to/local/models/qwen3.8-27b-dflash2 --preflight-only
-python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-eval.ninfer --dflash-model /path/to/local/models/qwen3.8-27b-dflash2 --preflight-only
+python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4g64-n16k16-eval.ninfer --dflash-model /path/to/models/qwen3.8-27b-dflash2 --preflight-only
+python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4-w8-mse-n16k16-eval.ninfer --dflash-model /path/to/models/qwen3.8-27b-dflash2 --preflight-only
+python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-eval.ninfer --dflash-model /path/to/models/qwen3.8-27b-dflash2 --preflight-only
 ```
 
 Remove `--preflight-only`, add an explicit `--out` and Torch `--device`, and run the conversion.
@@ -274,9 +274,9 @@ materialized from the exact N16 base for matched recipe-independent DFlash evalu
 an evaluation control and does not anticipate schema-v7 base or recipe selection.
 
 ```text
-python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4g64-n16k16-eval.ninfer --dflash-model /path/to/local/models/qwen3.8-27b-dflash2 --out out/qwen3.8-27b-r9700-q4g64-n16k16-dflash2-q4-eval.ninfer --device cuda
-python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4-w8-mse-n16k16-eval.ninfer --dflash-model /path/to/local/models/qwen3.8-27b-dflash2 --out out/qwen3.8-27b-r9700-q4-w8-mse-n16k16-dflash2-q4-eval.ninfer --device cuda
-python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-eval.ninfer --dflash-model /path/to/local/models/qwen3.8-27b-dflash2 --out out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-dflash2-q4-eval.ninfer --device cuda
+python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4g64-n16k16-eval.ninfer --dflash-model /path/to/models/qwen3.8-27b-dflash2 --out out/qwen3.8-27b-r9700-q4g64-n16k16-dflash2-q4-eval.ninfer --device cuda
+python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4-w8-mse-n16k16-eval.ninfer --dflash-model /path/to/models/qwen3.8-27b-dflash2 --out out/qwen3.8-27b-r9700-q4-w8-mse-n16k16-dflash2-q4-eval.ninfer --device cuda
+python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-eval.ninfer --dflash-model /path/to/models/qwen3.8-27b-dflash2 --out out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-dflash2-q4-eval.ninfer --device cuda
 ```
 
 The four-role control is 22,763,026,944 bytes with SHA-256
@@ -295,7 +295,7 @@ object plan, byte size, and SHA-256, updates that receipt, and atomically publis
 report is published, resume only report finalization instead of reconverting:
 
 ```text
-python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base BASE.ninfer --dflash-model /path/to/local/models/qwen3.8-27b-dflash2 --out COMPLETED.ninfer --finalize-report
+python3 -m tools.convert.qwen3_8_27b_r9700.convert_dflash2_q4 --base BASE.ninfer --dflash-model /path/to/models/qwen3.8-27b-dflash2 --out COMPLETED.ninfer --finalize-report
 ```
 
 When no pending receipt survives, pass the independently retained output digest with

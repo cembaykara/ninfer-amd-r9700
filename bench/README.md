@@ -94,3 +94,16 @@ timings are discarded and never copied into performance fields. The speed rankin
 complete exact-parity rows. The separate non-dominated list keeps speed, acceptance, fallback,
 and repair tradeoffs intact and supplies the K candidates for matched C=1 and C=4 follow-up;
 there is intentionally no single blended score.
+
+## Published workload results
+
+`results/readme-workloads-20261017.json` contains the admitted C1/C6 results shown
+in the README, including sample variation, draft acceptance and measurement
+settings. Reproduce them with `../tools/bench/run_readme_workloads.py`; see
+`../tools/bench/README.md` for the command and dependencies. C6 is aggregate
+decode throughput across six active requests, not the speed of one answer.
+
+Historical raw profiles are no longer tracked in the current tree.
+`results/historical-evidence.json` records their source commit, inventory and local
+archive checksum. Restore from the private archive when a historical analysis needs them;
+new benchmark outputs should remain under ignored `profiles/`.

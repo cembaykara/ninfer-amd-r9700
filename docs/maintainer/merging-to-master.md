@@ -18,7 +18,7 @@ verification rules in AGENTS.md; the full suite applies specifically to promotio
 Run the native host workflow with an explicit maintainer-provided production artifact:
 
 ```bash
-scripts/master-gates.sh /path/to/local/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer
+scripts/master-gates.sh /path/to/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer
 ```
 
 | Gate | Required result |

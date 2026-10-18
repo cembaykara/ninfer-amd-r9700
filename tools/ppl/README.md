@@ -1,5 +1,13 @@
 # R9700 perplexity and Pareto-quality gate
 
+Source private host settings from `.ninfer-local.env` before GPU work, and hold
+`flock --exclusive "$NINFER_GPU_LOCK"` through all children. Checkpoint and Python
+paths are explicit CLI inputs. The historical selective-source runners require
+`--weights /path/to/bf16` and use the Python interpreter running the command.
+`compare_nvfp4 prepare` additionally requires `--nvidia-repo` and `--nvidia-model`;
+later stages use the model recorded in its manifest. See
+`../../docs/maintainer/local-development.md`.
+
 ## Exploratory dense/XAttention context comparison
 
 `tools/bench/context_ladder.py run --kind ppl` runs serial, matched-token prefill PPL
@@ -13,7 +21,7 @@ long-context quality evidence or extrapolate the retained4K5090 scores to longer
 ## Bounded NVFP4 comparison
 
 `compare_nvfp4.py` compares three identical 4096-token samples with the local
-`ninfer-reference` NVFP4 scorer, then measures AMD C1 P4096/G128 ordinary inference.
+the frozen NVIDIA checkout NVFP4 scorer, then measures AMD C1 P4096/G128 ordinary inference.
 It evaluates all-Q4 and mixed Q4/W8 with Q4 A4/A8, plus selective and four-role
 A8 implementations. This diagnostic comparison does not replace BF16-source
 production admission. See `docs/performance.md` for results and limitations.
@@ -143,7 +151,10 @@ candidate.
 After schema-v7 selects one evaluation winner, prepare its separate exact same-route token gate:
 
 ```bash
-/home/maintainer/.local/bin/python3.11 -m tools.ppl.prepare_selected_exact_token \
+python3.11 -m tools.ppl.prepare_selected_exact_token \
+  --bf16-source /path/to/models/qwen3.8-27b-bf16 \
+  --bf16-receipt /path/to/checkpoint-preflight.json \
+  --python /path/to/rocm-python3.11 \
   --selection profiles/bench/r9700-terminal-base-phase-sum-20260921/select/result.json \
   --out profiles/ppl/r9700-selected-exact-token-20260921
 ```
@@ -158,7 +169,7 @@ The FP8 context/reporting recovery bridges those roots relied on were retired wi
 (438f6a89), and a selection whose source provenance binds either bridge is rejected. Do not
 silently substitute the original panel scorer or rebuild a
 frozen root from this launcher. The launcher runs under the installed
-`/path/to/local/.venv-ninfer-r9700-py311/bin/python` with the ROCm library paths exported.
+`python3.11` with the ROCm library paths exported.
 It reuses the selected quality campaign's bound BF16 prefill reference and exact repeat proof,
 without rerunning the source model. The layer-major oracle uses identical chunk spans and
 `skip=half` scored positions under either schedule label; original prefill reports and sidecars
@@ -183,7 +194,11 @@ For the separate artifact-backed Python Vision versus source-BF16 finite/shape d
 prepare a fresh package after selection with:
 
 ```bash
-/home/maintainer/.local/bin/python3.11 -m tools.bench.prepare_selected_vision_diagnostic \
+python3.11 -m tools.bench.prepare_selected_vision_diagnostic \
+  --source /path/to/models/qwen3.8-27b-bf16 \
+  --source-receipt /path/to/checkpoint-preflight.json \
+  --frontend-python /path/to/frontend-python3.11 \
+  --gpu-python /path/to/rocm-python3.11 \
   --selection profiles/bench/r9700-terminal-base-phase-sum-20260921/select/result.json \
   --out profiles/bench/r9700-selected-vision-20260921
 ```
@@ -464,7 +479,7 @@ do not use a cross-chunk comparison as a reuse waiver.
 ```bash
 set -euo pipefail
 export LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/core-10.0/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
-export PATH=/path/to/local/.venv-ninfer-r9700/bin:${PATH}
+export PATH=/path/to/python-environment/bin:${PATH}
 if ! NINFER_SELECTED_PREFILL_CHUNK="$(python3 -c \
   'from pathlib import Path; from tools.bench.select_prefill_chunk import validate_selection_record; print(validate_selection_record(Path("profiles/bench/prefill-chunk-selection-20260904.json"))["selected_prefill_chunk"])')"; then
   echo "prefill-chunk selection validation failed" >&2
@@ -476,7 +491,7 @@ case "$NINFER_SELECTED_PREFILL_CHUNK" in
 esac
 
 for PPL_EXECUTABLE in \
-  /path/to/local/.venv-ninfer-r9700/bin/python \
+  python3.11 \
   build-r9700-dense-selection-g16/apps/ninfer-ppl \
   build-r9700-dense-selection-g32/apps/ninfer-ppl \
   build-r9700-xattention-model-s16-tau900/apps/ninfer-ppl \
@@ -490,7 +505,7 @@ for PPL_INPUT in \
   out/qwen3.8-27b-r9700-q4-w8-mse-n16k16-eval.ninfer; do
   [[ -f "$PPL_INPUT" ]]
 done
-[[ -d /path/to/local/models/qwen3.8-27b-bf16 ]]
+[[ -d /path/to/models/qwen3.8-27b-bf16 ]]
 
 # All-Q4 sparse and both mixed routes are always fresh. Dense all-Q4 is fresh only when the
 # selected chunk differs from the retained 4096-token authority. Check every candidate destination
@@ -525,9 +540,9 @@ else
   [[ ! -e "$NINFER_BF16_B" ]]
   [[ ! -e "$NINFER_BF16_REPEAT" ]]
   for NINFER_BF16_OUT in "$NINFER_BF16_A" "$NINFER_BF16_B"; do
-    /path/to/local/.venv-ninfer-r9700/bin/python tools/ppl/run.py \
+    python3.11 tools/ppl/run.py \
       --bf16-reference-ppl-bin tools/reference/qwen3_8_27b_bf16/ppl.py \
-      --bf16-reference-weights /path/to/local/models/qwen3.8-27b-bf16 \
+      --bf16-reference-weights /path/to/models/qwen3.8-27b-bf16 \
       --ids tools/ppl/corpus.ids --profiles bf16-reference \
       --schedule prefill --spec none --no-extras \
       --prefill-chunk "$NINFER_SELECTED_PREFILL_CHUNK" \
@@ -542,9 +557,9 @@ fi
 export ALL_Q4_DENSE_QUALITY
 
 if [[ "$NINFER_SELECTED_PREFILL_CHUNK" != 4096 ]]; then
-/path/to/local/.venv-ninfer-r9700/bin/python tools/ppl/run.py \
+python3.11 tools/ppl/run.py \
   --bf16-reference-ppl-bin tools/reference/qwen3_8_27b_bf16/ppl.py \
-  --bf16-reference-weights /path/to/local/models/qwen3.8-27b-bf16 \
+  --bf16-reference-weights /path/to/models/qwen3.8-27b-bf16 \
   --g16-ppl-bin build-r9700-dense-selection-g16/apps/ninfer-ppl \
   --g32-ppl-bin build-r9700-dense-selection-g32/apps/ninfer-ppl \
   --g16-weights out/qwen3.8-27b-r9700-q4g64-n16k16-eval.ninfer \
@@ -563,9 +578,9 @@ if [[ "$NINFER_SELECTED_PREFILL_CHUNK" != 4096 ]]; then
   --out profiles/ppl/xattention-dense-q4g64-post-challenger-20260904
 fi
 
-/path/to/local/.venv-ninfer-r9700/bin/python tools/ppl/run.py \
+python3.11 tools/ppl/run.py \
   --bf16-reference-ppl-bin tools/reference/qwen3_8_27b_bf16/ppl.py \
-  --bf16-reference-weights /path/to/local/models/qwen3.8-27b-bf16 \
+  --bf16-reference-weights /path/to/models/qwen3.8-27b-bf16 \
   --g16-ppl-bin build-r9700-xattention-model-s16-tau900/apps/ninfer-ppl \
   --g32-ppl-bin build-r9700-xattention-model-s16-tau900-g32/apps/ninfer-ppl \
   --g16-weights out/qwen3.8-27b-r9700-q4g64-n16k16-eval.ninfer \
@@ -587,9 +602,9 @@ fi
 # all-Q4 authority, so both route campaigns import those rows and score only the mixed candidates.
 run_mixed_xattention_ppl() {
   local route="$1" g16_bin="$2" g32_bin="$3" output="$4"
-  /path/to/local/.venv-ninfer-r9700/bin/python tools/ppl/run.py \
+  python3.11 tools/ppl/run.py \
     --bf16-reference-ppl-bin tools/reference/qwen3_8_27b_bf16/ppl.py \
-    --bf16-reference-weights /path/to/local/models/qwen3.8-27b-bf16 \
+    --bf16-reference-weights /path/to/models/qwen3.8-27b-bf16 \
     --g16-ppl-bin "$g16_bin" --g32-ppl-bin "$g32_bin" \
     --g16-weights out/qwen3.8-27b-r9700-q4-w8-mse-n16k16-eval.ninfer \
     --g32-weights out/qwen3.8-27b-r9700-q4-w8-mse-n16k16-eval.ninfer \
@@ -660,9 +675,9 @@ unchanged historical all-Q4 dense cells to the v3 authority without either score
 distinct output already exists and is immutable; a new rebase must name another unused output path:
 
 ```bash
-/path/to/local/.venv-ninfer-r9700/bin/python tools/ppl/run.py \
+python3.11 tools/ppl/run.py \
   --bf16-reference-ppl-bin tools/reference/qwen3_8_27b_bf16/ppl.py \
-  --bf16-reference-weights /path/to/local/models/qwen3.8-27b-bf16 \
+  --bf16-reference-weights /path/to/models/qwen3.8-27b-bf16 \
   --g16-ppl-bin build-r9700-xattention-ppl-dense-g16/apps/ninfer-ppl \
   --g32-ppl-bin build-r9700-xattention-ppl-dense-g32/apps/ninfer-ppl \
   --g16-weights out/qwen3.8-27b-r9700-q4g64-n16k16-eval.ninfer \
@@ -720,9 +735,9 @@ draft head is not executed):
 
 ```bash
 LD_LIBRARY_PATH=/opt/rocm/core-10.0/lib \
-/path/to/local/.venv-ninfer-r9700/bin/python \
+python3.11 \
   tools/ppl/q4_group_source_diagnostic.py \
-  --weights /path/to/local/models/qwen3.8-27b-bf16 \
+  --weights /path/to/models/qwen3.8-27b-bf16 \
   --ids tools/ppl/corpus.ids --group 128 --tokens 8192 --device 0 \
   --preflight-only \
   --out profiles/bench/r9700-q4g128-source-ppl-preflight-20260904.json
@@ -733,16 +748,16 @@ compare them with the retained exact v3 BF16 cell:
 
 ```bash
 LD_LIBRARY_PATH=/opt/rocm/core-10.0/lib \
-/path/to/local/.venv-ninfer-r9700/bin/python \
+python3.11 \
   tools/ppl/q4_group_source_diagnostic.py \
-  --weights /path/to/local/models/qwen3.8-27b-bf16 \
+  --weights /path/to/models/qwen3.8-27b-bf16 \
   --ids tools/ppl/corpus.ids --group 64 --tokens 8192 --device 0 \
   --out profiles/ppl/q4-group-source-8k-20260904/q4g64.json
 
 LD_LIBRARY_PATH=/opt/rocm/core-10.0/lib \
-/path/to/local/.venv-ninfer-r9700/bin/python \
+python3.11 \
   tools/ppl/q4_group_source_diagnostic.py \
-  --weights /path/to/local/models/qwen3.8-27b-bf16 \
+  --weights /path/to/models/qwen3.8-27b-bf16 \
   --ids tools/ppl/corpus.ids --group 128 --tokens 8192 --device 0 \
   --out profiles/ppl/q4-group-source-8k-20260904/q4g128.json
 
@@ -777,14 +792,14 @@ retained deterministic BF16 authority:
 ```bash
 mkdir -p profiles/ppl/fp8-hybrid-source-8k-20260904
 LD_LIBRARY_PATH=/opt/rocm/core-10.0/lib \
-/path/to/local/.venv-ninfer-r9700/bin/python \
+python3.11 \
   tools/ppl/fp8_hybrid_source_diagnostic.py \
-  --weights /path/to/local/models/qwen3.8-27b-bf16 \
+  --weights /path/to/models/qwen3.8-27b-bf16 \
   --ids tools/ppl/corpus.ids --device 0 \
   --out profiles/ppl/fp8-hybrid-source-8k-20260904/hybrid.json
 
 LD_LIBRARY_PATH=/opt/rocm/core-10.0/lib \
-/path/to/local/.venv-ninfer-r9700/bin/python \
+python3.11 \
   tools/ppl/compare_fp8_hybrid_source.py \
   --hybrid profiles/ppl/fp8-hybrid-source-8k-20260904/hybrid.json \
   --bf16 profiles/ppl/bf16-reference-deterministic-pv-gdn-v3-a-20260904/8192.prefill.bf16-reference.json \
@@ -804,8 +819,8 @@ NLL, newly severe positions, and diagnostic greedy-token flips from the aligned 
 
 ```bash
 LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/core-10.0/lib \
-/path/to/local/.venv-ninfer-r9700/bin/python tools/ppl/run.py \
-  --bf16-reference-weights /path/to/local/models/qwen3.8-27b-bf16 \
+python3.11 tools/ppl/run.py \
+  --bf16-reference-weights /path/to/models/qwen3.8-27b-bf16 \
   --bf16-reference-ppl-bin tools/reference/qwen3_8_27b_bf16/ppl.py \
   --g16-weights out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-eval.ninfer \
   --g16-ppl-bin build-r9700-dense-selection-g16/apps/ninfer-ppl \
@@ -827,7 +842,7 @@ the position-aligned I32 argmax comparison rather than trusting the campaign's d
 
 ```bash
 LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/core-10.0/lib \
-/path/to/local/.venv-ninfer-r9700/bin/python \
+python3.11 \
   tools/ppl/validate_fp8_hybrid_greedy.py \
   --campaign profiles/ppl/fp8-hybrid-product-8k-20260904/results.json \
   --artifact out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-eval.ninfer \
@@ -845,7 +860,7 @@ implementation differences; these effects cannot be separated further from final
 
 ```bash
 LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/core-10.0/lib \
-/path/to/local/.venv-ninfer-r9700/bin/python \
+python3.11 \
   tools/ppl/compare_fp8_hybrid_execution.py \
   --source-codec profiles/ppl/fp8-hybrid-source-8k-20260904/hybrid.json \
   --product-campaign profiles/ppl/fp8-hybrid-product-8k-20260904/results.json \
@@ -862,8 +877,8 @@ and gate:
 
 ```bash
 LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/core-10.0/lib \
-/path/to/local/.venv-ninfer-r9700/bin/python tools/ppl/run.py \
-  --bf16-reference-weights /path/to/local/models/qwen3.8-27b-bf16 \
+python3.11 tools/ppl/run.py \
+  --bf16-reference-weights /path/to/models/qwen3.8-27b-bf16 \
   --bf16-reference-ppl-bin tools/reference/qwen3_8_27b_bf16/ppl.py \
   --g16-weights out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-eval.ninfer \
   --g16-ppl-bin build-r9700-dense-selection-g16/apps/ninfer-ppl \
@@ -883,7 +898,7 @@ same authorities:
 
 ```bash
 LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/core-10.0/lib \
-/path/to/local/.venv-ninfer-r9700/bin/python \
+python3.11 \
   tools/ppl/validate_fp8_hybrid_greedy.py \
   --campaign profiles/ppl/fp8-hybrid-product-32k-20260904/results.json \
   --artifact out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-eval.ninfer \
@@ -901,7 +916,7 @@ enable the same three-way decomposition used at 8K.
 
 ```bash
 LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/core-10.0/lib \
-/path/to/local/.venv-ninfer-r9700/bin/python \
+python3.11 \
   tools/ppl/compare_fp8_hybrid_execution.py \
   --product-campaign profiles/ppl/fp8-hybrid-product-32k-20260904/results.json \
   --artifact out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-eval.ninfer \
@@ -926,16 +941,16 @@ interpreter, and the complete argv is retained in each cell's provenance.
 
 ```bash
 export LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/core-10.0/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
-export PATH=/path/to/local/.venv-ninfer-r9700/bin:${PATH}
-/path/to/local/.venv-ninfer-r9700/bin/python -c \
+export PATH=/path/to/python-environment/bin:${PATH}
+python3.11 -c \
   "import torch; assert torch.version.hip, 'the execution gate requires ROCm PyTorch'"
 NINFER_EXECUTION_GATE_DIR=profiles/ppl/fp8-hybrid-product-execution-c1-20260904
 test ! -e "$NINFER_EXECUTION_GATE_DIR" || \
   { test -d "$NINFER_EXECUTION_GATE_DIR" && \
     test -z "$(find "$NINFER_EXECUTION_GATE_DIR" -mindepth 1 -print -quit)"; }
 
-/path/to/local/.venv-ninfer-r9700/bin/python tools/ppl/run.py \
-  --bf16-reference-weights /path/to/local/models/qwen3.8-27b-bf16 \
+python3.11 tools/ppl/run.py \
+  --bf16-reference-weights /path/to/models/qwen3.8-27b-bf16 \
   --bf16-reference-ppl-bin tools/reference/qwen3_8_27b_bf16/ppl.py \
   --g16-weights out/qwen3.8-27b-r9700-q4g64-f8e4m3-four-role-n16k16-eval.ninfer \
   --g16-ppl-bin build-r9700-dense-selection-g16/apps/ninfer-ppl \
@@ -948,7 +963,7 @@ test ! -e "$NINFER_EXECUTION_GATE_DIR" || \
   --require-fp8-hybrid \
   --out "$NINFER_EXECUTION_GATE_DIR"
 
-/path/to/local/.venv-ninfer-r9700/bin/python \
+python3.11 \
   tools/ppl/validate_fp8_hybrid_execution_gate.py \
   --results "$NINFER_EXECUTION_GATE_DIR/results.json" \
   --width-tool build-r9700/src/ninfer_r9700_runtime_planner_qual \

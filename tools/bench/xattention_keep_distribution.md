@@ -28,7 +28,7 @@ Read-only preflight compares compiled arithmetic options with the panel build, r
 executables, replays selected-chunk/quality authorities, and binds exact artifacts/corpus:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 /home/maintainer/.local/bin/python3.11 \
+PYTHONDONTWRITEBYTECODE=1 python3.11 \
   tools/bench/xattention_keep_distribution.py preflight
 ```
 
@@ -36,7 +36,7 @@ After independent review, root alone launches eight serial diagnostics: all-Q4/f
 sparse G16/G32, P8192/P32768. Mixed XAttention is quality-ineligible and excluded.
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 /home/maintainer/.local/bin/python3.11 \
+PYTHONDONTWRITEBYTECODE=1 python3.11 \
   tools/bench/xattention_keep_distribution.py run \
   --output profiles/bench/r9700-xattention-real-keep-distribution-20260921
 ```

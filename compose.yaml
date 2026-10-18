@@ -35,7 +35,7 @@ services:
         bind:
           create_host_path: false
       - type: bind
-        source: ${NINFER_DISK_CACHE_DIR:-/path/to/local/cache_r9700}
+        source: ${NINFER_DISK_CACHE_DIR:-./.cache/ninfer}
         target: /cache
         bind:
           create_host_path: false

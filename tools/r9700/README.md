@@ -874,9 +874,10 @@ make -C tools/r9700 PROFILE_DIR=../../profiles/r9700/<named-pmc> profile-pmc
 ```
 
 After naming the emitted database paths, `make -C tools/r9700 rocm-tool-audit` performs the
-GPU-independent capability audit over the retained captures. Override `TRACE_EVIDENCE_DB`,
-`PMC_EVIDENCE_DB`, the paired `TRACE_EVIDENCE_COMMAND`/`PMC_EVIDENCE_COMMAND`, or one of the
-explicit zero-probe database variables to audit a replacement capture. It validates target
+GPU-independent capability audit over the retained captures. Supply `TRACE_EVIDENCE_DB`,
+`PMC_EVIDENCE_DB` and all zero-probe database variables explicitly; there are no
+machine-specific capture defaults. Set the paired `TRACE_EVIDENCE_COMMAND`/
+`PMC_EVIDENCE_COMMAND` when the workload differs from the documented KV probe. It validates target
 identity, database schema, exact workload command, required trace rows,
 nonzero SQ counters, identically-zero unsupported counters, and database hashes. It also records
 the installed tool versions and performs compile-only device-ASan target probes. The atomic JSON
@@ -1016,7 +1017,7 @@ promotion; reruns must use a fresh output path because the report writer is deli
 non-clobbering.
 
 ```bash
-test "$(tr -d '\n' </sys/class/drm/card2/device/power_dpm_force_performance_level)" = auto
+test "$(tr -d '\n' <"/sys/bus/pci/devices/$NINFER_R9700_PCI_BUS_ID/power_dpm_force_performance_level")" = auto
 OUT=profiles/bench/r9700-split512-attention-admission-20260904.json
 test ! -e "$OUT"
 build-r9700/src/ninfer_r9700_split512_attention_qual \
@@ -1613,7 +1614,7 @@ cmake --build build-r9700 --target ninfer_r9700_w8a8_wmma_linear_qual
 build-r9700/src/ninfer_r9700_w8a8_wmma_linear_qual --packed-load-regression /tmp/w8-packed-fresh
 ```
 
-The output directory must not exist. The check binds PCI `0000:13:00.0` and requires `auto`;
+The output directory must not exist. The check binds the configured `NINFER_R9700_PCI_BUS_ID` and requires `auto`;
 it verifies initialized weights, the independent A8 codec, original BF16-input FP64 accuracy,
 four-byte-but-not-eight-byte code alignment, tails, guards, and poisoned graph replay. Complete
 BF16 outputs permit exact comparison with a retained control linked against the same fixture.
@@ -1881,7 +1882,7 @@ semantics and limits are in [`docs/maintainer/code-quality.md`](../../docs/maint
 Build `ninfer_r9700_graph_launch_bench` in `build-r9700` and run under the GPU lease:
 
 ```sh
-flock --exclusive /path/to/local/.ninfer-coordination/gpu.lock \
+flock --exclusive "$NINFER_GPU_LOCK" \
   env DEBUG_HIP_GRAPH_CLASSIC_PATH=0 ROC_ENABLE_LARGE_BAR=0 \
   ROC_SKIP_KERNEL_ARG_COPY=0 HSA_DISABLE_FRAGMENT_ALLOCATOR=1 \
   DEBUG_HIP_GRAPH_BATCH_SIZE=16384 \

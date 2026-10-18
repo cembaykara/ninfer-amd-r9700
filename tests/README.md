@@ -22,7 +22,27 @@ graph and no longer represented the kernels linked into the sole product. Real-m
 perplexity, and whole-inference performance gates live in the R9700 qualification workflow and
 require the complete BF16-derived product artifact.
 
+## Public CPU checks
+
+`.github/workflows/host-checks.yaml` runs file hygiene, the Python benchmark/report
+contracts and both Compose configuration checks on Ubuntu 24.04 with Python 3.11.
+It does not build HIP or claim GPU/model qualification. Run its Python tests without
+ROCm, model weights or third-party Python dependencies:
+
+```sh
+python3.11 -m unittest discover -s tests -p 'test_bench_matrix.py' -v
+python3.11 -m unittest discover -s tests -p 'test_serve_corpus.py' -v
+```
+
+The workflow's `pre-commit run --all-files` uses the pinned tools in
+`.pre-commit-config.yaml`. Full native and GPU promotion gates remain separate.
+
 ## Build and run
+
+Set private host inputs as described in `../docs/maintainer/local-development.md`.
+Source `.ninfer-local.env` before native tests so official-tokenizer sections receive
+`NINFER_OFFICIAL_TOKENIZER_DIR` and physical qualifiers receive the selected PCI identity.
+Run GPU tests under `flock --exclusive "$NINFER_GPU_LOCK"`; builds need no lock.
 
 ```bash
 cmake -S . -B build-r9700 \
@@ -30,7 +50,7 @@ cmake -S . -B build-r9700 \
   -DCMAKE_HIP_ARCHITECTURES=gfx1201 \
   -DBUILD_TESTING=ON
 cmake --build build-r9700 --parallel
-ctest --test-dir build-r9700 --output-on-failure
+flock --exclusive "$NINFER_GPU_LOCK" ctest --test-dir build-r9700 --output-on-failure
 ```
 
 The tests expect the selected physical gfx1201 device. Absence of the supported R9700 is a test
@@ -46,7 +66,7 @@ ctest --test-dir build-r9700 -L r9700 --output-on-failure
 The token-logprob real-model check uses the explicit production artifact:
 
 ```bash
-flock --exclusive /path/to/local/.ninfer-coordination/gpu.lock \
+flock --exclusive "$NINFER_GPU_LOCK" \
   env NINFER_R9700_WEIGHTS=/absolute/path/to/r9700-lq4.ninfer \
   ctest --test-dir build-r9700 -R '^ninfer_r9700_(token_logprobs_qual|engine_logprobs_real_test)$' \
     --output-on-failure
@@ -94,8 +114,8 @@ suite also checks shared-rule alternatives, recursive schemas, cache isolation a
 cold compilation with independent completed-call validators.
 
 ```bash
-flock --exclusive /path/to/local/.ninfer-coordination/gpu.lock \
-  env NINFER_R9700_WEIGHTS=/path/to/local/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer \
+flock --exclusive "$NINFER_GPU_LOCK" \
+  env NINFER_R9700_WEIGHTS=/path/to/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer \
   ctest --test-dir build-r9700 -R '^ninfer_r9700_output_constraint_real_test$' --output-on-failure
 ```
 
@@ -109,7 +129,7 @@ all three cache planes with mixed layouts and fragmented page mappings. Run the 
 with the same explicit production artifact and GPU lease as the other R9700 Engine tests:
 
 ```bash
-flock --exclusive /path/to/local/.ninfer-coordination/gpu.lock \
-  env NINFER_R9700_WEIGHTS=/path/to/local/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer \
+flock --exclusive "$NINFER_GPU_LOCK" \
+  env NINFER_R9700_WEIGHTS=/path/to/models/qwen3.8-27b-r9700-lq4/qwen3.8-27b-r9700-lq4.ninfer \
   ctest --test-dir build-r9700 -R '^ninfer_r9700_engine_cache_write_real_test$' --output-on-failure
 ```

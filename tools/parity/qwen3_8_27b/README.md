@@ -12,7 +12,7 @@ Run with an explicitly selected artifact and existing Python 3.11 reference envi
 cmake --build build-r9700 --target ninfer_qwen3_8_27b_vision_trace
 python3.11 -m tools.parity.qwen3_8_27b.vision \
   --weights /absolute/path/to/selected-r9700.ninfer \
-  --model-dir /path/to/local/models/qwen3.8-27b-bf16 \
+  --model-dir /path/to/models/qwen3.8-27b-bf16 \
   --messages examples/cli/messages/image_chart.json \
   --trace-exe build-r9700/tests/ninfer_qwen3_8_27b_vision_trace \
   --device cpu --output /absolute/path/to/new-vision-report.json
