@@ -69,6 +69,54 @@ public:
     bool requested = false;
 };
 
+// C1 plus disposable, non-reusing requests makes each unrelated admission release the old
+// allocation. The pool returns its lowest physical pages first, so the short request overwrites
+// the beginning of the long request's pages while their unwritten tails retain old contents.
+void qualify_recycled_pages(ninfer::Engine& engine) {
+    std::vector<ninfer::TokenId> long_prompt(173, 198);
+    long_prompt.front() = 1000;
+    std::vector<ninfer::TokenId> short_prompt(33, 198);
+    short_prompt.front()             = 2000;
+    auto disposable                  = request_options(false);
+    disposable.execution.cache_write = false;
+    // Forty decode tokens cross the short prompt's first page boundary, checking that newly
+    // visible slots are overwritten as the frontier advances into recycled pages.
+    disposable.execution.requested_output_tokens = 40;
+    const auto cold = engine.generate(engine.prepare_tokens(short_prompt), disposable);
+    require(cold.generated_token_ids.size() == 40, "short recycle control did not complete");
+
+    const auto before = engine.runtime_stats();
+    require(before.gpu_kv_main_capacity_pages == 4,
+            "recycle qualifier requires exactly four physical KV pages");
+    const auto long_result = engine.generate(engine.prepare_tokens(long_prompt), disposable);
+    require(long_result.generated_token_ids.size() == 40, "long recycle request did not complete");
+    require(engine.runtime_stats().gpu_kv_main_mapped_pages == 4,
+            "long recycle request did not occupy the complete physical KV pool");
+    const auto recycled = engine.generate(engine.prepare_tokens(short_prompt), disposable);
+    require(engine.runtime_stats().gpu_kv_main_mapped_pages == 2,
+            "short recycle request did not replace the long allocation with two pages");
+    require(recycled.reused_prompt_tokens == 0,
+            "short recycle request unexpectedly reused a prefix");
+    require_same_output(recycled, cold);
+
+    CancelAfterOutput sink;
+    const ninfer::CancellationView cancellation([&] { return sink.requested; });
+    const auto cancelled =
+        engine.generate(engine.prepare_tokens(long_prompt), disposable, &sink, cancellation);
+    require(sink.requested && cancelled.finish_reason == ninfer::FinishReason::Cancelled &&
+                !cancelled.generated_token_ids.empty(),
+            "long recycle cancellation was not observed after published output");
+    const auto after_cancel = engine.generate(engine.prepare_tokens(short_prompt), disposable);
+    require(after_cancel.reused_prompt_tokens == 0,
+            "short post-cancel request unexpectedly reused a prefix");
+    require_same_output(after_cancel, cold);
+    require(engine.runtime_stats().kv_ram_captures == before.kv_ram_captures,
+            "disposable recycled-page requests unexpectedly preserved old allocations in RAM");
+    std::cout << "engine_recycled_pages: PASS C1 disposable long173->short33 and "
+                 "cancelled-long->short; 40-token page-crossing exact cold greedy output; "
+                 "cancellation phase not forced\n";
+}
+
 int qualify_disk_restart(const std::filesystem::path& artifact,
                          const std::filesystem::path& directory) {
     require(std::filesystem::is_regular_file(artifact), "explicit artifact is not a regular file");
@@ -151,6 +199,7 @@ int main(int argc, char** argv) {
                "8 GiB RAM cache.\n"
                "Cancellation starts after the first nonempty stream delta; "
                "its exact GPU phase is not forced.\n"
+               "Also checks disposable long-to-short physical-page recycling against cold output.\n"
                "Disk mode instead checks durable restart/HostDisk reuse against cold output;\n"
                "uses 8 GiB RAM + 1 GiB SSD and retains the new directory.\n";
         return argc == 2 ? 0 : 2;
@@ -214,6 +263,7 @@ int main(int argc, char** argv) {
         const auto cold_ram =
             engine.generate(engine.prepare_tokens(ram_prompt), request_options(false));
         require_same_output(restored, cold_ram);
+        qualify_recycled_pages(engine);
         std::cout << "engine_cache_cancel: PASS ordinary C1 greedy; cancelled_tokens="
                   << cancelled.generated_token_ids.size()
                   << " cancel_resume_reused=" << resumed.reused_prompt_tokens

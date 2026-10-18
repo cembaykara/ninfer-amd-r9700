@@ -946,8 +946,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         }
         impl->graph_definition_count = definitions;
         impl->graph_executable_count = definitions;
+        // Ordinary C1/capacity256 preparation measured 44 MiB on gfx1201 with eligible-logit
+        // reporting (2026-10-18). Its two profiles reserve 20 MiB below; the remaining 24 MiB
+        // is family residency. Reporting adds no captured graph nodes.
         const std::size_t family_bytes =
-            (impl->speculative_backend == SpeculativeBackend::None  ? 23U
+            (impl->speculative_backend == SpeculativeBackend::None  ? 24U
              : impl->speculative_backend == SpeculativeBackend::Mtp ? 46U
                                                                     : 48U) *
             kMiB;

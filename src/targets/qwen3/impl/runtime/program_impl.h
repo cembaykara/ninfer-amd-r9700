@@ -547,6 +547,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     HIP_CHECK(hipMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     HIP_CHECK(hipMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
+    HIP_CHECK(
+        hipMemsetAsync(io.nonfinite_logits.data, 0, io.nonfinite_logits.bytes(), device.stream));
     device.synchronize();
     prepare_graphs();
     if (calibrates_p_less_drafts()) {
@@ -4101,8 +4103,10 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({TextConfig::token_domain});
     HIP_CHECK(hipMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
-    request.sampling_host     = config;
-    request.speculative_stats = SpeculativeStats{
+    request.sampling_host                  = config;
+    request.sampling_host.nonfinite_logits = static_cast<std::uint32_t*>(io.nonfinite_logits.data) +
+                                             sequence.lane * qwen3::kDFlashDecodeMaximumWidth;
+    request.speculative_stats              = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
@@ -4244,6 +4248,31 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
                                     table_rows, {minimum_count, maximum_count});
 }
 
+void ProgramImplCore::clear_nonfinite_logits(std::uint32_t lane) {
+    Tensor status = io.nonfinite_logits.slice(1, static_cast<std::int32_t>(lane), 1);
+    HIP_CHECK(hipMemsetAsync(status.data, 0, status.bytes(), device.stream));
+}
+
+void ProgramImplCore::copy_nonfinite_logits() {
+    auto* host = static_cast<PrefillRoundHost*>(round_host.data());
+    HIP_CHECK(hipMemcpyAsync(host->nonfinite_logits.data(), io.nonfinite_logits.data,
+                             io.nonfinite_logits.bytes(), hipMemcpyDeviceToHost, device.stream));
+}
+
+void ProgramImplCore::validate_finite_logits(std::uint32_t lane, std::uint32_t columns) const {
+    if (lane >= max_concurrency || columns == 0 || columns > qwen3::kDFlashDecodeMaximumWidth) {
+        throw std::logic_error("target logit validation has an invalid live domain");
+    }
+    const auto* host   = static_cast<const PrefillRoundHost*>(round_host.data());
+    const auto* status = host->nonfinite_logits.data() + lane * qwen3::kDFlashDecodeMaximumWidth;
+    for (std::uint32_t column = 0; column < columns; ++column) {
+        if (status[column] != 0U) {
+            throw std::runtime_error(
+                "target returned nonfinite eligible logits before token publication");
+        }
+    }
+}
+
 void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) const {
     for (const TokenId token : tokens) {
         if (token < 0 || token >= TextConfig::token_domain) {
@@ -4300,6 +4329,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        clear_nonfinite_logits(sequence.lane);
         schedule::PrefillContext schedule_state{
             {device, model, linear_execution.get(), work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -4525,6 +4555,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
 
         copy_round_token();
+        copy_nonfinite_logits();
         const bool token_logprobs = request.token_logprobs;
         if (token_logprobs) { copy_prefill_logprobs(); }
         std::array<TokenId, qwen3::kMtpDecodeMaximumDrafts> initial_drafts{};
@@ -4544,6 +4575,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.rewrite_checkpoint_capture;
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
 
+        validate_finite_logits(sequence.lane, 1);
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
         if (sequence.ledger.size() != prompt_tokens) {
             throw std::logic_error("candidate token ledger does not match prompt length");
@@ -4686,6 +4718,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             executable = &profile.executable;
         }
 
+        HIP_CHECK(hipMemsetAsync(io.nonfinite_logits.data, 0, io.nonfinite_logits.bytes(),
+                                 device.stream));
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = sequences[lanes[row]];
             RequestControl& request = requests[lanes[row]];
@@ -4743,11 +4777,13 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         executable);
         text_transactions.enqueue_resolution();
+        copy_nonfinite_logits();
         const double seconds = synchronize_round_seconds(device, start);
         std::array<std::uint32_t, kMaximumConcurrency> retained_frontiers{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             retained_frontiers[row] = sequences[lanes[row]].execution_frontier + 1U;
         }
+        for (const std::uint32_t lane : lanes) { validate_finite_logits(lane, 1); }
         text_transactions.finish_resolution({retained_frontiers.data(), lanes.size()});
         decision_trace::record_ordinary(
             ordinary_frame.logits, *ordinary_host_ingress, *ordinary_host_egress,
@@ -4889,6 +4925,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
 
         std::uint32_t realized_extent = 0;
+        HIP_CHECK(hipMemsetAsync(io.nonfinite_logits.data, 0, io.nonfinite_logits.bytes(),
+                                 device.stream));
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = sequences[lanes[row]];
             RequestControl& request = requests[lanes[row]];
@@ -4983,6 +5021,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                    executable);
         text_transactions.enqueue_resolution();
         mtp_transactions.enqueue_resolution();
+        copy_nonfinite_logits();
         const double seconds = synchronize_round_seconds(device, started);
         std::array<std::uint32_t, kMaximumConcurrency> text_retained_frontiers{};
         std::array<std::uint32_t, kMaximumConcurrency> mtp_retained_frontiers{};
@@ -4995,6 +5034,10 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             text_retained_frontiers[row] =
                 base + static_cast<std::uint32_t>(mtp_host_ingress->target_valid_columns[row]);
             mtp_retained_frontiers[row] = base + static_cast<std::uint32_t>(count);
+        }
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            validate_finite_logits(lanes[row], static_cast<std::uint32_t>(
+                                                   mtp_host_ingress->target_valid_columns[row]));
         }
         text_transactions.finish_resolution({text_retained_frontiers.data(), lanes.size()});
         mtp_transactions.finish_resolution({mtp_retained_frontiers.data(), lanes.size()});
@@ -5264,6 +5307,8 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_dflash_batch(
         const bool calibrate_p_less = calibrates_p_less_drafts() && chain_round;
         std::array<std::uint32_t, kMaximumConcurrency> text_target_columns{};
         std::uint32_t realized_extent = 0;
+        HIP_CHECK(hipMemsetAsync(io.nonfinite_logits.data, 0, io.nonfinite_logits.bytes(),
+                                 device.stream));
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = sequences[lanes[row]];
             RequestControl& request = requests[lanes[row]];
@@ -5398,11 +5443,15 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_dflash_batch(
                                           batch_k, live_w, envelopes, executable);
         }
         text_transactions.enqueue_resolution();
+        copy_nonfinite_logits();
         const double seconds = synchronize_round_seconds(device, started);
         std::array<std::uint32_t, kMaximumConcurrency> retained_frontiers{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             retained_frontiers[row] =
                 sequences[lanes[row]].execution_frontier + text_target_columns[row];
+        }
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            validate_finite_logits(lanes[row], text_target_columns[row]);
         }
         text_transactions.finish_resolution({retained_frontiers.data(), lanes.size()});
         decision_trace::record_dflash(

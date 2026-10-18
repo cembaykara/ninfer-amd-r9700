@@ -277,8 +277,11 @@ void qualify_host_ordinary_graph_allowance() {
     inputs.prefill_chunk   = 2048U;
     inputs.speculative_backend = ninfer::SpeculativeBackend::None;
     inputs.features            = {.vision = false, .speculative = ninfer::SpeculativeBackend::None};
-    for (const std::uint32_t capacity : {1024U, 4096U, 4224U}) {
-        const std::size_t definitions = capacity == 1024U ? 3U : capacity == 4096U ? 4U : 5U;
+    for (const std::uint32_t capacity : {256U, 1024U, 4096U, 4224U}) {
+        const std::size_t definitions = capacity == 256U    ? 2U
+                                        : capacity == 1024U ? 3U
+                                        : capacity == 4096U ? 4U
+                                                            : 5U;
         for (std::uint32_t concurrency = 1U; concurrency <= ninfer::kMaximumConcurrency;
              ++concurrency) {
             inputs.capacity         = capacity;
@@ -290,12 +293,16 @@ void qualify_host_ordinary_graph_allowance() {
             const auto plan =
                 runtime::build_sequence_candidate_for_qualification(inputs, physical_pages);
             const std::size_t expected =
-                (23ULL + 4ULL * definitions * concurrency) * 1024ULL * 1024ULL +
+                (24ULL + 4ULL * definitions * concurrency) * 1024ULL * 1024ULL +
                 definitions * kLoweredDefinitionBytes; // B=1 definitions
             require(plan->graph_definition_count == definitions * concurrency &&
                         plan->graph_executable_count == definitions * concurrency &&
                         plan->graph_allowance_bytes == expected,
                     "ordinary allowance omitted immutable profile executables");
+            if (capacity == 256U && concurrency == 1U) {
+                require(plan->graph_allowance_bytes >= 44ULL * 1024ULL * 1024ULL,
+                        "ordinary allowance misses observed 44 MiB C1/capacity256 preparation");
+            }
             if (capacity == 4224U && concurrency == 1U) {
                 require(plan->graph_allowance_bytes >= 54525952ULL,
                         "ordinary allowance misses observed 52 MiB tiled preparation");
@@ -677,7 +684,7 @@ std::size_t qualify_plan(ninfer::DeviceContext& device, std::uint32_t concurrenc
                                                               expected_dflash_width));
             }
         }
-        const std::size_t family_mib = backend == ninfer::SpeculativeBackend::None  ? 23U
+        const std::size_t family_mib = backend == ninfer::SpeculativeBackend::None  ? 24U
                                        : backend == ninfer::SpeculativeBackend::Mtp ? 46U
                                                                                     : 48U;
         require(plan.impl_->graph_definition_count == definitions &&

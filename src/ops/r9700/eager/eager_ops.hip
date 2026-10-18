@@ -828,7 +828,9 @@ __global__ void argmax_bf16_kernel(const hip_bfloat16* logits, std::int32_t* out
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0) { output[column] = indices[0]; }
+    // MTP proposals feed device embedding gathers before a host can inspect target status.
+    // An all-NaN column has no ordered maximum; token zero keeps that failed proposal in bounds.
+    if (threadIdx.x == 0) { output[column] = indices[0] == INT_MAX ? 0 : indices[0]; }
 }
 
 template <typename Launch>

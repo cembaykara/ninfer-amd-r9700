@@ -540,6 +540,9 @@ public:
     // Pinned landing area of the prefill-sampled token and its logprob record.
     struct PrefillRoundHost {
         TokenId token = 0;
+        std::array<std::uint32_t,
+                   static_cast<std::size_t>(qwen3::kDFlashDecodeMaximumWidth) * kMaximumConcurrency>
+            nonfinite_logits{};
         qwen3::RoundLogprobRecords<1> logprobs;
     };
 
@@ -592,6 +595,9 @@ private:
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
     void copy_prefill_logprobs();
+    void clear_nonfinite_logits(std::uint32_t lane);
+    void copy_nonfinite_logits();
+    void validate_finite_logits(std::uint32_t lane, std::uint32_t columns) const;
     void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                          std::uint32_t accepted_tokens, bool terminal);
     // Runs the owner's chunk inside a mixed DFlash round instead of alone: receives the owner's

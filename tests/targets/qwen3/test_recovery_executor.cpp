@@ -547,7 +547,7 @@ public:
         return 0;
     }
 
-    void abort_lane(std::uint32_t) noexcept {
+    virtual void abort_lane(std::uint32_t) noexcept {
         note("abort");
         ++abort_count;
     }
@@ -2029,6 +2029,191 @@ int run_admission_defers_for_reclaim(Frontend& frontend) {
     return failures;
 }
 
+// The Program reports a failed shared decode round before returning any licensed tokens.
+// The executor must fail the whole Engine, including queued work, rather than publishing a
+// plausible token from another row or silently retrying a subset of the failed batch.
+class IntegrityFailureProgram final : public ProbeProgram {
+public:
+    static constexpr const char* kFailure =
+        "target returned nonfinite eligible logits before token publication";
+    bool inject_failure = true;
+    std::atomic<bool> second_queued{false};
+    std::atomic<bool> failing_round_entered{false};
+    std::atomic<bool> release_failure{false};
+    std::atomic<std::uint32_t> active_lanes{0};
+    std::atomic<std::uint32_t> aborted_lanes{0};
+    std::atomic<std::uint32_t> resolved_rounds{0};
+    std::atomic<std::uint32_t> prefilled{0};
+
+    [[nodiscard]] AdmissionResources admission_capacity() const noexcept override {
+        return {2, 2, 0};
+    }
+
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t lane, PreparedPrompt prompt,
+                                                       ProbePlan, TransientRegion,
+                                                       const OutputSession*, bool) override {
+        active_lanes.fetch_or(1U << lane);
+        prefilled.fetch_add(1);
+        PrefillStepResult step;
+        step.complete                  = true;
+        step.processed_prompt_tokens   = 1;
+        step.round.tokens              = std::span<const TokenId>(&prefill_token_, 1);
+        step.summary.prompt_tokens     = prompt.summary().prompt_tokens;
+        step.summary.prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
+        return step;
+    }
+
+    // This fixture has no transfers. The base recovery probe deliberately reports pending
+    // copies, which would park the second admission until the first request finishes.
+    [[nodiscard]] bool kv_copies_ready() const override { return true; }
+
+    void abort_lane(std::uint32_t lane) noexcept override {
+        active_lanes.fetch_and(~(1U << lane));
+        aborted_lanes.fetch_or(1U << lane);
+    }
+
+    [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t> lanes,
+                                                     std::span<const RoundBudget>) override {
+        if (inject_failure && lanes.size() == 2) {
+            // Leave a distinct would-be output in the mock egress before reporting failure.
+            tokens_.fill(2); // "OPtail", which no successful round emits.
+            failing_round_entered.store(true);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!release_failure.load()) {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error("integrity fixture did not release its failing round");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            throw std::runtime_error(kFailure);
+        }
+        // Do not let the first request exhaust its budget before the caller submits its peer.
+        if (inject_failure) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!second_queued.load()) {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error("integrity fixture did not queue its peer");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        tokens_.fill(inject_failure ? 15 : 6); // answer, or clean model EOS.
+        counts_.fill(1);
+        return {.tokens     = std::span<const TokenId>(tokens_.data(), lanes.size()),
+                .row_counts = std::span<const std::int32_t>(counts_.data(), lanes.size()),
+                .row_stride = 1};
+    }
+
+    void resolve_pending_batch(std::span<const std::uint32_t>, std::span<const std::uint32_t>,
+                               std::span<const std::uint8_t>, std::span<const std::uint8_t>,
+                               std::span<const std::uint8_t>) override {
+        resolved_rounds.fetch_add(1);
+    }
+
+private:
+    TokenId prefill_token_ = 15;
+    std::array<TokenId, 2> tokens_{};
+    std::array<std::int32_t, 2> counts_{};
+};
+
+struct IntegrityPackage {
+    using Program         = IntegrityFailureProgram;
+    using RequestBasePlan = ProbePlan;
+    using RequestPlan     = ProbePlan;
+};
+
+struct IntegrityProbe {
+    using Package                    = IntegrityPackage;
+    IntegrityFailureProgram* program = nullptr;
+    ProbeLoaded* loaded              = nullptr;
+    ProbeMemory request_memory;
+};
+
+int run_integrity_failure(Frontend& frontend) {
+    IntegrityFailureProgram program;
+    program.lifecycle_retries = true; // use each request's output budget in the existing planner.
+    ProbeLoaded loaded{frontend};
+    IntegrityProbe instance{.program = &program, .loaded = &loaded};
+    auto engine                = engine_options();
+    engine.max_concurrency     = 2;
+    engine.generation_recovery = false;
+    ninfer::runtime::ConcurrentExecutor<IntegrityProbe> executor(instance, ProbeDevice{}, engine);
+    const auto submit = [&](auto& target, std::uint32_t budget) {
+        auto input                    = thinking_input();
+        input.options.enable_thinking = false;
+        auto prompt                   = frontend.prepare(std::move(input));
+        const auto summary            = prompt.summary();
+        ninfer::runtime::ResolvedRequestOptions options;
+        options.execution.allow_prefix_reuse      = false;
+        options.execution.requested_output_tokens = budget;
+        return target.submit(std::move(prompt), summary, 0.0, std::move(options),
+                             ninfer::OutputDelivery::Streaming);
+    };
+    auto first  = submit(executor, 512);
+    auto second = submit(executor, 512);
+    program.second_queued.store(true);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!program.failing_round_entered.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (!program.failing_round_entered.load()) {
+        program.release_failure.store(true);
+        return check(false, "integrity: two active requests never reached shared decode");
+    }
+    auto queued                = submit(executor, 512);
+    const auto resolved_before = program.resolved_rounds.load();
+    program.aborted_lanes.store(0);
+    program.release_failure.store(true);
+
+    class Sink final : public ninfer::OutputSink {
+    public:
+        std::string text;
+
+        void publish(ninfer::OutputDelta delta) override { text += delta.text; }
+    };
+
+    int failures              = 0;
+    const auto require_failed = [&](auto& submission, bool was_queued) {
+        Sink sink;
+        bool rejected = false;
+        try {
+            (void)submission.wait(&sink, {});
+        } catch (const std::runtime_error& error) {
+            rejected = std::string_view(error.what()) == IntegrityFailureProgram::kFailure;
+        }
+        failures += check(rejected, "integrity: active/queued request lost the shared failure");
+        failures += check(sink.text.find("OPtail") == std::string::npos,
+                          "integrity: a failed round published output callbacks");
+        if (was_queued)
+            failures += check(sink.text.empty(), "integrity: queued request emitted output");
+    };
+    require_failed(first, false);
+    require_failed(second, false);
+    require_failed(queued, true);
+    failures +=
+        check(program.prefilled.load() == 2 && program.active_lanes.load() == 0 &&
+                  program.aborted_lanes.load() == 3,
+              "integrity: failed Engine did not abort both active slots or admitted queued work");
+    failures += check(program.resolved_rounds.load() == resolved_before,
+                      "integrity: failed decode round reached the publication commit");
+    bool unavailable = false;
+    try {
+        (void)submit(executor, 2);
+    } catch (const ninfer::RequestError& error) {
+        unavailable = error.kind() == ninfer::RequestErrorKind::Unavailable;
+    }
+    failures += check(unavailable, "integrity: failed Engine accepted another request");
+
+    IntegrityFailureProgram clean;
+    clean.lifecycle_retries = true;
+    clean.inject_failure    = false;
+    IntegrityProbe fresh_instance{.program = &clean, .loaded = &loaded};
+    ninfer::runtime::ConcurrentExecutor<IntegrityProbe> fresh(fresh_instance, ProbeDevice{},
+                                                              engine);
+    auto recovered    = submit(fresh, 2);
+    const auto result = recovered.wait(nullptr, {});
+    failures += check(result.finish_reason == FinishReason::StopToken && result.content == "answer",
+                      "integrity: a fresh executor did not restore normal generation");
+    return failures;
+}
+
 int main() {
     try {
         Frontend frontend                = FrontendTestAccess::create_component(resources(), false);
@@ -2043,7 +2228,8 @@ int main() {
             CacheCase::AdmitRamRestoreThenCold,
             CacheCase::AdmitDiskRestoreThenCold,
         };
-        int failures = run_reasoning_close_sampling(frontend);
+        int failures = run_integrity_failure(frontend);
+        failures += run_reasoning_close_sampling(frontend);
         for (const CacheCase script : recovery_cases) {
             failures += run_recovery(frontend, script);
         }

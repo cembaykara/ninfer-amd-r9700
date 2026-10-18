@@ -104,6 +104,10 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   unreachable nodes need not constrain a different history. Every evaluated
  *   column must have at least one eligible token after explicit suppression.
  *   Greedy target_tokens must already be selected using these same masks.
+ *   Optional SamplingConfig nonfinite_logits words report nonfinite eligible target logits per
+ *   evaluated verification column. Greedy callers obtain that report from configured argmax;
+ *   stochastic consumers also set it while scanning logits. The caller clears status before
+ *   execution and rejects a live-column error before publishing licensed tokens.
  *
  * Effects:
  *   For each row, let A be the accepted draft count and L=A+1. licensed_tokens[0:A,b] receives

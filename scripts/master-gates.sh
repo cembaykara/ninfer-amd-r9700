@@ -92,6 +92,10 @@ gate 05-recovery-mtp flock --exclusive "$gpu_lock" \
   "$build_dir/src/ninfer_r9700_recovery_kv_qual" "$artifact" mtp
 gate 05-recovery-dflash flock --exclusive "$gpu_lock" \
   "$build_dir/src/ninfer_r9700_recovery_kv_qual" "$artifact" dflash
+for backend in none mtp dflash; do
+  gate "05-graph-recovery-$backend" flock --exclusive "$gpu_lock" \
+    "$build_dir/src/ninfer_r9700_recovery_kv_qual" "$artifact" "$backend" --device-graph
+done
 gate 06-memcheck bash scripts/gpu-check.sh memcheck
 gate 07-racecheck bash scripts/gpu-check.sh racecheck
 gate 08-initcheck bash scripts/gpu-check.sh initcheck

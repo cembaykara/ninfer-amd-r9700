@@ -205,7 +205,10 @@ void run_case(const std::vector<int>& lengths, bool uniform_entry, bool padded_q
     double max_reference     = 0.0;
     for (std::size_t index = 0; index < actual.size(); ++index) {
         if (!checked_query(static_cast<int>(index / (kHeads * kDim)), cumulative)) { continue; }
-        const double got   = represented(actual[index]);
+        const double got = represented(actual[index]);
+        if (!std::isfinite(got) || !std::isfinite(expected[index])) {
+            fail("vision_attention nonfinite oracle/output at " + std::to_string(index));
+        }
         const double error = got - expected[index];
         squared_error += error * error;
         squared_reference += expected[index] * expected[index];

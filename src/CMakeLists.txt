@@ -327,6 +327,20 @@ target_link_libraries(ninfer_r9700_recovery_kv_qual PRIVATE
   ninfer_r9700_core
   hip::host)
 
+# Real six-lane default DFlash graph geometry and nonfinite publication/recovery qualification.
+add_executable(ninfer_r9700_nonfinite_batch_qual
+  ${PROJECT_SOURCE_DIR}/tools/r9700/nonfinite_batch_qual.cpp)
+ninfer_r9700_internal_includes(ninfer_r9700_nonfinite_batch_qual)
+set_target_properties(ninfer_r9700_nonfinite_batch_qual PROPERTIES
+  HIP_ARCHITECTURES gfx1201 LINKER_LANGUAGE HIP)
+target_link_libraries(ninfer_r9700_nonfinite_batch_qual PRIVATE
+  ninfer_engine
+  ninfer_r9700_qwen3_8_27b_runtime
+  ninfer_r9700_target_bindings
+  ninfer_artifact
+  ninfer_r9700_core
+  hip::host)
+
 # Sole-target selection and startup device-memory/capacity planning. This compile-only object
 # boundary checks the registry against native HIP and the Qwen3.8-27B R9700 package identity
 # without claiming that the still excluded package schedule and Engine are linkable.

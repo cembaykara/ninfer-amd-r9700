@@ -29,6 +29,18 @@ build-r9700/src/ninfer_r9700_runtime_planner_qual --host-dflash-graph-allowance
 build-r9700/src/ninfer_r9700_full_attention_qual
 ```
 
+Nonfinite publication and recovery use the production artifact explicitly:
+`ninfer_r9700_recovery_kv_qual ARTIFACT.ninfer none|mtp|dflash [--device-graph]`
+rejects injected eligible-logit faults during final prefill/decode, then checks clean re-admission.
+`ninfer_r9700_nonfinite_batch_qual ARTIFACT.ninfer` exercises the default Text geometry
+(C6, adaptive maximum K7, optimized proposal head, p-less temperature 1.5, context 262144,
+prefill 2048) with the minimum resident KV pool. It checks graph batch shrink/repacking,
+logical lane isolation of a shared-head fault, whole-batch cleanup, and seeded clean replay.
+A supplemental K7 round uses synthetic policy costs solely to qualify that graph route.
+The batch qualifier also accepts `NINFER_R9700_WEIGHTS` and is in the real-artifact CTest set.
+Hold the shared GPU lock for either manual command. A direct Program re-admission tests storage
+reuse; the public Engine's integrity-failure policy requires recreating the Engine.
+
 The discriminator retains W5/W6 and adds widths 1..4 at context64 and133 (4100 with
 `--long-context`), compact C1..8 device page-table selection, causal prefixes,
 invalid-row poisoning, eager/graph equality, and workspace/output guards. `--sequence-batch`

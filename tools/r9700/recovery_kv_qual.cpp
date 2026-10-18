@@ -202,7 +202,138 @@ void require_empty_lane(const execution::ProgramImplCore& program, const char* w
             std::string(when) + " copy still returned a prompt");
 }
 
-void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend backend) {
+// A resident-only fault: change one output-head row scale, leaving every Text/MTP KV input
+// finite. The artifact bytes remain untouched and the original scale is restored on every exit.
+class OutputHeadFault {
+public:
+    explicit OutputHeadFault(const ninfer::Weight& head) {
+        require(head.qtype == ninfer::QType::LQ4 && head.layout == ninfer::QuantLayout::Lq4N16K64 &&
+                    head.scale_dtype == ninfer::DType::FP32 && head.n > 7 &&
+                    head.scales != nullptr && head.scale_bytes >= 8U * sizeof(std::uint32_t),
+                "nonfinite publication fixture requires the production LQ4/FP32-scale head");
+        row_scale_ = const_cast<std::uint32_t*>(static_cast<const std::uint32_t*>(head.scales)) + 7;
+        HIP_CHECK(hipMemcpy(&original_, row_scale_, sizeof(original_), hipMemcpyDeviceToHost));
+    }
+
+    OutputHeadFault(const OutputHeadFault&)            = delete;
+    OutputHeadFault& operator=(const OutputHeadFault&) = delete;
+
+    ~OutputHeadFault() {
+        if (dirty_) {
+            // Preserve the failure being unwound; the normal path checks restoration below.
+            (void)hipMemcpy(row_scale_, &original_, sizeof(original_), hipMemcpyHostToDevice);
+        }
+    }
+
+    void inject() {
+        constexpr std::uint32_t nan = 0x7fc00000U;
+        dirty_                      = true;
+        HIP_CHECK(hipMemcpy(row_scale_, &nan, sizeof(nan), hipMemcpyHostToDevice));
+    }
+
+    void restore() {
+        HIP_CHECK(hipMemcpy(row_scale_, &original_, sizeof(original_), hipMemcpyHostToDevice));
+        dirty_ = false;
+    }
+
+private:
+    std::uint32_t* row_scale_ = nullptr;
+    std::uint32_t original_   = 0;
+    bool dirty_               = false;
+};
+
+std::size_t require_graph_inventory(const execution::ProgramImplCore& program) {
+    const std::array<const execution::DecodeGraphFamily*, 3> families{
+        &program.ordinary_graphs, &program.mtp_graphs, &program.dflash_graphs};
+    std::size_t definitions = 0;
+    std::size_t executables = 0;
+    for (const auto* family : families) {
+        for (const auto& profile : family->profiles) {
+            definitions += profile.definition.ready();
+            executables += profile.executable.ready();
+        }
+    }
+    require(definitions == program.expected_graph_definition_count &&
+                executables == program.expected_graph_executable_count &&
+                (program.use_device_graph ? executables > 0 : executables == 0),
+            "decode graph inventory is not the complete startup-fixed family");
+    return executables;
+}
+
+void exercise_nonfinite_publication(execution::ProgramImplCore& program, family::Frontend& frontend,
+                                    const ninfer::PromptInput& input,
+                                    ninfer::runtime::ResolvedExecutionOptions options,
+                                    const ninfer::Weight& head) {
+    constexpr std::string_view expected =
+        "target returned nonfinite eligible logits before token publication";
+    const auto graph_executables = require_graph_inventory(program);
+    for (const int mode : {0, 1, 2}) {
+        options.sampling.temperature = mode == 0 ? 0.0F : 1.0F;
+        options.sampling.top_k       = 20;
+        options.sampling.p_less      = mode == 2;
+        options.allow_prefix_reuse   = false;
+        options.force_cold_prefill   = true;
+        for (const bool decode : {false, true}) {
+            program.abort_lane(0);
+            options.requested_output_tokens = decode ? 2 : 1;
+            auto prompt = family::PreparedPromptAccess::take(frontend.prepare(input));
+            if (decode) {
+                auto base = program.plan_request_base(prompt, options);
+                auto plan = program.plan_request_for_lane(0, prompt, base);
+                (void)finish_prefill(program, family::PreparedPromptData(prompt), std::move(plan));
+            }
+            OutputHeadFault fault(head);
+            fault.inject();
+            bool rejected = false;
+            try {
+                if (decode) {
+                    const std::array<std::uint32_t, 1> lanes{0};
+                    const std::array<ninfer::runtime::RoundBudget, 1> budgets{{{1}}};
+                    (void)program.decode_batch(lanes, budgets);
+                } else {
+                    auto base = program.plan_request_base(prompt, options);
+                    auto plan = program.plan_request_for_lane(0, prompt, base);
+                    (void)finish_prefill(program, std::move(prompt), std::move(plan));
+                }
+            } catch (const std::runtime_error& error) {
+                if (std::string_view(error.what()) != expected) { throw; }
+                rejected = true;
+            }
+            fault.restore();
+            require(rejected, "nonfinite eligible logits returned a generated round");
+            require_empty_lane(program, decode ? "nonfinite decode" : "nonfinite final prefill");
+
+            // Re-admit on the same Program after restoring the weight. A fresh prefill and final
+            // decode must succeed: this catches a sticky status surviving lane reuse/replay.
+            options.requested_output_tokens = 2;
+            auto clean      = family::PreparedPromptAccess::take(frontend.prepare(input));
+            auto clean_base = program.plan_request_base(clean, options);
+            auto clean_plan = program.plan_request_for_lane(0, clean, clean_base);
+            (void)finish_prefill(program, std::move(clean), std::move(clean_plan));
+            const std::array<std::uint32_t, 1> lanes{0};
+            const std::array<ninfer::runtime::RoundBudget, 1> budgets{{{1}}};
+            // In graph mode Program selects an immutable executable or throws; it has no eager
+            // fallback. Assert startup inventory before and after the fault and clean replay.
+            require(require_graph_inventory(program) == graph_executables,
+                    "a fault changed the prepared graph inventory");
+            const auto round = program.decode_batch(lanes, budgets);
+            const auto count = round.row_counts.empty() ? 1 : round.row_counts[0];
+            require(count == 1 && !round.tokens.empty(),
+                    "clean final decode after a nonfinite fault did not return one token");
+            const std::array<std::uint32_t, 1> accepted{1};
+            const std::array<std::uint8_t, 1> terminal{1}, cancelled{0};
+            program.resolve_pending_batch(lanes, accepted, terminal, cancelled);
+            require(require_graph_inventory(program) == graph_executables,
+                    "clean replay changed the prepared graph inventory");
+        }
+    }
+    std::cout
+        << "nonfinite output-head fault rejected before final-prefill/decode token publication "
+           "for greedy/truncated/p-less sampling\n";
+}
+
+void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend backend,
+              bool device_graph) {
     ninfer::DeviceContext device(0);
     ninfer::EngineOptions options;
     options.artifact_path         = artifact;
@@ -212,9 +343,9 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     options.prefill_chunk         = 1024;
     options.kv_ram_capacity_bytes = kRamBytes;
     options.enable_vision         = false;
-    // Decode graphs have their own qualification; this run is the retain/copy/abort/restore
-    // sequence and must not depend on graph-allowance calibration.
-    options.use_device_graph          = false;
+    // Eager is the default; the explicit graph run exercises the same recovery/fault sequence
+    // through the production immutable executable inventory.
+    options.use_device_graph          = device_graph;
     options.speculative.backend       = backend;
     options.speculative.draft_tokens  = backend == ninfer::SpeculativeBackend::None ? 0 : 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Full;
@@ -229,6 +360,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     options.artifact_file_identity = reader.file_identity();
     const auto profile             = Package::resolve_weights(reader.identity());
     auto load = target::bind_artifact(binder, profile, family::startup_features(options));
+    // Match Package::plan_load: these supported linear widths also back graph preparation.
     load.bindings.linear_widths = target::Variant::ExecutionState::eager_widths(
         std::min(options.prefill_chunk, options.max_context), options.max_concurrency,
         family::startup_verify_widths<target::DFlashConfig>(options));
@@ -385,6 +517,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     std::cout << "restored hit reused=" << restored.summary.reused_prompt_tokens
               << " suffix=" << restored.processed << '\n';
     exercise_decoded_retries(program, frontend, input, request);
+    exercise_nonfinite_publication(program, frontend, input, request, model.runtime.output_head);
 }
 
 ninfer::SpeculativeBackend parse_backend(std::string_view value) {
@@ -397,8 +530,9 @@ ninfer::SpeculativeBackend parse_backend(std::string_view value) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::cerr << "usage: ninfer_r9700_recovery_kv_qual ARTIFACT.ninfer none|mtp|dflash\n";
+    if (argc != 3 && argc != 4) {
+        std::cerr << "usage: ninfer_r9700_recovery_kv_qual ARTIFACT.ninfer none|mtp|dflash "
+                     "[--device-graph]\n";
         return 2;
     }
     try {
@@ -406,8 +540,12 @@ int main(int argc, char** argv) {
         if (artifact.extension() != ".ninfer" || !std::filesystem::is_regular_file(artifact)) {
             throw std::invalid_argument("an explicit existing .ninfer artifact is required");
         }
-        exercise(artifact, parse_backend(argv[2]));
-        std::cout << "recovery KV qualification passed\n";
+        const bool device_graph = argc == 4;
+        if (device_graph && std::string_view(argv[3]) != "--device-graph") {
+            throw std::invalid_argument("the only optional argument is --device-graph");
+        }
+        exercise(artifact, parse_backend(argv[2]), device_graph);
+        std::cout << "recovery KV qualification passed device_graph=" << device_graph << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "ninfer_r9700_recovery_kv_qual: " << error.what() << '\n';

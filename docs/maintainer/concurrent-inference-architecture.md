@@ -1732,6 +1732,15 @@ GPU execution 或 state-integrity failure 属于 Engine-wide failure：停止 ad
 requests 以 unavailable/failure 结束，重新创建 Engine 后才能恢复 serving。Scheduler 不猜测 failed
 shared round 中某一行可以安全继续。
 
+Target selection reports nonfinite eligible raw logits in lane-owned, per-verification-column
+status words. The Program clears them before each round and validates every live target column
+before returning generated tokens. Suppressed tokens do not set status, and status from inactive
+columns does not affect the publication decision.
+A reported nonfinite target logit is a state-integrity failure under the Engine-wide policy above.
+MTP proposal argmax returns an in-domain placeholder when no ordered maximum exists, keeping
+device gathers safe while the host awaits target validation. Immutable Device Graph replay uses
+the same status storage and publication checks as eager execution.
+
 ---
 
 ## 12. End-to-end examples
