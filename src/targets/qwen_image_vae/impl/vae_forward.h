@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 namespace ninfer::targets::qwen_image_vae {
+namespace detail {
 
 struct VaeWeights {
     // conv_in: [1152, 64, 3, 3] + bias [1152]
@@ -82,4 +83,5 @@ struct VaeWorkspace {
 void vae_decode(const VaeWeights& weights, const Tensor& latent, Tensor& out_image,
                 VaeWorkspace& ws, hipStream_t stream);
 
+} // namespace detail
 } // namespace ninfer::targets::qwen_image_vae

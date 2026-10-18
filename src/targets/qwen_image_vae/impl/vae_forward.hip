@@ -10,7 +10,7 @@
 #include <hip/hip_runtime.h>
 
 namespace ninfer::targets::qwen_image_vae {
-namespace {
+namespace detail {
 
 constexpr int kLatentCh = 64;
 constexpr int kImageCh  = 4;
@@ -193,7 +193,9 @@ void mid_attention(const VaeWeights& wts, const hip_bfloat16* in, int dim, int h
     conv1x1(ws.d, wts.mid_attn_proj, wts.mid_attn_proj_b, dim, dim, hw, out, s);
 }
 
-} // namespace
+} // namespace detail
+
+namespace detail {
 
 void vae_decode(const VaeWeights& w, const Tensor& latent, Tensor& out_image,
                 VaeWorkspace& ws, hipStream_t s) {
@@ -230,4 +232,5 @@ void vae_decode(const VaeWeights& w, const Tensor& latent, Tensor& out_image,
     ops::conv2d_3x3(gin, wout, bout, img, s);
 }
 
+} // namespace detail
 } // namespace ninfer::targets::qwen_image_vae

@@ -23,6 +23,6 @@ struct VaeWeightHandles {
 };
 
 VaeWeightHandles plan_vae_weights(artifact::Binder& binder);
-void bind_vae_weights(VaeWeights& w, const VaeWeightHandles& h, const artifact::MaterializedArtifact& m);
+void bind_vae_weights(detail::VaeWeights& w, const VaeWeightHandles& h, const artifact::MaterializedArtifact& m);
 
 } // namespace ninfer::targets::qwen_image_vae

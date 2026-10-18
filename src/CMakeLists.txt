@@ -8,6 +8,7 @@ function(ninfer_r9700_internal_includes target)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen_image_21/export
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen_image_vae/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_vl/export
     ${PROJECT_SOURCE_DIR}/third_party)
 endfunction()
@@ -231,7 +232,8 @@ target_link_libraries(ninfer_r9700_qwen_image_21_runtime PUBLIC
 
 add_library(ninfer_r9700_qwen_image_vae_runtime STATIC
   targets/qwen_image_vae/impl/vae_forward.hip
-  targets/qwen_image_vae/impl/load/bindings.cpp)
+  targets/qwen_image_vae/impl/load/bindings.cpp
+  targets/qwen_image_vae/impl/package.cpp)
 ninfer_r9700_internal_includes(ninfer_r9700_qwen_image_vae_runtime)
 set_target_properties(ninfer_r9700_qwen_image_vae_runtime PROPERTIES
   HIP_ARCHITECTURES gfx1201)

@@ -89,7 +89,7 @@ VaeWeightHandles plan_vae_weights(artifact::Binder& b) {
     return h;
 }
 
-void bind_vae_weights(VaeWeights& w, const VaeWeightHandles& h, const artifact::MaterializedArtifact& m) {
+void bind_vae_weights(detail::VaeWeights& w, const VaeWeightHandles& h, const artifact::MaterializedArtifact& m) {
     auto pd = [&](artifact::ObjectHandle oh) -> const hip_bfloat16* {
         return reinterpret_cast<const hip_bfloat16*>(m.device_data(oh));
     };
