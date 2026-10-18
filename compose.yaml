@@ -54,18 +54,19 @@ services:
       - --kv-capacity
       - auto
       - --kv-ram-capacity
-      - "${NINFER_RAM_CACHE_MIB:-4096}"
+      - "${NINFER_RAM_CACHE_MIB:-off}"
       - --kv-disk-capacity
-      - "${NINFER_DISK_CACHE_MIB:-32768}"
-      - --kv-disk-location
-      - /cache/prefix
+      - "${NINFER_DISK_CACHE_MIB:-off}"
       - --spec
       - dflash
       - --draft-tokens
       - "${NINFER_DRAFT_TOKENS:-7}"
       - --adaptive-draft
       - --lm-head-draft
+      - --model-id
+      - ${SERVED_MODEL_NAME:-qwen3.8-27b-ninfer}
       - --preserve-thinking
+      - --vision
       - --pending-timeout-ms
       - "900000"
       - --default-max-tokens

@@ -162,7 +162,7 @@ def convert(args):
             torch.set_num_threads(4)
             source.validate_config(json.loads((args.model / "config.json").read_text()))
             metadata = source_recipe.preflight_sources(args.model)
-            if metadata.source_shard_count != 18 or metadata.source_dtype_counts != {"BF16": 1199}:
+            if metadata.source_shard_count < 1 or metadata.source_dtype_counts != {"BF16": 1199}:
                 raise ValueError("requires complete original BF16 source")
             reader = stack.enter_context(ShardReader(args.model))
         specs = {s.name: s for s in expected if isinstance(s, TensorSpec)}

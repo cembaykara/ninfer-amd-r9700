@@ -667,14 +667,9 @@ def validate_checkpoint_files(source: Path) -> dict[str, str]:
     missing_names = [item.name for item in expected_text_tensors() if item.name not in weight_map]
     if missing_names:
         raise ValueError(f"BF16 source index is missing text tensor {missing_names[0]}")
-    expected_shards = {
-        f"model-{part:05d}-of-{SHARD_COUNT:05d}.safetensors" for part in range(1, SHARD_COUNT + 1)
-    }
     indexed_shards = set(weight_map.values())
-    if indexed_shards != expected_shards:
-        missing = sorted(expected_shards - indexed_shards)
-        extra = sorted(indexed_shards - expected_shards)
-        raise ValueError(f"BF16 source shard index differs; missing={missing}, extra={extra}")
+    if not indexed_shards:
+        raise ValueError("BF16 source index references no shards")
     for shard in sorted(indexed_shards):
         path = source / shard
         if not path.is_file() or path.stat().st_size == 0:

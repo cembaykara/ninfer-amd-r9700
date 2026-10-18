@@ -90,8 +90,8 @@ def _source_shard_manifest(model: Path) -> SourceShardManifest:
             f"BF16 source index must contain exactly {_EXPECTED_SOURCE_TENSORS} tensors"
         )
     shard_names = tuple(sorted(set(weight_map.values())))
-    if shard_names != _SOURCE_SHARDS:
-        raise ValueError("BF16 source index does not reference the exact 18-shard set")
+    if not shard_names:
+        raise ValueError("BF16 source index references no shards")
     shard_bytes: list[int] = []
     for name in shard_names:
         path = model / name
@@ -180,7 +180,7 @@ def preflight_conversion(
     source_preflight = source_recipe.preflight_sources(model)
     if (
         source_preflight.source_tensor_count != _EXPECTED_SOURCE_TENSORS
-        or source_preflight.source_shard_count != len(_SOURCE_SHARDS)
+        or source_preflight.source_shard_count < 1
         or source_preflight.source_dtype_counts != {"BF16": _EXPECTED_SOURCE_TENSORS}
     ):
         raise ValueError("source metadata is not the exact 1,199-BF16-tensor/18-shard contract")

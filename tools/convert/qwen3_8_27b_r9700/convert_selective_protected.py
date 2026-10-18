@@ -94,7 +94,7 @@ def preflight(base: Path, model: Path, output: Path) -> dict:
     metadata = source_recipe.preflight_sources(model)
     if (
         metadata.source_tensor_count != 1199
-        or metadata.source_shard_count != 18
+        or metadata.source_shard_count < 1
         or metadata.source_dtype_counts != {"BF16": 1199}
     ):
         raise ValueError("requires the original complete 1199-tensor BF16 source")

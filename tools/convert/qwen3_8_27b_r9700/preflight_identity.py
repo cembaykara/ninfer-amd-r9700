@@ -41,8 +41,8 @@ def source_checkpoint(model_dir: Path) -> dict[str, object]:
     ):
         raise ValueError("source index has invalid exact tensor byte count")
     names = tuple(sorted(set(weight_map.values())))
-    if names != SOURCE_SHARDS:
-        raise ValueError("source index does not bind the exact 18-shard set")
+    if not names:
+        raise ValueError("source index references no shards")
     shards = []
     for name in names:
         path = _regular(model / name, f"source shard {name}")

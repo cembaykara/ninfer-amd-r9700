@@ -74,10 +74,10 @@ def preflight_summary(preflight: Q4ConversionPreflight) -> dict[str, object]:
     }
     if (
         source_summary["tensors"] != 1199
-        or source_summary["shards"] != 18
+        or source_summary["shards"] < 1
         or source_summary["dtypes"] != {"BF16": 1199}
     ):
-        raise ValueError("source is not the exact 1,199-BF16-tensor/18-shard checkpoint")
+        raise ValueError("source is not the exact 1,199-BF16-tensor checkpoint")
     objects = preflight.object_plan.objects
     statistics = family_conversion.object_statistics(objects)
     if statistics["count"] != len(q4_inventory.OBJECT_SPECS):

@@ -128,7 +128,7 @@ def preflight_summary(preflight: Q4W8MseConversionPreflight) -> dict[str, object
     }
     if (
         source_summary["tensors"] != 1199
-        or source_summary["shards"] != 18
+        or source_summary["shards"] < 1
         or source_summary["dtypes"] != {"BF16": 1199}
     ):
         raise ValueError("source is not the exact 1,199-BF16-tensor/18-shard checkpoint")

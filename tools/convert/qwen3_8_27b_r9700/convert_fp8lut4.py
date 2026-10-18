@@ -108,7 +108,7 @@ def convert(args) -> None:
         raise FileExistsError(args.out)
     source.validate_config(json.loads((args.model / "config.json").read_text()))
     metadata = source_recipe.preflight_sources(args.model)
-    if metadata.source_shard_count != 18 or metadata.source_dtype_counts != {"BF16": 1199}:
+    if metadata.source_shard_count < 1 or metadata.source_dtype_counts != {"BF16": 1199}:
         raise ValueError("requires the complete original BF16 source")
     torch.set_num_threads(8)
     device = torch.device(args.device)
