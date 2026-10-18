@@ -3,10 +3,12 @@
 #include "ninfer/types.h"
 #include "runtime/engine/request_memory.h"
 #include <ninfer/targets/qwen3_8_27b/package.h>
+#include <ninfer/targets/qwen_image_21/package.h>
 
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <variant>
 
 namespace ninfer {
 
@@ -17,6 +19,7 @@ namespace targets {
 [[nodiscard]] constexpr std::optional<std::string_view>
 registered_target_key(std::string_view model_id) noexcept {
     if (model_id == qwen3_8_27b::Package::model_id) { return qwen3_8_27b::Package::target_key; }
+    if (model_id == qwen_image_21::Package::model_id) { return qwen_image_21::Package::target_key; }
     return std::nullopt;
 }
 
@@ -50,7 +53,24 @@ struct Qwen3_8_27BInstance {
     Qwen3_8_27BInstance& operator=(const Qwen3_8_27BInstance&) = delete;
 };
 
-using ActiveTarget = std::unique_ptr<Qwen3_8_27BInstance>;
+struct LoadedDit {
+    std::unique_ptr<qwen_image_21::Package::LoadedModel> model;
+    std::unique_ptr<qwen_image_21::Package::ImageProgram> program;
+    explicit LoadedDit(std::unique_ptr<qwen_image_21::Package::LoadedModel> m, DeviceContext& device);
+    ~LoadedDit();
+    LoadedDit(const LoadedDit&)            = delete;
+    LoadedDit& operator=(const LoadedDit&) = delete;
+};
+
+struct DitInstance {
+    std::unique_ptr<LoadedDit> loaded;
+    DitInstance(std::unique_ptr<LoadedDit> l);
+    ~DitInstance();
+    DitInstance(const DitInstance&)            = delete;
+    DitInstance& operator=(const DitInstance&) = delete;
+};
+
+using ActiveTarget = std::unique_ptr<std::variant<Qwen3_8_27BInstance, DitInstance>>;
 
 struct ConstructedTarget {
     ActiveTarget active;

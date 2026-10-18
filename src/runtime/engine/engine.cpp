@@ -144,8 +144,13 @@ public:
         active                = std::move(constructed.active);
         load                  = std::move(constructed.load);
         sampling_defaults     = constructed.sampling_defaults;
-        options.mixed_forward = active->program->mixed_forward();
-        executor              = std::make_unique<Executor>(*active, device, options);
+        if (auto* qwen = std::get_if<targets::Qwen3_8_27BInstance>(&*active)) {
+            options.mixed_forward = qwen->program->mixed_forward();
+            executor              = std::make_unique<Executor>(*qwen, device, options);
+        } else {
+            // Qwen-Image DiT: image-generation target, no text executor (served via the
+            // ImageProgram; the HTTP image route is a follow-up).
+        }
     }
 
     ~Impl() noexcept {

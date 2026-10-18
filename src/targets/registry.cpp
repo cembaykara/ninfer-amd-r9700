@@ -202,6 +202,41 @@ Qwen3_8_27BInstance::Qwen3_8_27BInstance(std::unique_ptr<LoadedQwen3_8_27B> stab
 
 Qwen3_8_27BInstance::~Qwen3_8_27BInstance() = default;
 
+LoadedDit::LoadedDit(std::unique_ptr<qwen_image_21::Package::LoadedModel> m, DeviceContext& device)
+    : model(std::move(m)), program(qwen_image_21::Package::create_program(*model, device)) {}
+LoadedDit::~LoadedDit() = default;
+DitInstance::DitInstance(std::unique_ptr<LoadedDit> l) : loaded(std::move(l)) {}
+DitInstance::~DitInstance() = default;
+
+ConstructedTarget construct_diffusion(const EngineOptions& options, DeviceContext& device,
+                                      artifact::Reader& reader, Clock::time_point load_start,
+                                      std::string_view target_key) {
+    const auto& identity = reader.identity();
+    artifact::Binder binder(reader);
+    EngineOptions planned          = options;
+    planned.model_id               = identity.model_id;
+    planned.weights_id             = identity.weights_id;
+    planned.artifact_file_identity = reader.file_identity();
+    auto load_plan = qwen_image_21::Package::plan_load(binder, planned,
+                                                       qwen_image_21::Package::WeightsProfile::R9700Bf16);
+    auto progress     = artifact_progress(options.load_progress);
+    auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
+                                              progress.callback ? &progress : nullptr);
+    auto model = qwen_image_21::Package::construct_loaded_model(std::move(load_plan),
+                                                                std::move(materialized));
+    device.synchronize();
+    auto loaded   = std::make_unique<LoadedDit>(std::move(model), device);
+    auto instance = std::make_unique<DitInstance>(std::move(loaded));
+    LoadSummary summary;
+    summary.target         = std::string(target_key);
+    summary.model_id       = identity.model_id;
+    summary.weights_id     = identity.weights_id;
+    summary.load_seconds   = std::chrono::duration<double>(Clock::now() - load_start).count();
+    return ConstructedTarget{.active            = ActiveTarget(std::make_unique<std::variant<Qwen3_8_27BInstance, DitInstance>>(std::move(*instance))),
+                             .load              = std::move(summary),
+                             .sampling_defaults = ModelSamplingDefaults{}};
+}
+
 ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& device) {
     validate_options(options);
     const auto load_start = Clock::now();
@@ -210,6 +245,9 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     const auto& identity  = reader.identity();
     const auto target_key = registered_target_key(identity.model_id);
     if (target_key.has_value()) {
+        if (identity.model_id == qwen_image_21::Package::model_id) {
+            return construct_diffusion(options, device, reader, load_start, *target_key);
+        }
         return construct_registered<qwen3_8_27b::Package, LoadedQwen3_8_27B, Qwen3_8_27BInstance>(
             options, device, reader, load_start, *target_key);
     }
