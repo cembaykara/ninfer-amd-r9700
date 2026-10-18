@@ -176,7 +176,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
     summary.tensor_count         = stats.tensor_count;
     summary.resource_count       = stats.resource_count;
-    return ConstructedTarget{.active            = ActiveTarget(std::make_unique<std::variant<Qwen3_8_27BInstance, DitInstance, EncoderInstance>>(std::move(*instance))),
+    return ConstructedTarget{.active            = ActiveTarget(std::make_unique<std::variant<Qwen3_8_27BInstance, DitInstance, EncoderInstance, VaeInstance>>(std::move(*instance))),
                              .load              = std::move(summary),
                              .sampling_defaults = sampling_defaults};
 }
@@ -214,6 +214,12 @@ LoadedEncoder::~LoadedEncoder() = default;
 EncoderInstance::EncoderInstance(std::unique_ptr<LoadedEncoder> l) : loaded(std::move(l)) {}
 EncoderInstance::~EncoderInstance() = default;
 
+LoadedVae::LoadedVae(std::unique_ptr<qwen_image_vae::Package::LoadedModel> m, DeviceContext& device)
+    : model(std::move(m)), program(qwen_image_vae::Package::create_program(*model, device)) {}
+LoadedVae::~LoadedVae() = default;
+VaeInstance::VaeInstance(std::unique_ptr<LoadedVae> l) : loaded(std::move(l)) {}
+VaeInstance::~VaeInstance() = default;
+
 ConstructedTarget construct_diffusion(const EngineOptions& options, DeviceContext& device,
                                       artifact::Reader& reader, Clock::time_point load_start,
                                       std::string_view target_key) {
@@ -238,7 +244,7 @@ ConstructedTarget construct_diffusion(const EngineOptions& options, DeviceContex
     summary.model_id       = identity.model_id;
     summary.weights_id     = identity.weights_id;
     summary.load_seconds   = std::chrono::duration<double>(Clock::now() - load_start).count();
-    return ConstructedTarget{.active            = ActiveTarget(std::make_unique<std::variant<Qwen3_8_27BInstance, DitInstance, EncoderInstance>>(std::move(*instance))),
+    return ConstructedTarget{.active            = ActiveTarget(std::make_unique<std::variant<Qwen3_8_27BInstance, DitInstance, EncoderInstance, VaeInstance>>(std::move(*instance))),
                              .load              = std::move(summary),
                              .sampling_defaults = ModelSamplingDefaults{}};
 }
@@ -267,7 +273,36 @@ ConstructedTarget construct_encoder(const EngineOptions& options, DeviceContext&
     summary.model_id       = identity.model_id;
     summary.weights_id     = identity.weights_id;
     summary.load_seconds   = std::chrono::duration<double>(Clock::now() - load_start).count();
-    return ConstructedTarget{.active            = ActiveTarget(std::make_unique<std::variant<Qwen3_8_27BInstance, DitInstance, EncoderInstance>>(std::move(*instance))),
+    return ConstructedTarget{.active            = ActiveTarget(std::make_unique<std::variant<Qwen3_8_27BInstance, DitInstance, EncoderInstance, VaeInstance>>(std::move(*instance))),
+                             .load              = std::move(summary),
+                             .sampling_defaults = ModelSamplingDefaults{}};
+}
+
+ConstructedTarget construct_vae(const EngineOptions& options, DeviceContext& device,
+                                 artifact::Reader& reader, Clock::time_point load_start,
+                                 std::string_view target_key) {
+    const auto& identity = reader.identity();
+    artifact::Binder binder(reader);
+    EngineOptions planned          = options;
+    planned.model_id               = identity.model_id;
+    planned.weights_id             = identity.weights_id;
+    planned.artifact_file_identity = reader.file_identity();
+    auto load_plan = qwen_image_vae::Package::plan_load(binder, planned,
+                                                        qwen_image_vae::Package::WeightsProfile::R9700Bf16);
+    auto progress     = artifact_progress(options.load_progress);
+    auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
+                                              progress.callback ? &progress : nullptr);
+    auto model = qwen_image_vae::Package::construct_loaded_model(std::move(load_plan),
+                                                                std::move(materialized));
+    device.synchronize();
+    auto loaded   = std::make_unique<LoadedVae>(std::move(model), device);
+    auto instance = std::make_unique<VaeInstance>(std::move(loaded));
+    LoadSummary summary;
+    summary.target         = std::string(target_key);
+    summary.model_id       = identity.model_id;
+    summary.weights_id     = identity.weights_id;
+    summary.load_seconds   = std::chrono::duration<double>(Clock::now() - load_start).count();
+    return ConstructedTarget{.active            = ActiveTarget(std::make_unique<std::variant<Qwen3_8_27BInstance, DitInstance, EncoderInstance, VaeInstance>>(std::move(*instance))),
                              .load              = std::move(summary),
                              .sampling_defaults = ModelSamplingDefaults{}};
 }
@@ -285,6 +320,9 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
         }
         if (identity.model_id == qwen3_vl::Package::model_id) {
             return construct_encoder(options, device, reader, load_start, *target_key);
+        }
+        if (identity.model_id == qwen_image_vae::Package::model_id) {
+            return construct_vae(options, device, reader, load_start, *target_key);
         }
         return construct_registered<qwen3_8_27b::Package, LoadedQwen3_8_27B, Qwen3_8_27BInstance>(
             options, device, reader, load_start, *target_key);

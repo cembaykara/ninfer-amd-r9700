@@ -5,6 +5,7 @@
 #include <ninfer/targets/qwen3_8_27b/package.h>
 #include <ninfer/targets/qwen_image_21/package.h>
 #include <ninfer/targets/qwen3_vl/package.h>
+#include <ninfer/targets/qwen_image_vae/package.h>
 
 #include <memory>
 #include <optional>
@@ -22,6 +23,7 @@ registered_target_key(std::string_view model_id) noexcept {
     if (model_id == qwen3_8_27b::Package::model_id) { return qwen3_8_27b::Package::target_key; }
     if (model_id == qwen_image_21::Package::model_id) { return qwen_image_21::Package::target_key; }
     if (model_id == qwen3_vl::Package::model_id) { return qwen3_vl::Package::target_key; }
+    if (model_id == qwen_image_vae::Package::model_id) { return qwen_image_vae::Package::target_key; }
     return std::nullopt;
 }
 
@@ -92,7 +94,25 @@ struct EncoderInstance {
     EncoderInstance(EncoderInstance&&) = default;  // needed for the variant ActiveTarget
 };
 
-using ActiveTarget = std::unique_ptr<std::variant<Qwen3_8_27BInstance, DitInstance, EncoderInstance>>;
+struct LoadedVae {
+    std::unique_ptr<qwen_image_vae::Package::LoadedModel> model;
+    std::unique_ptr<qwen_image_vae::Package::ImageProgram> program;
+    explicit LoadedVae(std::unique_ptr<qwen_image_vae::Package::LoadedModel> m, DeviceContext& device);
+    ~LoadedVae();
+    LoadedVae(const LoadedVae&)            = delete;
+    LoadedVae& operator=(const LoadedVae&) = delete;
+};
+
+struct VaeInstance {
+    std::unique_ptr<LoadedVae> loaded;
+    VaeInstance(std::unique_ptr<LoadedVae> l);
+    ~VaeInstance();
+    VaeInstance(const VaeInstance&)            = delete;
+    VaeInstance& operator=(const VaeInstance&) = delete;
+    VaeInstance(VaeInstance&&) = default;  // needed for the variant ActiveTarget
+};
+
+using ActiveTarget = std::unique_ptr<std::variant<Qwen3_8_27BInstance, DitInstance, EncoderInstance, VaeInstance>>;
 
 struct ConstructedTarget {
     ActiveTarget active;
