@@ -51,6 +51,7 @@ struct Qwen3_8_27BInstance {
 
     Qwen3_8_27BInstance(const Qwen3_8_27BInstance&)            = delete;
     Qwen3_8_27BInstance& operator=(const Qwen3_8_27BInstance&) = delete;
+    Qwen3_8_27BInstance(Qwen3_8_27BInstance&&) = default;  // needed for the variant ActiveTarget
 };
 
 struct LoadedDit {
@@ -68,6 +69,7 @@ struct DitInstance {
     ~DitInstance();
     DitInstance(const DitInstance&)            = delete;
     DitInstance& operator=(const DitInstance&) = delete;
+    DitInstance(DitInstance&&) = default;  // needed for the variant ActiveTarget
 };
 
 using ActiveTarget = std::unique_ptr<std::variant<Qwen3_8_27BInstance, DitInstance>>;

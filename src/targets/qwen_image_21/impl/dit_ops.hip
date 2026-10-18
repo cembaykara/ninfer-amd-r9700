@@ -56,8 +56,8 @@ __global__ void dit_layernorm_kernel(const hip_bfloat16* __restrict__ x, hip_bfl
     }
     // block reduce sum and sumsq
     for (int off = 16; off > 0; off >>= 1) {
-        sum   += __shfl_down_sync(0xffffffffu, sum, off);
-        sumsq += __shfl_down_sync(0xffffffffu, sumsq, off);
+        sum   += __shfl_down_sync(0xffffffffull, sum, off);
+        sumsq += __shfl_down_sync(0xffffffffull, sumsq, off);
     }
     if ((threadIdx.x & 31) == 0) {
         red[0][threadIdx.x / 32] = sum;
@@ -169,12 +169,31 @@ void dit_residual_gate(const Tensor& x, const Tensor& gate, const Tensor& delta,
                                                          (hip_bfloat16*)out.data, tokens, hidden, total);
 }
 
-void dit_silu(const Tensor& x, Tensor& out, hipStream_t stream) {
+void dit_silu(const Tensor& x, const Tensor& out, hipStream_t stream) {
     const int total = (int)x.numel();
     dim3 grid((total + 255) / 256);
     dim3 block(256);
     dit_silu_kernel<<<grid, block, 0, stream>>>((const hip_bfloat16*)x.data, (hip_bfloat16*)out.data,
                                                 total);
+}
+
+__global__ void dit_silu_mul_kernel(const hip_bfloat16* __restrict__ gate,
+                                    const hip_bfloat16* __restrict__ up,
+                                    hip_bfloat16* __restrict__ out, int total) {
+    const int idx = blockIdx.x * 256 + threadIdx.x;
+    if (idx >= total) return;
+    const float g = gate[idx];
+    const float u = up[idx];
+    out[idx] = hip_bfloat16((g / (1.0F + expf(-g))) * u);
+}
+
+void dit_silu_mul(const Tensor& gate, const Tensor& up, const Tensor& out, hipStream_t stream) {
+    const int total = (int)gate.numel();
+    dim3 grid((total + 255) / 256);
+    dim3 block(256);
+    dit_silu_mul_kernel<<<grid, block, 0, stream>>>((const hip_bfloat16*)gate.data,
+                                                     (const hip_bfloat16*)up.data,
+                                                     (hip_bfloat16*)out.data, total);
 }
 
 } // namespace ninfer::targets::qwen_image_21::detail

@@ -23,7 +23,7 @@ public:
 
     RequestMemory(const RequestMemory&)            = delete;
     RequestMemory& operator=(const RequestMemory&) = delete;
-    RequestMemory(RequestMemory&&)                 = delete;
+    RequestMemory(RequestMemory&&);  // defined in .cpp (Impl is complete there); needed so the variant ActiveTarget can hold the instance
     RequestMemory& operator=(RequestMemory&&)      = delete;
 
     void activate(std::size_t bytes, std::size_t alignment);

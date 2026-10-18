@@ -177,18 +177,28 @@ Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 
+namespace {
+// The active target is a variant (text Qwen3 or the Qwen-Image DiT). These text-specific
+// methods only make sense for the Qwen3 instance; the DiT is served via its ImageProgram.
+const targets::Qwen3_8_27BInstance& text_target(const targets::ActiveTarget& active) {
+    if (active == nullptr) { throw std::logic_error("Engine target is not active"); }
+    const auto* qwen = std::get_if<targets::Qwen3_8_27BInstance>(&*active);
+    if (qwen == nullptr) { throw std::logic_error("Engine target is not a text model"); }
+    return *qwen;
+}
+} // namespace
+
 PreparedPrompt Engine::prepare(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     const SamplingMode sampling_mode =
         input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    const auto& target = impl_->active;
-    if (target == nullptr) { throw std::logic_error("Engine target is not active"); }
+    const auto& target = text_target(impl_->active);
     auto prepared = targets::qwen3::EncodedHistoryPrepare::prepare(
-        target->loaded->frontend, std::move(input), impl_->host_encode_cache);
+        target.loaded->frontend, std::move(input), impl_->host_encode_cache);
     PromptSummary info = prepared.summary();
-    if (info.prompt_tokens > target->capacity) {
+    if (info.prompt_tokens > target.capacity) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           context_capacity_error(info.prompt_tokens, target->capacity));
+                           context_capacity_error(info.prompt_tokens, target.capacity));
     }
     const double seconds = prepared.prepare_seconds();
     return PreparedPrompt(
@@ -198,14 +208,13 @@ PreparedPrompt Engine::prepare(PromptInput input) const {
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                                       bool allow_prefix_identity) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const auto& target = impl_->active;
-    if (target == nullptr) { throw std::logic_error("Engine target is not active"); }
+    const auto& target = text_target(impl_->active);
     auto prepared =
-        target->loaded->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
+        target.loaded->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
     PromptSummary info = prepared.summary();
-    if (info.prompt_tokens > target->capacity) {
+    if (info.prompt_tokens > target.capacity) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           context_capacity_error(info.prompt_tokens, target->capacity));
+                           context_capacity_error(info.prompt_tokens, target.capacity));
     }
     const double seconds = prepared.prepare_seconds();
     return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
@@ -214,24 +223,21 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
 
 std::uint32_t Engine::count_tokens(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const auto& target = impl_->active;
-    if (target == nullptr) { throw std::logic_error("Engine target is not active"); }
+    const auto& target = text_target(impl_->active);
     return targets::qwen3::EncodedHistoryPrepare::count_tokens(
-        target->loaded->frontend, std::move(input), impl_->host_encode_cache);
+        target.loaded->frontend, std::move(input), impl_->host_encode_cache);
 }
 
 PromptCapabilities Engine::prompt_capabilities() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const auto& target = impl_->active;
-    if (target == nullptr) { throw std::logic_error("Engine target is not active"); }
-    return target->loaded->frontend.prompt_capabilities();
+    const auto& target = text_target(impl_->active);
+    return target.loaded->frontend.prompt_capabilities();
 }
 
 std::string Engine::token_bytes(TokenId token) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const auto& target = impl_->active;
-    if (target == nullptr) { throw std::logic_error("Engine target is not active"); }
-    return std::string(target->loaded->frontend.token_bytes(token));
+    const auto& target = text_target(impl_->active);
+    return std::string(target.loaded->frontend.token_bytes(token));
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {

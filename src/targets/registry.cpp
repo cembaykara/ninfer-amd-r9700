@@ -176,7 +176,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
     summary.tensor_count         = stats.tensor_count;
     summary.resource_count       = stats.resource_count;
-    return ConstructedTarget{.active            = ActiveTarget(std::move(instance)),
+    return ConstructedTarget{.active            = ActiveTarget(std::make_unique<std::variant<Qwen3_8_27BInstance, DitInstance>>(std::move(*instance))),
                              .load              = std::move(summary),
                              .sampling_defaults = sampling_defaults};
 }

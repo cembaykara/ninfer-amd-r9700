@@ -45,6 +45,8 @@ RequestMemory::RequestMemory(DeviceContext& device, std::size_t frozen_capacity_
 
 RequestMemory::~RequestMemory() = default;
 
+RequestMemory::RequestMemory(RequestMemory&&) = default;  // moves the impl_ (unique_ptr<Impl>)
+
 void RequestMemory::activate(std::size_t bytes, std::size_t alignment) {
     if (bytes == 0) {
         if (alignment != 1) {

@@ -82,33 +82,33 @@ void ImageProgram::denoise(const Tensor& text_emb, int image_h, int image_w, Ten
 
 } // namespace detail
 
-WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
+detail::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
     (void)identity;
-    return WeightsProfile::R9700Bf16;
+    return detail::WeightsProfile::R9700Bf16;
 }
 
-LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
-                            WeightsProfile weights_profile) {
+detail::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
+                                    detail::WeightsProfile weights_profile) {
     (void)options;
     (void)weights_profile;
-    auto impl = std::make_unique<LoadPlan::Impl>();
-    impl->handles = plan_dit_weights(binder);
+    auto impl = std::make_unique<detail::LoadPlan::Impl>();
+    impl->handles = detail::plan_dit_weights(binder);
     impl->plan    = binder.finish();
     return LoadPlan(std::move(impl));
 }
 
-std::unique_ptr<LoadedModel>
+std::unique_ptr<detail::LoadedModel>
 Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
-    auto impl = std::make_unique<LoadedModel::Impl>();
-    bind_dit_weights(impl->weights, plan.impl_->handles, materialized);
-    return std::make_unique<LoadedModel>(std::move(impl));
+    auto impl = std::make_unique<detail::LoadedModel::Impl>();
+    detail::bind_dit_weights(impl->weights, plan.impl_->handles, materialized);
+    return std::unique_ptr<detail::LoadedModel>(new detail::LoadedModel(std::move(impl)));
 }
 
-std::unique_ptr<ImageProgram> Package::create_program(const LoadedModel& model, DeviceContext& device) {
-    auto impl = std::make_unique<ImageProgram::Impl>();
+std::unique_ptr<detail::ImageProgram> Package::create_program(const LoadedModel& model, DeviceContext& device) {
+    auto impl = std::make_unique<detail::ImageProgram::Impl>();
     impl->model  = &model;
     impl->device = &device;
-    return std::unique_ptr<ImageProgram>(new ImageProgram(std::move(impl)));
+    return std::unique_ptr<detail::ImageProgram>(new detail::ImageProgram(std::move(impl)));
 }
 
 } // namespace ninfer::targets::qwen_image_21

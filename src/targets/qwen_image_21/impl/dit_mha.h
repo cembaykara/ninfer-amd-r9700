@@ -6,6 +6,7 @@
 #include "core/tensor.h"
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
 
 namespace ninfer::targets::qwen_image_21::detail {
 

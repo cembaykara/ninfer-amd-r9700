@@ -5,6 +5,8 @@
 // entry point is an image denoise (prompt embeddings + shape -> latent).
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
+#include "core/tensor.h"
+#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <memory>

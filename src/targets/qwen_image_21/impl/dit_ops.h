@@ -5,6 +5,7 @@
 #include "core/tensor.h"
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
 
 #include <cstdint>
 
@@ -22,7 +23,10 @@ void dit_layer_norm(const Tensor& x, float eps, Tensor& out, hipStream_t stream)
 void dit_modulate_scale(const Tensor& x, const Tensor& scale, Tensor& out, hipStream_t stream);
 
 // In-place SiLU: out = x * sigmoid(x).
-void dit_silu(const Tensor& x, Tensor& out, hipStream_t stream);
+void dit_silu(const Tensor& x, const Tensor& out, hipStream_t stream);
+
+// SiLU(gate) * up (the MLP gate): out = silu(gate) * up.
+void dit_silu_mul(const Tensor& gate, const Tensor& up, const Tensor& out, hipStream_t stream);
 
 // Residual gate: out = x + tanh(gate) * delta, gate [batch, hidden] broadcast, delta [b,t,h].
 void dit_residual_gate(const Tensor& x, const Tensor& gate, const Tensor& delta, Tensor& out,

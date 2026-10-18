@@ -45,8 +45,8 @@ __global__ void dit_mha_kernel(const hip_bfloat16* __restrict__ q, const hip_bfl
     // block reduce (m, l)
     __shared__ float red[2][256 / 32];
     for (int off = 16; off > 0; off >>= 1) {
-        m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
-        l += __shfl_down_sync(0xffffffffu, l, off);
+        m = fmaxf(m, __shfl_down_sync(0xffffffffull, m, off));
+        l += __shfl_down_sync(0xffffffffull, l, off);
     }
     if ((threadIdx.x & 31) == 0) {
         red[0][threadIdx.x / 32] = m;
@@ -66,7 +66,7 @@ __global__ void dit_mha_kernel(const hip_bfloat16* __restrict__ q, const hip_bfl
     const float inv_l = 1.0F / red[1][0];
 
     // Pass 2: weighted sum of values.
-    float acc[HeadDim / 256];
+    float acc[(HeadDim + 255) / 256];  // ceil(HeadDim/256); indexed by d/256
     for (int d = threadIdx.x; d < HeadDim; d += 256) acc[d / 256] = 0.0F;
     for (int j = 0; j < tokens; j++) {
         float dot = 0.0F;

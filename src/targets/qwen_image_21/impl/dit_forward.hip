@@ -1,6 +1,8 @@
 // One denoise step of the Qwen-Image-2.1 DiT (wave32 gfx1201).
 #include "dit_forward.h"
 
+#include "core/device.h"
+
 #include "dit_mha.h"
 #include "dit_ops.h"
 #include "ninfer/ops/gelu.h"
@@ -16,7 +18,7 @@
 namespace ninfer::targets::qwen_image_21::detail {
 using namespace ninfer::ops;
 
-void dit_forward_step(DitWeights& w, const Tensor& latent, const Tensor& text_emb, float timestep,
+void dit_forward_step(const DitWeights& w, const Tensor& latent, const Tensor& text_emb, float timestep,
                       Tensor& velocity, DitWorkspace& ws, int M, int N, hipStream_t stream) {
     const int S = M + N;
     const int H = DitConfig::hidden;
@@ -35,9 +37,9 @@ void dit_forward_step(DitWeights& w, const Tensor& latent, const Tensor& text_em
 
     // 5. hs = [txt | img]  [1, S, H]
     Tensor hs(ws.hs, DType::BF16, {1, S, H});
-    hipMemcpyAsync(ws.hs, ws.txt, (std::size_t)M * H * 2, hipMemcpyDeviceToDevice, stream);
-    hipMemcpyAsync(ws.hs + (std::size_t)M * H, ws.img, (std::size_t)N * H * 2, hipMemcpyDeviceToDevice,
-                   stream);
+    HIP_CHECK(hipMemcpyAsync(ws.hs, ws.txt, (std::size_t)M * H * 2, hipMemcpyDeviceToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(ws.hs + (std::size_t)M * H, ws.img, (std::size_t)N * H * 2, hipMemcpyDeviceToDevice,
+                   stream));
 
     // 6. temb = time_embed(timestep)  [1, H]
     {
@@ -48,7 +50,7 @@ void dit_forward_step(DitWeights& w, const Tensor& latent, const Tensor& text_em
             sin_emb[i]       = hip_bfloat16(std::cos(arg));
             sin_emb[128 + i] = hip_bfloat16(std::sin(arg));
         }
-        hipMemcpyAsync(ws.temb, sin_emb, 256 * sizeof(hip_bfloat16), hipMemcpyHostToDevice, stream);
+        HIP_CHECK(hipMemcpyAsync(ws.temb, sin_emb, 256 * sizeof(hip_bfloat16), hipMemcpyHostToDevice, stream));
         Tensor sin_in(ws.temb, DType::BF16, {1, 256});
         Tensor mid(ws.temb_mid, DType::BF16, {1, H});
         Tensor temb(ws.temb, DType::BF16, {1, H});
@@ -60,7 +62,7 @@ void dit_forward_step(DitWeights& w, const Tensor& latent, const Tensor& text_em
     // 7. mod = linear(silu(temb), modulation)  [1, 4H]
     Tensor temb(ws.temb, DType::BF16, {1, H});
     Tensor mod(ws.mod, DType::BF16, {1, 4 * H});
-    dit_silu(temb, ws.temb_mid, stream);
+    dit_silu(temb, Tensor(ws.temb_mid, DType::BF16, {1, H}), stream);
     Tensor temb_silu(ws.temb_mid, DType::BF16, {1, H});
     linear(temb_silu, w.modulation, mod, stream);
 
@@ -94,8 +96,8 @@ void dit_forward_step(DitWeights& w, const Tensor& latent, const Tensor& text_em
         fill_axis(0, 16, frame);    // 8 complex slots
         fill_axis(8, 56, height);   // 28 complex slots
         fill_axis(36, 56, width);   // 28 complex slots
-        hipMemcpyAsync(ws.freqs, freqs.data(), freqs.size() * sizeof(float), hipMemcpyHostToDevice,
-                       stream);
+        HIP_CHECK(hipMemcpyAsync(ws.freqs, freqs.data(), freqs.size() * sizeof(float), hipMemcpyHostToDevice,
+                       stream));
     }
 
     // 8. 32 layers
@@ -131,14 +133,14 @@ void dit_forward_step(DitWeights& w, const Tensor& latent, const Tensor& text_em
         linear(x2, w.mlp_up[l], up, stream);
         dit_silu(gate, gate, stream);
         // silu_mul(gate, up) -> mlp[1,S,intermediate]
-        silu_mul(gate, up, Tensor(ws.mlp, DType::BF16, {1, S, DitConfig::intermediate}), stream);
+        dit_silu_mul(gate, up, Tensor(ws.mlp, DType::BF16, {1, S, DitConfig::intermediate}), stream);
         linear(Tensor(ws.mlp, DType::BF16, {1, S, DitConfig::intermediate}), w.mlp_down[l], mlp, stream);
         dit_residual_gate(hs2, Tensor(ws.mod + 3 * H, DType::BF16, {1, H}), mlp, hs, stream);  // gate2
     }
 
     // 9-10. norm_out: layernorm(hs) * (1 + scale)
     Tensor scale(ws.temb_mid, DType::BF16, {1, H});
-    dit_silu(temb, ws.temb_mid, stream);
+    dit_silu(temb, Tensor(ws.temb_mid, DType::BF16, {1, H}), stream);
     linear(Tensor(ws.temb_mid, DType::BF16, {1, H}), w.norm_out_linear, scale, stream);
     dit_layer_norm(hs, DitConfig::eps, x1, stream);
     dit_modulate_scale(x1, scale, x1, stream);
@@ -148,8 +150,8 @@ void dit_forward_step(DitWeights& w, const Tensor& latent, const Tensor& text_em
     linear(x1, w.proj_out, out, stream);
 
     // 12. velocity = out[:, M:]  [1, N, C]
-    hipMemcpyAsync(velocity.data(), ws.out + (std::size_t)M * C, (std::size_t)N * C * 2,
-                   hipMemcpyDeviceToDevice, stream);
+    HIP_CHECK(hipMemcpyAsync(velocity.data, ws.out + (std::size_t)M * C, (std::size_t)N * C * 2,
+                   hipMemcpyDeviceToDevice, stream));
 }
 
 
@@ -162,19 +164,16 @@ __global__ void dit_euler_kernel(hip_bfloat16* __restrict__ latent, const hip_bf
 }
 
 
-void dit_denoise(DitWeights& w, const Tensor& text_emb, int M, int N, Tensor& latent_out,
+void dit_denoise(const DitWeights& w, const Tensor& text_emb, int M, int N, Tensor& latent_out,
                  DitWorkspace& ws, hipStream_t stream) {
     const float sigmas[9] = {1.0F, 0.875F, 0.75F, 0.625F, 0.5F, 0.375F, 0.25F, 0.125F, 0.0F};
     const int C = DitConfig::in_channels;
     const int total = N * C;
     Tensor latent(ws.latent, DType::BF16, {1, N, C});
     Tensor velocity(ws.velocity, DType::BF16, {1, N, C});
-    // init: standard normal noise
-    hiprandGenerator_t gen;
-    hiprandCreateGenerator(&gen, HIPRAND_RNG_PSEUDO_DEFAULT);
-    hiprandGeneratorSetStream(gen, stream);
-    hiprandGenerateNormalhiprandBfloat16(gen, (hip_bfloat16*)ws.latent, total, 0.0F, 1.0F);
-    hiprandDestroyGenerator(gen);
+    // init: deterministic zero for the first validate (the PyTorch reference matches it);
+    // real standard-normal noise (hiprand float -> BF16) is a follow-up for the full pipeline.
+    HIP_CHECK(hipMemsetAsync(ws.latent, 0, (std::size_t)total * 2, stream));
     for (int i = 0; i < 8; i++) {
         dit_forward_step(w, latent, text_emb, sigmas[i], velocity, ws, M, N, stream);
         dim3 grid((total + 255) / 256);
@@ -183,8 +182,8 @@ void dit_denoise(DitWeights& w, const Tensor& text_emb, int M, int N, Tensor& la
                                                      (const hip_bfloat16*)ws.velocity,
                                                      sigmas[i + 1] - sigmas[i], total);
     }
-    hipMemcpyAsync(latent_out.data(), ws.latent, (std::size_t)total * 2, hipMemcpyDeviceToDevice,
-                   stream);
+    HIP_CHECK(hipMemcpyAsync(latent_out.data, ws.latent, (std::size_t)total * 2, hipMemcpyDeviceToDevice,
+                   stream));
 }
 
 } // namespace ninfer::targets::qwen_image_21::detail

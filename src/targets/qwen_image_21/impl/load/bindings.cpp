@@ -1,5 +1,6 @@
 #include "bindings.h"
 
+#include <array>
 #include <stdexcept>
 #include <string>
 
@@ -10,13 +11,13 @@ using artifact::NumericFormat;
 using artifact::StorageLayout;
 
 artifact::ObjectHandle req(artifact::Binder& b, const std::string& name, int out, int in) {
-    return b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1,
-                            {static_cast<std::uint64_t>(out), static_cast<std::uint64_t>(in)});
+    const std::array<std::uint64_t, 2> shape{static_cast<std::uint64_t>(out), static_cast<std::uint64_t>(in)};
+    return b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
 }
 
 artifact::ObjectHandle req1d(artifact::Binder& b, const std::string& name, int size) {
-    return b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1,
-                            {static_cast<std::uint64_t>(size)});
+    const std::array<std::uint64_t, 1> shape{static_cast<std::uint64_t>(size)};
+    return b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
 }
 
 Weight make_weight(const void* data, int out, int in) {
