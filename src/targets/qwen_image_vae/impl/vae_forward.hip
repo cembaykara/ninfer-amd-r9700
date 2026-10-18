@@ -138,15 +138,59 @@ void upsample(const VaeWeights::Upsampler& u, const hip_bfloat16* in, int c, int
     ops::conv2d_3x3(in2, w1, b1, out_t, s);
 }
 
-// Mid attention (single head, head_dim = dim): RMS -> to_qkv -> attn -> proj
+// Single-head self-attention over spatial positions (head_dim = dim).
+// q,k,v: [dim, hw] (from to_qkv). attn: [hw, hw] weights. out: [dim, hw].
+__global__ void attn_row_kernel(const hip_bfloat16* __restrict__ q, const hip_bfloat16* __restrict__ k,
+                                int dim, int hw, hip_bfloat16* __restrict__ attn) {
+    const int qpos = blockIdx.x;
+    if (qpos >= hw) return;
+    const float scale = 1.0f / sqrtf((float)dim);
+    // pass 1: max
+    float mx = -1e30f;
+    for (int kp = 0; kp < hw; ++kp) {
+        float dot = 0.0f;
+        for (int d = 0; d < dim; ++d) dot += float(q[(std::int64_t)d * hw + qpos]) * float(k[(std::int64_t)d * hw + kp]);
+        mx = fmaxf(mx, dot * scale);
+    }
+    // pass 2: unnormalized exp + sum
+    float sum = 0.0f;
+    for (int kp = 0; kp < hw; ++kp) {
+        float dot = 0.0f;
+        for (int d = 0; d < dim; ++d) dot += float(q[(std::int64_t)d * hw + qpos]) * float(k[(std::int64_t)d * hw + kp]);
+        float e = expf(dot * scale - mx);
+        attn[(std::int64_t)qpos * hw + kp] = hip_bfloat16(e);
+        sum += e;
+    }
+    // pass 3: normalize
+    const float inv = 1.0f / sum;
+    for (int kp = 0; kp < hw; ++kp)
+        attn[(std::int64_t)qpos * hw + kp] = hip_bfloat16(float(attn[(std::int64_t)qpos * hw + kp]) * inv);
+}
+__global__ void attn_out_kernel(const hip_bfloat16* __restrict__ attn, const hip_bfloat16* __restrict__ v,
+                                int dim, int hw, hip_bfloat16* __restrict__ out) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim * hw) return;
+    const int c = idx / hw, qpos = idx % hw;
+    float acc = 0.0f;
+    for (int kp = 0; kp < hw; ++kp)
+        acc += float(attn[(std::int64_t)qpos * hw + kp]) * float(v[(std::int64_t)c * hw + kp]);
+    out[idx] = hip_bfloat16(acc);
+}
 void mid_attention(const VaeWeights& wts, const hip_bfloat16* in, int dim, int h, int w,
                    hip_bfloat16* out, VaeWorkspace& ws, hipStream_t s) {
     const int hw = h * w;
     rms_channels(in, wts.mid_attn_norm, dim, h, w, ws.a, s);
     conv1x1(ws.a, wts.mid_attn_to_qkv, wts.mid_attn_to_qkv_b, dim, 3 * dim, hw, ws.b, s);
-    // NOTE: full attention (q@k^T softmax @v) is a TODO — placeholder: out = 2*in
-    (void)wts.mid_attn_proj; (void)wts.mid_attn_proj_b;
-    add(in, in, (std::int64_t)dim * hw, out, s);
+    // q = ws.b[0:dim], k = ws.b[dim:2dim], v = ws.b[2dim:3dim]
+    const hip_bfloat16* q = ws.b;
+    const hip_bfloat16* k = ws.b + (std::int64_t)dim * hw;
+    const hip_bfloat16* v = ws.b + (std::int64_t)2 * dim * hw;
+    dim3 blk(256);
+    attn_row_kernel<<<hw, blk, 0, s>>>(q, k, dim, hw, ws.c);
+    dim3 grd((std::int64_t)dim * hw / 256 + 1);
+    attn_out_kernel<<<grd, blk, 0, s>>>(ws.c, v, dim, hw, ws.d);
+    // proj: [dim, hw] -> [dim, hw]
+    conv1x1(ws.d, wts.mid_attn_proj, wts.mid_attn_proj_b, dim, dim, hw, out, s);
 }
 
 } // namespace
