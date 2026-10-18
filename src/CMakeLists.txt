@@ -47,6 +47,7 @@ add_library(ninfer_r9700_core STATIC
   ops/r9700/sampling/sampling.hip
   ops/r9700/rope/rope.hip
   ops/r9700/persistent/persistent_decode.hip
+  ops/r9700/conv/conv2d_3x3.hip
   ops/r9700/vision/vision_attention.hip
   ops/r9700/vision/vision_pos_embed.hip
   ops/r9700/attention_projection/attention_projection.hip
