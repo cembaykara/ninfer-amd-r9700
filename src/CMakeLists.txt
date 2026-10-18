@@ -229,6 +229,15 @@ target_link_libraries(ninfer_r9700_qwen_image_21_runtime PUBLIC
   ninfer_r9700_core
   hip::host)
 
+add_library(ninfer_r9700_qwen_image_vae_runtime STATIC
+  targets/qwen_image_vae/impl/vae_forward.hip)
+ninfer_r9700_internal_includes(ninfer_r9700_qwen_image_vae_runtime)
+set_target_properties(ninfer_r9700_qwen_image_vae_runtime PROPERTIES
+  HIP_ARCHITECTURES gfx1201)
+target_link_libraries(ninfer_r9700_qwen_image_vae_runtime PUBLIC
+  ninfer_r9700_target_bindings
+  ninfer_r9700_core
+  hip::host)
 add_library(ninfer_r9700_qwen3_vl_runtime STATIC
   targets/qwen3_vl/impl/causal_gqa.hip
   targets/qwen3_vl/impl/encoder_forward.hip
@@ -280,6 +289,7 @@ set_target_properties(ninfer_engine PROPERTIES
 target_link_libraries(ninfer_engine PUBLIC
   ninfer_r9700_qwen3_8_27b_runtime
   ninfer_r9700_qwen_image_21_runtime
+  ninfer_r9700_qwen_image_vae_runtime
   ninfer_r9700_qwen3_vl_runtime
   ninfer_r9700_target_bindings
   ninfer_artifact
