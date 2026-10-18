@@ -50,9 +50,15 @@ struct DitWorkspace {
     hip_bfloat16* mlp  = nullptr;  // [1, M+N, 4096]
     hip_bfloat16* out  = nullptr;  // [1, M+N, 64]
     float* freqs       = nullptr;  // [M+N, 128] RoPE freqs (re/im interleaved)
+    hip_bfloat16* latent   = nullptr;  // [1, N, 64] current noisy latent
+    hip_bfloat16* velocity = nullptr;  // [1, N, 64] model velocity
 };
 
 void dit_forward_step(DitWeights& w, const Tensor& latent, const Tensor& text_emb, float timestep,
                       Tensor& velocity, DitWorkspace& ws, int M, int N, hipStream_t stream);
+
+// Run the full 8-step flow-matching denoise: init noise, 8 Euler steps, return the latent.
+void dit_denoise(DitWeights& w, const Tensor& text_emb, int M, int N, Tensor& latent_out,
+                     DitWorkspace& ws, hipStream_t stream);
 
 } // namespace ninfer::targets::qwen_image_21::detail

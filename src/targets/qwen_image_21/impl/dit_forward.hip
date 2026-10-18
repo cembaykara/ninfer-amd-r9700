@@ -8,6 +8,7 @@
 #include "ninfer/ops/rmsnorm.h"
 
 #include <hip/hip_bfloat16.h>
+#include <hiprand/hiprand.h>
 
 #include <cmath>
 #include <vector>
@@ -149,6 +150,41 @@ void dit_forward_step(DitWeights& w, const Tensor& latent, const Tensor& text_em
     // 12. velocity = out[:, M:]  [1, N, C]
     hipMemcpyAsync(velocity.data(), ws.out + (std::size_t)M * C, (std::size_t)N * C * 2,
                    hipMemcpyDeviceToDevice, stream);
+}
+
+
+// latent += scale * velocity  (elementwise, [1, N, C])
+__global__ void dit_euler_kernel(hip_bfloat16* __restrict__ latent, const hip_bfloat16* __restrict__ velocity,
+                                 float scale, int total) {
+    const int idx = blockIdx.x * 256 + threadIdx.x;
+    if (idx >= total) return;
+    latent[idx] = hip_bfloat16(latent[idx] + scale * velocity[idx]);
+}
+
+
+void dit_denoise(DitWeights& w, const Tensor& text_emb, int M, int N, Tensor& latent_out,
+                 DitWorkspace& ws, hipStream_t stream) {
+    const float sigmas[9] = {1.0F, 0.875F, 0.75F, 0.625F, 0.5F, 0.375F, 0.25F, 0.125F, 0.0F};
+    const int C = DitConfig::in_channels;
+    const int total = N * C;
+    Tensor latent(ws.latent, DType::BF16, {1, N, C});
+    Tensor velocity(ws.velocity, DType::BF16, {1, N, C});
+    // init: standard normal noise
+    hiprandGenerator_t gen;
+    hiprandCreateGenerator(&gen, HIPRAND_RNG_PSEUDO_DEFAULT);
+    hiprandGeneratorSetStream(gen, stream);
+    hiprandGenerateNormalhiprandBfloat16(gen, (hip_bfloat16*)ws.latent, total, 0.0F, 1.0F);
+    hiprandDestroyGenerator(gen);
+    for (int i = 0; i < 8; i++) {
+        dit_forward_step(w, latent, text_emb, sigmas[i], velocity, ws, M, N, stream);
+        dim3 grid((total + 255) / 256);
+        dim3 block(256);
+        dit_euler_kernel<<<grid, block, 0, stream>>>((hip_bfloat16*)ws.latent,
+                                                     (const hip_bfloat16*)ws.velocity,
+                                                     sigmas[i + 1] - sigmas[i], total);
+    }
+    hipMemcpyAsync(latent_out.data(), ws.latent, (std::size_t)total * 2, hipMemcpyDeviceToDevice,
+                   stream);
 }
 
 } // namespace ninfer::targets::qwen_image_21::detail
