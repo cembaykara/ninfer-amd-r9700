@@ -1,0 +1,126 @@
+// Qwen3-VL vision (ViT) encoder forward (wave32 gfx1201).
+#include "vision_forward.h"
+
+#include "core/device.h"
+#include "ninfer/ops/add_bias.h"
+#include "ninfer/ops/cast.h"
+#include "ninfer/ops/gelu.h"
+#include "ninfer/ops/layer_norm.h"
+#include "ninfer/ops/linear.h"
+#include "ninfer/ops/residual_add.h"
+#include "ninfer/ops/rope.h"
+#include "ninfer/ops/vision_attention.h"
+#include "ninfer/ops/vision_pos_embed.h"
+
+#include <hip/hip_bfloat16.h>
+
+namespace ninfer::targets::qwen3_vl::detail {
+using namespace ninfer::ops;
+
+void vision_forward(const VisionWeights& w, const float* patches, int patches_count,
+                    int segment_count, const int* position_ids_host, const int* cu_seqlens_host,
+                    const int* pos_indices_host, const float* pos_weights_host,
+                    hip_bfloat16* merged_out, hip_bfloat16* deepstack_out, VisionWorkspace& ws,
+                    hipStream_t stream) {
+    const int H   = VisionConfig::hidden;      // 1152
+    const int P   = patches_count;
+    const int V   = P / VisionConfig::merge_unit;
+    const float eps = VisionConfig::eps;
+
+    // copy host control tensors to device
+    HIP_CHECK(hipMemcpyAsync(ws.position_ids, position_ids_host, sizeof(int) * P * 2,
+                             hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(ws.cu_seqlens, cu_seqlens_host,
+                             sizeof(int) * (segment_count + 1), hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(ws.pos_indices, pos_indices_host, sizeof(int) * 4 * P,
+                             hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(ws.pos_weights, pos_weights_host, sizeof(float) * 4 * P,
+                             hipMemcpyHostToDevice, stream));
+
+    // 1. patches FP32 [1152, P] -> BF16, then patch embed (linear [1152,1152] + bias).
+    Tensor patch_f32(const_cast<float*>(patches), DType::FP32, {H, P});
+    Tensor x(ws.x, DType::BF16, {H, P});
+    cast_fp32_to_bf16(patch_f32, x, stream);
+    linear(x, w.patch_embed, x, stream);
+    add_bias(w.patch_embed_bias, x, stream);
+
+    // 2. position embed (4-corner interpolation). table is [1152, 2304] (zero-copy view).
+    Tensor pos_table(w.pos_embed.data, DType::BF16, {H, VisionConfig::pos_embed});
+    Tensor pos_idx(ws.pos_indices, DType::I32, {4, P});
+    Tensor pos_wt(ws.pos_weights, DType::FP32, {4, P});
+    vision_pos_embed_add(pos_table, pos_idx, pos_wt, x, stream);
+
+    // 3. the 27 blocks.
+    Tensor qkv_t(ws.qkv, DType::BF16, {3 * H, P});
+    Tensor h_t(ws.h, DType::BF16, {H, P});
+    Tensor attended_t(ws.attended, DType::BF16, {H, P});
+    Tensor projected_t(ws.projected, DType::BF16, {H, P});
+    Tensor up_t(ws.up, DType::BF16, {VisionConfig::intermediate, P});
+    Tensor down_t(ws.down, DType::BF16, {H, P});
+    Tensor pos_ids(ws.position_ids, DType::I32, {P, 2});
+
+    for (int l = 0; l < VisionConfig::layers; l++) {
+        // attention sub-block
+        layer_norm(x, w.norm1_w[l], w.norm1_b[l], eps, h_t, stream);
+        linear(h_t, w.qkv[l], qkv_t, stream);
+        add_bias(w.qkv_bias[l], qkv_t, stream);
+        // split qkv [3456, P] into q/k/v planes [72, 16, P]
+        const std::size_t plane_bytes = static_cast<std::size_t>(H) * sizeof(hip_bfloat16);
+        Tensor q(reinterpret_cast<hip_bfloat16*>(qkv_t.data), DType::BF16,
+                 {VisionConfig::head_dim, VisionConfig::heads, P});
+        Tensor k(reinterpret_cast<hip_bfloat16*>(qkv_t.data) + H * P, DType::BF16,
+                 {VisionConfig::head_dim, VisionConfig::heads, P});
+        Tensor v(reinterpret_cast<hip_bfloat16*>(qkv_t.data) + 2 * H * P, DType::BF16,
+                 {VisionConfig::head_dim, VisionConfig::heads, P});
+        (void)plane_bytes;
+        rope(pos_ids, VisionConfig::rotary_dim, VisionConfig::rope_theta, q, k, stream);
+        Tensor attended_heads(attended_t.data, DType::BF16,
+                              {VisionConfig::head_dim, VisionConfig::heads, P});
+        // single image: fixed segment length P, no workspace needed
+        vision_attention(q, k, v, P, attended_heads, stream);
+        linear(attended_t, w.proj[l], projected_t, stream);
+        add_bias(w.proj_bias[l], projected_t, stream);
+        residual_add(projected_t, x, stream);
+
+        // mlp sub-block
+        layer_norm(x, w.norm2_w[l], w.norm2_b[l], eps, h_t, stream);
+        linear(h_t, w.fc1[l], up_t, stream);
+        add_bias(w.fc1_bias[l], up_t, stream);
+        gelu(up_t, GeluMode::Tanh, stream);
+        linear(up_t, w.fc2[l], down_t, stream);
+        add_bias(w.fc2_bias[l], down_t, stream);
+        residual_add(down_t, x, stream);
+
+        // deepstack capture at layers 8/16/24
+        for (int d = 0; d < VisionConfig::deepstack_layers; d++) {
+            if (l == VisionConfig::deepstack_index[d]) {
+                // view [1152, P] -> [4608, V] (spatial merge), norm, fc1, gelu, fc2
+                Tensor merged_view(x.data, DType::BF16, {VisionConfig::merger_hidden, V});
+                Tensor ds_normed(ws.merged, DType::BF16, {VisionConfig::merger_hidden, V});
+                layer_norm(merged_view, w.ds_norm_w[d], w.ds_norm_b[d], eps, ds_normed, stream);
+                Tensor ds_h(ws.mhidden, DType::BF16, {VisionConfig::merger_hidden, V});
+                linear(ds_normed, w.ds_fc1[d], ds_h, stream);
+                add_bias(w.ds_fc1_bias[d], ds_h, stream);
+                gelu(ds_h, GeluMode::Exact, stream);
+                Tensor ds_out(deepstack_out + d * VisionConfig::out_hidden * V, DType::BF16,
+                              {VisionConfig::out_hidden, V});
+                linear(ds_h, w.ds_fc2[d], ds_out, stream);
+                add_bias(w.ds_fc2_bias[d], ds_out, stream);
+            }
+        }
+    }
+
+    // 4. main merger: norm [1152,P] -> view [4608,V] -> fc1 -> gelu -> fc2 -> [4096,V]
+    Tensor normed(ws.h, DType::BF16, {H, P});
+    layer_norm(x, w.merger_norm_w, w.merger_norm_b, eps, normed, stream);
+    Tensor merged_in(normed.data, DType::BF16, {VisionConfig::merger_hidden, V});
+    Tensor mhidden(ws.mhidden, DType::BF16, {VisionConfig::merger_hidden, V});
+    linear(merged_in, w.merger_fc1, mhidden, stream);
+    add_bias(w.merger_fc1_bias, mhidden, stream);
+    gelu(mhidden, GeluMode::Exact, stream);
+    Tensor out(merged_out, DType::BF16, {VisionConfig::out_hidden, V});
+    linear(mhidden, w.merger_fc2, out, stream);
+    add_bias(w.merger_fc2_bias, out, stream);
+}
+
+} // namespace ninfer::targets::qwen3_vl::detail

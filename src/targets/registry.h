@@ -4,6 +4,7 @@
 #include "runtime/engine/request_memory.h"
 #include <ninfer/targets/qwen3_8_27b/package.h>
 #include <ninfer/targets/qwen_image_21/package.h>
+#include <ninfer/targets/qwen3_vl/package.h>
 
 #include <memory>
 #include <optional>
@@ -20,6 +21,7 @@ namespace targets {
 registered_target_key(std::string_view model_id) noexcept {
     if (model_id == qwen3_8_27b::Package::model_id) { return qwen3_8_27b::Package::target_key; }
     if (model_id == qwen_image_21::Package::model_id) { return qwen_image_21::Package::target_key; }
+    if (model_id == qwen3_vl::Package::model_id) { return qwen3_vl::Package::target_key; }
     return std::nullopt;
 }
 
@@ -72,7 +74,25 @@ struct DitInstance {
     DitInstance(DitInstance&&) = default;  // needed for the variant ActiveTarget
 };
 
-using ActiveTarget = std::unique_ptr<std::variant<Qwen3_8_27BInstance, DitInstance>>;
+struct LoadedEncoder {
+    std::unique_ptr<qwen3_vl::Package::LoadedModel> model;
+    std::unique_ptr<qwen3_vl::Package::EncoderProgram> program;
+    explicit LoadedEncoder(std::unique_ptr<qwen3_vl::Package::LoadedModel> m, DeviceContext& device);
+    ~LoadedEncoder();
+    LoadedEncoder(const LoadedEncoder&)            = delete;
+    LoadedEncoder& operator=(const LoadedEncoder&) = delete;
+};
+
+struct EncoderInstance {
+    std::unique_ptr<LoadedEncoder> loaded;
+    EncoderInstance(std::unique_ptr<LoadedEncoder> l);
+    ~EncoderInstance();
+    EncoderInstance(const EncoderInstance&)            = delete;
+    EncoderInstance& operator=(const EncoderInstance&) = delete;
+    EncoderInstance(EncoderInstance&&) = default;  // needed for the variant ActiveTarget
+};
+
+using ActiveTarget = std::unique_ptr<std::variant<Qwen3_8_27BInstance, DitInstance, EncoderInstance>>;
 
 struct ConstructedTarget {
     ActiveTarget active;

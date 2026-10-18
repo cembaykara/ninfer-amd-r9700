@@ -8,6 +8,7 @@ function(ninfer_r9700_internal_includes target)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen_image_21/export
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_vl/export
     ${PROJECT_SOURCE_DIR}/third_party)
 endfunction()
 
@@ -127,7 +128,8 @@ add_library(ninfer_r9700_target_bindings STATIC
   targets/qwen3_8_27b/impl/package_identity.cpp
   targets/qwen3_8_27b/impl/load/bindings.cpp
   targets/qwen3_8_27b/impl/variant.cpp
-  targets/qwen_image_21/impl/load/bindings.cpp)
+  targets/qwen_image_21/impl/load/bindings.cpp
+  targets/qwen3_vl/impl/load/bindings.cpp)
 if(NINFER_R9700_XATTENTION_QUALIFICATION)
   target_compile_definitions(ninfer_r9700_target_bindings PRIVATE
     NINFER_R9700_XATTENTION_QUALIFICATION=1)
@@ -225,6 +227,19 @@ target_link_libraries(ninfer_r9700_qwen_image_21_runtime PUBLIC
   ninfer_r9700_core
   hip::host)
 
+add_library(ninfer_r9700_qwen3_vl_runtime STATIC
+  targets/qwen3_vl/impl/causal_gqa.hip
+  targets/qwen3_vl/impl/encoder_forward.hip
+  targets/qwen3_vl/impl/vision_forward.hip
+  targets/qwen3_vl/impl/package.cpp)
+ninfer_r9700_internal_includes(ninfer_r9700_qwen3_vl_runtime)
+set_target_properties(ninfer_r9700_qwen3_vl_runtime PROPERTIES
+  HIP_ARCHITECTURES gfx1201)
+target_link_libraries(ninfer_r9700_qwen3_vl_runtime PUBLIC
+  ninfer_r9700_target_bindings
+  ninfer_r9700_core
+  hip::host)
+
 # Force every runtime archive member into one physical planner executable. This prevents an
 # unresolved schedule dependency from being hidden merely because a small main does not call that
 # Program method. The observable route then constructs/finalizes every C=1..8 ordinary, Vision,
@@ -261,6 +276,7 @@ set_target_properties(ninfer_engine PROPERTIES
 target_link_libraries(ninfer_engine PUBLIC
   ninfer_r9700_qwen3_8_27b_runtime
   ninfer_r9700_qwen_image_21_runtime
+  ninfer_r9700_qwen3_vl_runtime
   ninfer_r9700_target_bindings
   ninfer_artifact
   ninfer_r9700_core
