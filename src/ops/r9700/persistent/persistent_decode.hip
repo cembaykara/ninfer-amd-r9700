@@ -144,7 +144,7 @@ struct PhaseStreams {
     std::uint32_t reserved;
 };
 
-// ---- Entries.
+// Entries.
 // Row block c of an LQ4 weight: its contiguous N16 code tiles and group codes.
 inline PhaseStreams lq4_streams(const linear::Lq4Weight& first, const linear::Lq4Weight& second) {
     const auto part = [](const linear::Lq4Weight& weight) {
@@ -471,7 +471,7 @@ constexpr std::size_t max_lds(std::index_sequence<I...>) {
 constexpr std::size_t kLdsBytes = max_lds(std::make_index_sequence<kEntryCount>{});
 static_assert(kLdsBytes <= kLdsBudget);
 
-// ---- Device program.
+// Device program.
 struct Phase {
     std::uint32_t entry;
     std::uint32_t grid_x;
@@ -736,7 +736,7 @@ __global__ __launch_bounds__(kBlockThreads) __attribute__((
     }
 }
 
-// ---- Host lowering.
+// Host lowering.
 struct HostEntry {
     const void* kernel                              = nullptr;
     std::uint32_t launch_threads                    = 0;

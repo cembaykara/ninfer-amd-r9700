@@ -35,7 +35,6 @@ constexpr std::size_t kMaxDraftTokens = 15;
 static_assert(kMaxDraftTokens >= product::kMaximumMtpDraftTokens &&
               kMaxDraftTokens >= product::kMaximumDFlashDraftTokens);
 
-// ---------------------------------------------------------------------------
 // Histogram bounds. A Histogram type carries its bounds, so observation and
 // rendering cannot disagree.
 
@@ -116,7 +115,6 @@ using DecodeRateHistogram  = Histogram<kDecodeRateBounds>;
 using PrefillRateHistogram = Histogram<kPrefillRateBounds>;
 using CountHistogram       = Histogram<kCountBounds>;
 
-// ---------------------------------------------------------------------------
 // Closed label vocabularies. Array order is the storage index.
 
 constexpr const char* kProtocols[]   = {"openai_chat", "openai_responses", "anthropic_messages"};
@@ -342,7 +340,6 @@ template <std::size_t N>
 
 [[nodiscard]] const char* yn(bool value) { return value ? "true" : "false"; }
 
-// ---------------------------------------------------------------------------
 // Stored state.
 
 struct Startup {
@@ -526,7 +523,6 @@ void observe_success(Series& series, std::size_t protocol, const GenerationOutco
     }
 }
 
-// ---------------------------------------------------------------------------
 // Prometheus text.
 
 void append_number(std::string& out, double value) {
@@ -953,7 +949,6 @@ std::string render_text(const MetricsSnapshotData& data) {
     return w.take();
 }
 
-// ---------------------------------------------------------------------------
 // JSON.
 
 template <const auto& Bounds>

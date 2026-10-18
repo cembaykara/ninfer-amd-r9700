@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Fast-iteration speed suite for the live NInfer serve (default :8081).
+"""Measure workloads against a running NInfer server (default :8081).
 
 Runs a scenario matrix (small/large prompts, thinking on/off, multi-turn,
 tools, context prefill, decode-heavy) against the running server and reports
 per-case prefill tok/s, decode tok/s, TTFT, and end-to-end wall time.
 
-Metrics come from the usage object's single-storage-location stats
-(usage.prompt_tokens_details.ninfer.* + completion_tokens_details):
+Metrics come from usage.prompt_tokens_details.ninfer and completion_tokens_details:
   prefill_tok_s  = ninfer.prefill.tok_s (computed non-reused suffix only)
   prefill_tail_tok_s = ninfer.prefill.tail_tok_s (steady-state rate, trailing <=1s)
   ttft_ms        = client wall time to first content/reasoning delta (stream)
@@ -40,7 +39,7 @@ from pathlib import Path
 
 
 def repo_root() -> Path:
-    """Repo root = the directory containing CMakeLists.txt (walk up from here)."""
+    """Find the repository root by walking up to CMakeLists.txt."""
     here = Path(__file__).resolve().parent
     for candidate in (here, *here.parents[:6]):
         if (candidate / "CMakeLists.txt").is_file():

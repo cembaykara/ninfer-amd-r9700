@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
-"""NIAH (needle-in-a-haystack) recall check against the live NInfer serve.
+"""Check needle-in-a-haystack recall against a running NInfer server.
 
-This is a behavioral long-context attention gate: a broken attention path loses
-the needle. The script hits the
-*already-running* server (no engine restart / reconfig) and checks whether the
-exact needle string is retrieved in the model's answer to a long-context
-question. It reports per-run recall (e.g. 3/3) rather than a speed metric.
-
-Stdlib only; never restarts or reconfigures the engine. Fixtures resolve
-relative to the repo root (auto-detected) unless given as an absolute path.
+Checks whether each answer contains the exact needle and reports per-run
+recall. Uses only the standard library and does not restart or reconfigure
+the server. Relative fixture paths resolve from the repository root.
 
     python3 -m tools.bench.run_niah_check --label SAGE --runs 3
     python3 -m tools.bench.run_niah_check --fixture examples/cli/messages/long_niah_64k.json \
         --needle "ORCHID=493817; COLOR=COBALT" --max-tokens 64 --label SAGE
 
-Outputs a per-run JSON record under profiles/bench/niah-check/ (gitignored). Durable gate evidence
-uses an explicit --out together with --server-log, --artifact, and --serve-bin; that mode binds the
-loaded files and requires one fresh full-prefill request_done event for every HTTP response.
+Records go to ignored profiles/bench/niah-check/ by default. For durable gate
+evidence, supply --out, --server-log, --artifact and --serve-bin. That mode
+binds the loaded files and requires a fresh full-prefill request_done event
+for every HTTP response.
 """
 
 from __future__ import annotations
@@ -34,7 +30,7 @@ from tools.ppl.pareto import validate_terminal_production_authority
 
 
 def repo_root() -> Path:
-    """Repo root = the directory containing CMakeLists.txt (walk up from here)."""
+    """Find the repository root by walking up to CMakeLists.txt."""
     here = Path(__file__).resolve().parent
     for candidate in (here, *here.parents[:6]):
         if (candidate / "CMakeLists.txt").is_file():

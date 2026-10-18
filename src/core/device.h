@@ -9,13 +9,13 @@ namespace ninfer {
 void hip_check(hipError_t error, const char* expr, const char* file, int line);
 
 // Remaining driver-backed pinned-host budget on the current HIP device.
-// Allocation remains authoritative when concurrent users consume the shared GTT heap.
+// Other users may consume the shared GTT heap before allocation succeeds.
 [[nodiscard]] std::size_t available_pinned_host_memory();
 
 #define HIP_CHECK(expr) ::ninfer::hip_check((expr), #expr, __FILE__, __LINE__)
 
-// Sole device-context contract for the R9700 product. It owns ordered compute, load, and copy
-// streams plus blocking host events, and rejects every target other than wave32 gfx1201.
+// Owns ordered compute, load and copy streams plus blocking host events.
+// Only wave32 gfx1201 devices are accepted.
 struct DeviceContext {
     int device                  = 0;
     hipStream_t stream          = nullptr;

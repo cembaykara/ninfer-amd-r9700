@@ -202,9 +202,8 @@ struct DecodeGraphFamily {
     std::vector<DecodeGraphProfile> profiles;
 };
 
-// Target model continuation for one logical sequence. This state remains meaningful after the
-// request which produced it has finished, so it is deliberately separate from request lifecycle,
-// output, sampling, and round-control state.
+// Model state for continuing one logical sequence after its request has finished.
+// Kept separate from request, output, sampling and round-control state.
 enum class CacheCaptureMode : std::uint8_t { ReachableTurn, CompleteOriginal };
 
 struct SequenceState {

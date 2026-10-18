@@ -633,9 +633,8 @@ def _artifact_local_oracles(
 ) -> list[dict[str, object]]:
     """Check each production boundary from its captured production inputs.
 
-    This deliberately does not carry the Python result into the next operation. Each logical Op
-    receives the C++ tensor from the immediately preceding boundary, so a discrepancy is charged
-    to the Op that creates it instead of being amplified through the remaining tower.
+    Each Op receives the captured C++ output of the preceding Op. This isolates its
+    numerical discrepancy instead of accumulating errors down the tower.
     """
 
     comparisons: list[dict[str, object]] = []

@@ -1,9 +1,5 @@
-// Contract test for the Anthropic Messages serving layer: request parsing
-// (system field, string + block content, tool_use/tool_result round-trip,
-// tool_choice/thinking/sampling mapping, unsupported-content rejection),
-// non-streaming response + streaming SSE event shapes, stop_reason mapping,
-// count_tokens body, and Anthropic error body. This is the schema boundary
-// consumed by Claude Code / other Anthropic clients.
+// Anthropic wire-format tests: system and content parsing, tool calls/results, sampling,
+// thinking, unsupported inputs, response/SSE shapes, stop reasons, token counts and errors.
 
 #include "serve/anthropic_schema.h"
 #include "serve/request.h"

@@ -1,10 +1,8 @@
 #pragma once
 
-// Anthropic Messages API wire-format layer: parses /v1/messages request JSON into
-// the internal GenerationRequest and serializes internal results back into
-// Anthropic message bodies / SSE events. This is a sibling of openai_schema.h;
-// both map to the same wire-agnostic GenerationRequest / GenerationOutcome, so the
-// engine and generation service below know nothing about either protocol.
+// Parses Anthropic /v1/messages requests and serializes response bodies and SSE events.
+// Shares GenerationRequest / GenerationOutcome with the OpenAI adapter; the Engine and
+// generation service do not depend on either wire format.
 
 #include "serve/request.h"
 #include "ninfer/types.h"

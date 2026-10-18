@@ -33,8 +33,8 @@ inline std::filesystem::path configured_pci_path() {
     return std::filesystem::path("/sys/bus/pci/devices") / configured_pci_bus_id();
 }
 
-// This is a physical-target receipt for local baseline measurements, not a device-discovery
-// policy. Construct before the first HIP call, then select exactly the bound PCI function.
+// Bind measurements to the configured PCI device. Construct before the first HIP call,
+// then select that device.
 class DeviceGuard {
 public:
     DeviceGuard() {

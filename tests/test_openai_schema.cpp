@@ -1,7 +1,5 @@
-// Contract test for the OpenAI serving layer: request parsing (string + parts
-// content, unsupported-feature rejection), response/chunk/models/error
-// serialization shapes, and finish_reason mapping. This is the schema boundary
-// consumed by external OpenAI clients.
+// OpenAI wire-format tests: request parsing and rejection, response/chunk/models/error shapes,
+// and finish_reason mapping.
 
 #include "serve/openai_schema.h"
 #include "serve/request.h"

@@ -133,7 +133,7 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& block) {
     return out;
 }
 
-// --- request parsing --------------------------------------------------------
+// Request parsing.
 
 void parse_tools(const Json& body, GenerationRequest& out) {
     if (!body.contains("tools") || body.at("tools").is_null()) { return; }

@@ -271,7 +271,7 @@ void run_roundtrip(ninfer::DeviceContext& device, ninfer::KvDiskCompress compres
     require(!reopened.plan_match(retained, chain), "invalidated corrupt prefix remained reusable");
 }
 
-// ---- Disk I/O stays off the decode and admission paths ----
+// Disk I/O stays off the decode and admission paths.
 
 template <class Predicate>
 bool wait_pred(Predicate predicate, std::chrono::milliseconds limit) {

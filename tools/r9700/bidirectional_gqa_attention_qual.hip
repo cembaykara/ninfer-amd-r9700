@@ -180,8 +180,8 @@ Result run_case(ninfer::DeviceContext& device, int tokens, const std::vector<std
         kScale, context, envelope, workspace, output_tensor, device.stream);
     device.synchronize();
 
-    // Unprofiled event timing at this case's extent (attribution-only baseline for the
-    // Layer-0 decision point; the oracle gate above remains the correctness authority).
+    // Unprofiled event timing at this case's extent. Correctness is checked against the oracle
+    // above.
     Result result;
     const int iters = 200;
     device.synchronize();
