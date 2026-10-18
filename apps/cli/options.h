@@ -19,6 +19,8 @@ struct Options {
     std::filesystem::path json_schema_path;
     std::filesystem::path grammar_path;
     bool json_object = false;
+    std::optional<std::string> output_regex;
+    std::vector<std::string> output_choices;
 
     std::uint32_t max_new              = 128;
     std::uint32_t max_context          = 2048;

@@ -77,7 +77,8 @@ void reject_unavailable_context_checkpoint_capture(bool capture_requested, bool 
     throw ApiException(std::move(error));
 }
 
-ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
+ApiError request_error_to_api_error(const ninfer::RequestError& exception,
+                                    const GenerationRequest* request) {
     ApiError error;
     error.param    = "messages";
     error.message  = exception.what();
@@ -130,6 +131,51 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
         error.type   = "server_error";
         error.code   = "generation_recovery_exhausted";
         break;
+    }
+    if (exception.location()) {
+        const auto& location = *exception.location();
+        if (exception.kind() == ninfer::RequestErrorKind::InvalidToolSchema &&
+            location.tool_index) {
+            std::string prefix =
+                "/tools/" + std::to_string(*location.tool_index) + "/function/parameters";
+            if (request) {
+                const ToolDefinition* tool = nullptr;
+                if (request->tool_choice.mode == ToolChoiceMode::Named) {
+                    for (const auto& candidate : request->tools)
+                        if (candidate.name == request->tool_choice.name) {
+                            tool = &candidate;
+                            break;
+                        }
+                } else if (*location.tool_index < request->tools.size()) {
+                    tool = &request->tools[*location.tool_index];
+                }
+                if (tool && !tool->schema_pointer.empty()) prefix = tool->schema_pointer;
+                if (tool) error.message = "tool " + tool->name + ": " + error.message;
+            }
+            error.param = prefix + location.pointer;
+        } else if (exception.kind() == ninfer::RequestErrorKind::InvalidOutputConstraint) {
+            const std::string param =
+                request ? request->output_constraint_param : "response_format";
+            std::string prefix = "/";
+            for (char character : param) prefix += character == '.' ? '/' : character;
+            if (!request ||
+                (request->output_constraint &&
+                 request->output_constraint->kind == ninfer::OutputConstraintKind::JsonSchema)) {
+                prefix += param == "response_format" ? "/json_schema/schema" : "/schema";
+            }
+            error.param = prefix + location.pointer;
+        }
+        // Anthropic omits OpenAI's param field, so retain the same complete source location
+        // in the message rendered by every protocol.
+        if (error.param.starts_with('/')) {
+            const auto relative_suffix =
+                " at " + (location.pointer.empty() ? "/" : location.pointer);
+            if (error.message.ends_with(relative_suffix))
+                error.message.resize(error.message.size() - relative_suffix.size());
+            error.message += " at " + error.param;
+        }
+    } else if (request && exception.kind() == ninfer::RequestErrorKind::InvalidOutputConstraint) {
+        error.param = request->output_constraint_param;
     }
     return error;
 }
@@ -231,12 +277,8 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
 }
 
 [[noreturn]] void throw_request_error(const ninfer::RequestError& exception,
-                                      std::string_view constraint_param = "response_format") {
-    auto error = request_error_to_api_error(exception);
-    if (exception.kind() == ninfer::RequestErrorKind::InvalidOutputConstraint) {
-        error.param = constraint_param;
-    }
-    throw ApiException(std::move(error));
+                                      const GenerationRequest* request = nullptr) {
+    throw ApiException(request_error_to_api_error(exception, request));
 }
 
 void check_preparation_control(Clock::time_point deadline,
@@ -287,7 +329,9 @@ public:
     // The wire formats report logprobs for content only, so reasoning records stop here.
     void publish(ninfer::OutputDelta delta) override {
         if (sink_ == nullptr) { return; }
-        if (delta.channel == ninfer::OutputChannel::Reasoning) {
+        if (delta.tool_call) {
+            if (sink_->on_tool_call) sink_->on_tool_call(*delta.tool_call);
+        } else if (delta.channel == ninfer::OutputChannel::Reasoning) {
             if (!delta.text.empty() && sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
         } else if (!delta.text.empty() || !delta.logprobs.empty()) {
             publish_content(delta.text, to_logprob_entries(engine_, delta.logprobs));
@@ -476,7 +520,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                             prepared.lifetime->deadline, std::move(host_input));
         prepared.sampling = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
-        throw_request_error(exception, request.output_constraint_param);
+        throw_request_error(exception, &request);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
     return prepared;
 }
@@ -512,7 +556,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
         check_preparation_control(deadline, is_cancelled);
         return prompt_tokens;
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
-        throw_request_error(exception, request.output_constraint_param);
+        throw_request_error(exception, &request);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
 }
 
@@ -588,14 +632,15 @@ GenerationService::run(PreparedRequest& prepared, std::uint64_t request_id, cons
         result = prepared.generation.wait(public_sink, cancellation);
     } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
     GenerationOutcome outcome;
-    outcome.text              = std::move(result.content);
-    outcome.reasoning         = std::move(result.reasoning);
-    outcome.content_logprobs  = to_logprob_entries(*engine_, result.content_logprobs);
-    outcome.prompt_tokens     = static_cast<int>(result.prompt.prompt_tokens);
-    outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
-    outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);
-    outcome.finish_reason     = result.finish_reason;
-    outcome.metrics.recovery  = result.recovery;
+    outcome.text               = std::move(result.content);
+    outcome.reasoning          = std::move(result.reasoning);
+    outcome.content_logprobs   = to_logprob_entries(*engine_, result.content_logprobs);
+    outcome.prompt_tokens      = static_cast<int>(result.prompt.prompt_tokens);
+    outcome.completion_tokens  = static_cast<int>(result.generated_token_ids.size());
+    outcome.reasoning_tokens   = static_cast<int>(result.reasoning_tokens);
+    outcome.finish_reason      = result.finish_reason;
+    outcome.metrics.recovery   = result.recovery;
+    outcome.metrics.constraint = result.constraint;
 
     outcome.metrics.prepare_seconds     = prepared.prepare_seconds;
     outcome.metrics.prepare_cpu_seconds = prepared.prepare_cpu_seconds;

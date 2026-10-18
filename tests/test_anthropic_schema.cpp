@@ -600,6 +600,9 @@ int test_stop_reason_mapping() {
     failures += check(std::string(messages_stop_reason(ninfer::FinishReason::OutputLimit, false)) ==
                           "max_tokens",
                       "output limit -> max_tokens");
+    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::OutputLimit, true)) ==
+                          "max_tokens",
+                      "completed earlier call hid real output budget finish");
     failures += check(std::string(messages_stop_reason(ninfer::FinishReason::StopToken, false)) ==
                           "end_turn",
                       "stop token -> end_turn");

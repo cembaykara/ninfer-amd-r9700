@@ -104,6 +104,13 @@ ninfer_add_r9700_test(ninfer_r9700_fp8_execution_state_contract_test
   LIBRARIES ninfer_r9700_target_bindings ninfer_r9700_core)
 
 # Family CPU behavior retained by the sole Qwen3.8-27B target.
+ninfer_add_r9700_test(ninfer_schema_composition_test
+  SOURCES test_schema_composition.cpp
+  LIBRARIES ninfer_r9700_text ninfer_token_grammar)
+target_compile_definitions(ninfer_schema_composition_test PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+ninfer_add_r9700_test(ninfer_json_input_test
+  SOURCES test_json_input.cpp
+  LIBRARIES ninfer_r9700_text)
 ninfer_add_r9700_test(ninfer_typical_cycle_test
   SOURCES test_typical_cycle.cpp)
 ninfer_add_r9700_test(ninfer_generation_recovery_test
@@ -114,6 +121,9 @@ ninfer_add_r9700_test(ninfer_qwen3_recovery_executor_test
   LIBRARIES ninfer_engine)
 target_compile_definitions(ninfer_qwen3_recovery_executor_test PRIVATE
   NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+ninfer_add_r9700_test(ninfer_counted_grammar_test
+  SOURCES targets/qwen3/test_counted_grammar.cpp
+  LIBRARIES ninfer_token_grammar)
 ninfer_add_r9700_test(ninfer_schema_grammar_test
   SOURCES targets/qwen3/test_schema_grammar.cpp
   LIBRARIES ninfer_token_grammar)
@@ -143,6 +153,9 @@ ninfer_add_r9700_test(ninfer_qwen3_score_index_test
 
 # Product CLI and external serving contracts.
 if(TARGET ninfer_serve)
+  ninfer_add_r9700_test(ninfer_schema_number_input_test
+    SOURCES test_schema_number_input.cpp
+    LIBRARIES ninfer_serve)
   foreach(contract IN ITEMS
       openai_schema
       responses_schema
@@ -168,6 +181,9 @@ if(TARGET ninfer_serve)
 endif()
 
 if(TARGET ninfer)
+  ninfer_add_r9700_test(ninfer_prompt_input_test
+    SOURCES test_prompt_input.cpp
+    LIBRARIES ninfer_product_prompt_input)
   ninfer_add_r9700_test(ninfer_cli_options_test
     SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
     LIBRARIES ninfer_engine)

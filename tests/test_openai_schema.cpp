@@ -460,6 +460,28 @@ int test_reject_unsupported() {
     failures += check(parsed_grammar.output_constraint && parsed_grammar.output_constraint->kind ==
                                                               ninfer::OutputConstraintKind::Grammar,
                       "EBNF grammar was not translated");
+    for (const Json& extension : {Json{{"regex", "[A-Z]+"}}, Json{{"choice", {"", "a|b", "你"}}}}) {
+        auto request                  = base;
+        request["structured_outputs"] = extension;
+        const auto parsed             = parse_chat_completion_request(request, default_limits());
+        failures += check(
+            parsed.output_constraint &&
+                (extension.contains("regex")
+                     ? parsed.output_constraint->kind == ninfer::OutputConstraintKind::Regex &&
+                           parsed.output_constraint->source == "[A-Z]+"
+                     : parsed.output_constraint->kind == ninfer::OutputConstraintKind::Choice &&
+                           parsed.output_constraint->choices ==
+                               std::vector<std::string>{"", "a|b", "你"}),
+            "choice/regex extension changed source");
+    }
+    for (const Json& extension : {Json{{"choice", Json::array()}}, Json{{"choice", {"yes", 1}}},
+                                  Json{{"regex", 1}}, Json{{"regex", "a"}, {"choice", {"b"}}}}) {
+        auto request                  = base;
+        request["structured_outputs"] = extension;
+        failures += check(
+            throws_api([&] { (void)parse_chat_completion_request(request, default_limits()); }),
+            "invalid choice/regex extension admitted");
+    }
     grammar_request["response_format"] = {{"type", "json_object"}};
     failures += check(
         throws_api([&] { (void)parse_chat_completion_request(grammar_request, default_limits()); }),
@@ -691,6 +713,37 @@ int test_response_serialization() {
     const Json& no_copy_ninfer = no_copy.at("usage").at("prompt_tokens_details").at("ninfer");
     failures += check(!no_copy_ninfer.contains("kv_ram") && !no_copy_ninfer.contains("kv_disk"),
                       "usage emits KV tier objects for a request that copied nothing");
+    failures += check(!no_copy_ninfer.contains("constraint"),
+                      "unconstrained usage emitted constraint stats");
+    timings.constraint     = {.active               = true,
+                              .complete             = true,
+                              .terminated           = false,
+                              .branch               = ninfer::ConstraintBranch::Answer,
+                              .compile_cache        = ninfer::ConstraintCompileCache::Waited,
+                              .compile_seconds      = 0.125,
+                              .compile_wait_seconds = 0.0625,
+                              .mask_calls           = 3,
+                              .mask_nodes           = 7,
+                              .mask_upload_bytes    = 93036,
+                              .mask_seconds         = 0.003};
+    const Json constrained = Json::parse(make_chat_completion_response(
+        "id-constrained", "m", 111, "yes", "", "stop", usage, &timings));
+    const Json& constraint =
+        constrained.at("usage").at("prompt_tokens_details").at("ninfer").at("constraint");
+    failures += check(
+        constraint.at("complete") == true && constraint.at("terminated") == false &&
+            constraint.at("branch") == "answer" && constraint.at("compile_cache") == "waited" &&
+            constraint.at("compile_seconds") == 0.125 &&
+            constraint.at("compile_wait_seconds") == 0.0625 && constraint.at("mask_calls") == 3 &&
+            constraint.at("mask_nodes") == 7 && constraint.at("mask_upload_bytes") == 93036 &&
+            constraint.at("mask_seconds") == 0.003,
+        "constraint usage lost state/cache/host-work/payload counters");
+    const Json constrained_chunk = parse_sse(make_chat_chunk_usage("id", "m", 1, usage, &timings));
+    failures += check(
+        constrained_chunk.at("usage").at("prompt_tokens_details").at("ninfer").at("constraint") ==
+            constraint,
+        "stream usage constraint observations differ from completion");
+    timings.constraint          = {};
     timings.kv_ram_save_ms      = 8.0;
     timings.kv_ram_load_ms      = 14.0;
     timings.prefix_reuse_source = ninfer::PrefixReuseSource::HostRam;
@@ -1200,29 +1253,6 @@ int test_chunk_serialization() {
     return failures;
 }
 
-int test_tool_chunk_serialization() {
-    int failures                      = 0;
-    const std::vector<ToolCall> calls = {
-        ToolCall{"call_abc", "get_weather", R"({"city":"Paris"})"}};
-    const Json chunk = parse_sse(make_chat_chunk_tool_calls("id", "m", 1, calls, true));
-    failures += check(chunk.at("object") == "chat.completion.chunk", "tool chunk object");
-    const Json& delta = chunk.at("choices").at(0).at("delta");
-    const Json& call  = delta.at("tool_calls").at(0);
-    failures += check(call.at("index") == 0, "tool chunk index");
-    failures += check(call.at("id") == "call_abc", "tool chunk id");
-    failures += check(call.at("type") == "function", "tool chunk type");
-    failures += check(call.at("function").at("name") == "get_weather", "tool chunk name");
-    failures +=
-        check(call.at("function").at("arguments") == R"({"city":"Paris"})", "tool chunk arguments");
-    failures +=
-        check(chunk.contains("usage") && chunk.at("usage").is_null(), "tool chunk usage null");
-
-    const Json final_chunk = parse_sse(make_chat_chunk_final("id", "m", 1, "tool_calls", true));
-    failures += check(final_chunk.at("choices").at(0).at("finish_reason") == "tool_calls",
-                      "tool final finish reason");
-    return failures;
-}
-
 int test_models_and_error() {
     int failures    = 0;
     const Json list = Json::parse(make_models_list("qwen3.8-27b", 1));
@@ -1520,6 +1550,36 @@ int test_owui_youtube_fetch_url_logged_turn() {
     return failures;
 }
 
+int test_tool_delta_serialization() {
+    const auto start = parse_sse(make_chat_chunk_tool_delta(
+        "id", "m", 1, {ninfer::ToolCallDeltaKind::Start, 2, "call_1_2", "weather", {}}, false));
+    const auto args  = parse_sse(make_chat_chunk_tool_delta(
+        "id", "m", 1,
+        {ninfer::ToolCallDeltaKind::Arguments, 2, "call_1_2", "weather", "{\"city\":"}, true));
+    const auto& call = start.at("choices")[0].at("delta").at("tool_calls")[0];
+    int failures =
+        check(call.at("index") == 2 && call.at("id") == "call_1_2" &&
+                  call.at("function").at("name") == "weather" &&
+                  call.at("function").at("arguments").get_ref<const std::string&>().empty(),
+              "tool stream start lost stable index/id/name");
+    const auto& fragment = args.at("choices")[0].at("delta").at("tool_calls")[0];
+    failures += check(fragment.at("index") == 2 && !fragment.contains("id") &&
+                          fragment.at("function").at("arguments") == "{\"city\":" &&
+                          args.at("usage").is_null(),
+                      "tool argument fragment restated identity or changed bytes");
+    failures +=
+        check(make_chat_chunk_tool_delta(
+                  "id", "m", 1,
+                  {ninfer::ToolCallDeltaKind::Incomplete, 2, "call_1_2", "weather", {}}, false)
+                  .empty(),
+              "Chat invented a nonstandard tool completion delta");
+    const auto body = Json::parse(make_chat_completion_tool_response(
+        "id", "m", 1, {}, {}, {{"call_1_2", "weather", "{}"}}, {}, nullptr, nullptr, "length"));
+    failures += check(body.at("choices")[0].at("finish_reason") == "length",
+                      "tool result hid real output budget finish reason");
+    return failures;
+}
+
 int main() {
     if (std::getenv("NINFER_BENCH_SSE") != nullptr) { return run_sse_bench(); }
     int failures = 0;
@@ -1540,7 +1600,7 @@ int main() {
     failures += test_tool_response_serialization();
     failures += test_owui_youtube_fetch_url_logged_turn();
     failures += test_chunk_serialization();
-    failures += test_tool_chunk_serialization();
+    failures += test_tool_delta_serialization();
     failures += test_models_and_error();
     failures += test_finish_reason_wire();
     failures += test_system_prepend_merge();

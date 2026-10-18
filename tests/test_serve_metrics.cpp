@@ -171,6 +171,81 @@ int main() {
     for (std::size_t i = 0; i < kMetricFamilyCount; ++i) { catalog.emplace(kMetricFamilies[i]); }
     failures += check(rendered == catalog, "rendered families do not match kMetricFamilies");
 
+    // Protocol-independent process totals include observed cancellation work,
+    // retain bounded cache/branch labels, and do not re-add during scrapes.
+    ServeMetrics constraint_metrics;
+    GenerationOutcome constrained;
+    constrained.metrics.constraint = {.active               = true,
+                                      .complete             = true,
+                                      .terminated           = false,
+                                      .branch               = ninfer::ConstraintBranch::Answer,
+                                      .compile_cache        = ninfer::ConstraintCompileCache::Built,
+                                      .compile_seconds      = 0.25,
+                                      .compile_wait_seconds = 0.125,
+                                      .mask_calls           = 3,
+                                      .mask_nodes           = 7,
+                                      .mask_upload_bytes    = 1024,
+                                      .mask_seconds         = 0.5};
+    for (int protocol = 0; protocol < 3; ++protocol) {
+        auto& constraint         = constrained.metrics.constraint;
+        constraint.branch        = protocol == 0   ? ninfer::ConstraintBranch::Answer
+                                   : protocol == 1 ? ninfer::ConstraintBranch::ToolCall
+                                                   : ninfer::ConstraintBranch::Reasoning;
+        constraint.compile_cache = protocol == 0   ? ninfer::ConstraintCompileCache::Built
+                                   : protocol == 1 ? ninfer::ConstraintCompileCache::Hit
+                                                   : ninfer::ConstraintCompileCache::Waited;
+        constraint.complete      = protocol != 2;
+        constraint.terminated    = protocol == 1;
+        GenerationObservation terminal_constraint;
+        terminal_constraint.protocol = static_cast<MetricsProtocol>(protocol);
+        terminal_constraint.result =
+            protocol == 2 ? GenerationResult::Cancelled : GenerationResult::Success;
+        terminal_constraint.outcome = &constrained;
+        constraint_metrics.observe_generation(terminal_constraint);
+    }
+    const auto constraint_snapshot    = constraint_metrics.snapshot({});
+    const std::string constraint_text = constraint_snapshot.prometheus_text();
+    const auto constraint_json =
+        nlohmann::json::parse(constraint_snapshot.json()).at("generation").at("constraint");
+    failures += check(
+        contains(constraint_text, "ninfer_constraint_requests_total 3\n") &&
+            contains(constraint_text, "ninfer_constraint_complete_total 2\n") &&
+            contains(constraint_text, "ninfer_constraint_terminated_total 1\n") &&
+            contains(constraint_text,
+                     "ninfer_constraint_compile_cache_total{result=\"waited\"} 1\n") &&
+            contains(constraint_text, "ninfer_constraint_branch_total{branch=\"reasoning\"} 1\n") &&
+            contains(constraint_text, "ninfer_constraint_compile_seconds_total 0.75\n") &&
+            contains(constraint_text, "ninfer_constraint_compile_wait_seconds_total 0.375\n") &&
+            contains(constraint_text, "ninfer_constraint_mask_calls_total 9\n") &&
+            contains(constraint_text, "ninfer_constraint_mask_nodes_total 21\n") &&
+            contains(constraint_text, "ninfer_constraint_mask_seconds_total 1.5\n") &&
+            contains(constraint_text, "ninfer_constraint_mask_upload_bytes_total 3072\n"),
+        "constraint process totals lost state/cache/cancellation/work observations");
+    failures += check(
+        constraint_json.at("requests_total") == 3 && constraint_json.at("complete_total") == 2 &&
+            constraint_json.at("terminated_total") == 1 &&
+            constraint_json.at("compile_cache").at("hit") == 1 &&
+            constraint_json.at("branches").at("answer") == 1 &&
+            constraint_json.at("compile_seconds") == 0.75 &&
+            constraint_json.at("compile_wait_seconds") == 0.375 &&
+            constraint_json.at("mask_calls") == 9 && constraint_json.at("mask_nodes") == 21 &&
+            constraint_json.at("mask_seconds") == 1.5 &&
+            constraint_json.at("mask_upload_bytes") == 3072,
+        "constraint JSON snapshot differs from process totals");
+    constrained.metrics.constraint.active = false;
+    GenerationObservation inactive_constraint;
+    inactive_constraint.outcome = &constrained;
+    constraint_metrics.observe_generation(inactive_constraint);
+    constrained.metrics.constraint.active = true;
+    inactive_constraint.result            = GenerationResult::Rejected;
+    constraint_metrics.observe_generation(inactive_constraint);
+    failures += check(nlohmann::json::parse(constraint_metrics.snapshot({}).json())
+                                  .at("generation")
+                                  .at("constraint") == constraint_json &&
+                          constraint_metrics.snapshot({}).prometheus_text().find(
+                              "ninfer_constraint_requests_total 3\n") != std::string::npos,
+                      "unconstrained/rejected request or scrape double-counted constraint work");
+
     ServeMetrics fresh_metrics;
     const std::string fresh = fresh_metrics.snapshot({}).prometheus_text();
     for (const char* phase : {"prepare_cpu", "media_wait", "media_fetch", "queue", "copy_hold",

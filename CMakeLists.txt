@@ -232,6 +232,11 @@ pkg_check_modules(NINFER_ZSTD REQUIRED IMPORTED_TARGET libzstd)
 include(cmake/xgrammar.cmake)
 # After the third-party xgrammar target, so its sources keep their upstream diagnostics.
 include(cmake/warnings.cmake)
+# The vendored CPU compiler/matcher participates in host lifetime qualification.
+if(NINFER_SANITIZE)
+  target_compile_options(ninfer_token_grammar PRIVATE ${ninfer_sanitizers}
+    -fno-omit-frame-pointer -fno-sanitize=vptr)
+endif()
 
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)

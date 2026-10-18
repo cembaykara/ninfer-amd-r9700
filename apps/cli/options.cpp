@@ -122,7 +122,8 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--no-p-less-sampling]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--json-object | --json-schema FILE | --grammar FILE]\n"
+           "       [--json-object | --json-schema FILE | --grammar FILE | --regex PATTERN | "
+           "--choice TEXT ...]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
            "       [--no-device-graph] [--capture-context-checkpoint]\n"
@@ -183,6 +184,10 @@ Options parse_options(int argc, char** argv) {
             options.json_object = true;
         } else if (arg == "--json-schema") {
             options.json_schema_path = value(arg);
+        } else if (arg == "--regex") {
+            options.output_regex = value(arg);
+        } else if (arg == "--choice") {
+            options.output_choices.emplace_back(value(arg));
         } else if (arg == "--grammar") {
             options.grammar_path = value(arg);
         } else if (arg == "--max-new") {
@@ -305,9 +310,12 @@ Options parse_options(int argc, char** argv) {
 
     if (static_cast<int>(options.json_object) +
             static_cast<int>(!options.json_schema_path.empty()) +
-            static_cast<int>(!options.grammar_path.empty()) >
+            static_cast<int>(!options.grammar_path.empty()) +
+            static_cast<int>(options.output_regex.has_value()) +
+            static_cast<int>(!options.output_choices.empty()) >
         1) {
-        throw std::invalid_argument("select only one of --json-object, --json-schema or --grammar");
+        throw std::invalid_argument(
+            "select only one of --json-object, --json-schema, --grammar, --regex or --choice");
     }
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();

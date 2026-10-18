@@ -153,8 +153,9 @@ void parse_tools(const Json& body, GenerationRequest& out) {
             bad_request("tool input_schema must be a JSON object", "tools");
         }
         ToolDefinition tool;
-        tool.name     = require_function_name(item, "tools");
-        Json function = Json{{"name", tool.name}};
+        tool.schema_pointer = "/tools/" + std::to_string(out.tools.size()) + "/input_schema";
+        tool.name           = require_function_name(item, "tools");
+        Json function       = Json{{"name", tool.name}};
         if (item.contains("description") && !item.at("description").is_null()) {
             if (!item.at("description").is_string()) {
                 bad_request("tool description must be a string", "tools");
@@ -552,7 +553,9 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
 }
 
 const char* messages_stop_reason(ninfer::FinishReason reason, bool has_tool_calls) {
-    if (has_tool_calls) { return "tool_use"; }
+    if (has_tool_calls &&
+        (reason == ninfer::FinishReason::StopToken || reason == ninfer::FinishReason::StopString))
+        return "tool_use";
     switch (reason) {
     case ninfer::FinishReason::OutputLimit:
     case ninfer::FinishReason::ContextCapacity:

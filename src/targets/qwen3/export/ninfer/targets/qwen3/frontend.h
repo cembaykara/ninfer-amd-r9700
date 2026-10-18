@@ -3,7 +3,6 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -48,40 +47,8 @@ private:
     friend class EncodedHistoryPrepare;
 };
 
-class PublishedOutput {
-public:
-    using iterator       = std::array<OutputDelta, 2>::iterator;
-    using const_iterator = std::array<OutputDelta, 2>::const_iterator;
-
-    PublishedOutput()                                  = default;
-    PublishedOutput(const PublishedOutput&)            = default;
-    PublishedOutput& operator=(const PublishedOutput&) = default;
-    PublishedOutput(PublishedOutput&& other) noexcept;
-    PublishedOutput& operator=(PublishedOutput&& other) noexcept;
-
-    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
-
-    [[nodiscard]] std::size_t size() const noexcept { return size_; }
-
-    [[nodiscard]] iterator begin() noexcept { return values_.begin(); }
-
-    [[nodiscard]] const_iterator begin() const noexcept { return values_.begin(); }
-
-    [[nodiscard]] iterator end() noexcept { return values_.begin() + size_; }
-
-    [[nodiscard]] const_iterator end() const noexcept { return values_.begin() + size_; }
-
-    [[nodiscard]] OutputDelta& back() noexcept { return values_[size_ - 1]; }
-
-    [[nodiscard]] const OutputDelta& back() const noexcept { return values_[size_ - 1]; }
-
-    void clear() noexcept;
-    void push_back(OutputDelta value);
-
-private:
-    std::array<OutputDelta, 2> values_{};
-    std::size_t size_ = 0;
-};
+// A committed round can contain multiple tool lifecycle events as well as channel text.
+using PublishedOutput = std::vector<OutputDelta>;
 
 class OutputSession {
 public:
@@ -115,6 +82,8 @@ public:
     [[nodiscard]] std::optional<TokenId> suppressed_reasoning_end_token() const noexcept;
     [[nodiscard]] bool reasoning_cycle_exclusion_allowed(TokenId token) const;
     [[nodiscard]] bool has_token_grammar() const noexcept;
+    [[nodiscard]] ConstraintStats constraint_stats() const noexcept;
+    void record_token_mask_upload(std::size_t bytes) const noexcept;
     [[nodiscard]] std::span<const ToolCall> tool_calls() const noexcept;
     [[nodiscard]] std::shared_ptr<const GenerationRecoveryContext>
     generation_recovery_context() const noexcept;

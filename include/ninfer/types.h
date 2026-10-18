@@ -386,15 +386,38 @@ enum class OutputConstraintKind : std::uint8_t {
     JsonObject,
     JsonSchema,
     Grammar,
+    Choice,
+    Regex,
 };
 
-// Owns the schema JSON or XGrammar EBNF source (root rule: root). Constraints apply to answer
+// Owns schema JSON, XGrammar EBNF (root rule: root), full-match regex, or literal choices.
+// Choice alternatives may include the empty string; the alternatives list must be nonempty.
+// Constraints apply to answer
 // content after reasoning. A generation prompt is required, and tool declarations are forbidden.
 // Unsupported schemas/grammars fail preparation with InvalidOutputConstraint. Caller stops and
 // output/context limits can truncate a valid prefix before the grammar completes.
 struct OutputConstraint {
     OutputConstraintKind kind = OutputConstraintKind::JsonObject;
     std::string source;
+    std::vector<std::string> choices = {};
+};
+
+enum class ConstraintCompileCache : std::uint8_t { None, Hit, Built, Waited };
+enum class ConstraintBranch : std::uint8_t { None, Reasoning, Answer, ToolCall };
+
+struct ConstraintStats {
+    bool active                          = false;
+    bool complete                        = false;
+    bool terminated                      = false;
+    ConstraintBranch branch              = ConstraintBranch::None;
+    ConstraintCompileCache compile_cache = ConstraintCompileCache::None;
+    // Host compile elapsed time, including the compiler-lock wait subset.
+    double compile_seconds          = 0.0;
+    double compile_wait_seconds     = 0.0;
+    std::uint64_t mask_calls        = 0;
+    std::uint64_t mask_nodes        = 0;
+    std::uint64_t mask_upload_bytes = 0;
+    double mask_seconds             = 0.0;
 };
 
 struct PromptOptions {
@@ -466,6 +489,19 @@ struct TokenLogprob {
     }
 };
 
+// A committed tool stream is provisional until terminal generation success. Incomplete never
+// creates an executable ToolCall or conversation-history entry. Argument fragments concatenate to
+// JSON only for completed calls; consumers must not execute a partial stream.
+enum class ToolCallDeltaKind : std::uint8_t { Start, Arguments, Completed, Incomplete };
+
+struct ToolCallDelta {
+    ToolCallDeltaKind kind = ToolCallDeltaKind::Start;
+    std::uint32_t index    = 0;
+    std::string id;
+    std::string name;
+    std::string arguments;
+};
+
 struct OutputDelta {
     OutputChannel channel = OutputChannel::Content;
     std::string text;
@@ -475,6 +511,7 @@ struct OutputDelta {
     // token trimmed by a stop string still has its record. Tokens that publish to no channel
     // (reasoning markers, tool-call markup, stop tokens) have no record.
     std::vector<TokenLogprob> logprobs;
+    std::optional<ToolCallDelta> tool_call;
 };
 
 enum class OutputDelivery : std::uint8_t {
@@ -592,13 +629,26 @@ struct GenerationRecoveryStats {
     std::uint32_t cycle_exclusions = 0;
 };
 
+// A schema-relative JSON Pointer and, for a tool failure, its index in the submitted
+// PromptInput tool list. Product adapters retain the original wire-field location.
+struct RequestErrorLocation {
+    std::string pointer;
+    std::optional<std::size_t> tool_index;
+};
+
 class RequestError final : public std::invalid_argument {
 public:
     RequestError(RequestErrorKind kind, const std::string& message,
-                 GenerationRecoveryStats recovery = {})
-        : std::invalid_argument(message), kind_(kind), recovery_(recovery) {}
+                 GenerationRecoveryStats recovery             = {},
+                 std::optional<RequestErrorLocation> location = std::nullopt)
+        : std::invalid_argument(message), kind_(kind), recovery_(recovery),
+          location_(std::move(location)) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
+
+    [[nodiscard]] const std::optional<RequestErrorLocation>& location() const noexcept {
+        return location_;
+    }
 
     // Recovery totals when this error ended an admitted generation; empty otherwise.
     [[nodiscard]] const GenerationRecoveryStats& recovery() const noexcept { return recovery_; }
@@ -606,6 +656,7 @@ public:
 private:
     RequestErrorKind kind_;
     GenerationRecoveryStats recovery_;
+    std::optional<RequestErrorLocation> location_;
 };
 
 struct GenerationResult {
@@ -622,6 +673,7 @@ struct GenerationResult {
     // Diagnostic names only when tools were not declared; never executable.
     std::vector<std::string> undeclared_tool_call_names;
     GenerationRecoveryStats recovery;
+    ConstraintStats constraint;
     std::uint32_t reasoning_tokens        = 0;
     FinishReason finish_reason            = FinishReason::None;
     std::uint32_t reused_prompt_tokens    = 0;

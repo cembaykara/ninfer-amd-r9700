@@ -22,7 +22,7 @@ Vendored code retains its notices in the following files:
 | nlohmann/json | `../third_party/nlohmann/LICENSE.MIT` |
 | utf8proc and Unicode data | `../third_party/utf8proc/LICENSE.md` |
 
-CMake fetches [XGrammar](https://github.com/mlc-ai/xgrammar) at the commit pinned in `../cmake/xgrammar.cmake`, including its DLPack submodule (both Apache-2.0). Preserve their upstream license files when redistributing dependency sources. ROCm, FFmpeg, libcurl and zstd are external build/runtime dependencies with their own notices.
+The CPU [XGrammar](https://github.com/mlc-ai/xgrammar) sources and DLPack headers are vendored under `../third_party/xgrammar` (both Apache-2.0). Selected source commits and native adaptations are recorded in `../third_party/xgrammar/README.ninfer.md`; preserve their included license and notice files when redistributing sources. ROCm, FFmpeg, libcurl and zstd are external build/runtime dependencies with their own notices.
 
 ## Workflow references
 

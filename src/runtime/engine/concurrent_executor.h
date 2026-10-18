@@ -572,6 +572,7 @@ private:
         GenerationTimings initial_timings;
         double previous_decode_seconds = 0.0;
         SpeculativeStats previous_speculative;
+        ConstraintStats previous_constraint;
 
         std::optional<BasePlan> base_plan;
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
@@ -594,6 +595,7 @@ private:
         std::condition_variable cv;
         std::vector<OutputDelta> events;
         std::vector<RecoveryEvent> recovery_events;
+        std::vector<OutputDelta> pending_tool_events;
         GenerationResult result;
         std::exception_ptr error;
         bool done              = false;
@@ -725,7 +727,7 @@ private:
         const auto attach = [&output](OutputChannel channel, std::vector<TokenLogprob>& tokens) {
             if (tokens.empty()) { return; }
             for (OutputDelta& delta : output) {
-                if (delta.channel == channel) {
+                if (!delta.tool_call && delta.channel == channel) {
                     delta.logprobs = std::move(tokens);
                     return;
                 }
@@ -738,9 +740,15 @@ private:
     }
 
     void append_output(const std::shared_ptr<Request>& request,
-                       targets::qwen3::PublishedOutput output, bool notify = true) {
+                       targets::qwen3::PublishedOutput output, bool notify = true,
+                       bool accept_tools = false) {
         if (output.empty()) { return; }
         for (OutputDelta& delta : output) {
+            if (delta.tool_call) {
+                delta.tool_call->id = "call_" + std::to_string(request->id) + "_" +
+                                      std::to_string(delta.tool_call->index);
+                continue;
+            }
             const bool reasoning = delta.channel == OutputChannel::Reasoning;
             std::string& full    = reasoning ? request->reasoning : request->content;
             full += delta.text;
@@ -748,6 +756,15 @@ private:
             logprobs.insert(logprobs.end(), delta.logprobs.begin(), delta.logprobs.end());
         }
         if (request->delivery == OutputDelivery::TerminalOnly) { return; }
+        if (!accept_tools && request->recovery_context &&
+            request->recovery_context->has_repeated_tool_history()) {
+            for (auto& delta : output) {
+                if (delta.tool_call) request->pending_tool_events.push_back(std::move(delta));
+            }
+            // Moving an optional retains its engaged state, so the held events are still
+            // identified here without inspecting their moved payloads.
+            std::erase_if(output, [](const auto& delta) { return delta.tool_call.has_value(); });
+        }
         {
             std::lock_guard lock(request->mutex);
             for (OutputDelta& delta : output) { request->events.push_back(std::move(delta)); }
@@ -819,6 +836,15 @@ private:
         publish_runtime_stats();
     }
 
+    static void add_constraint_work(ConstraintStats& totals, const ConstraintStats& part) {
+        totals.compile_seconds += part.compile_seconds;
+        totals.compile_wait_seconds += part.compile_wait_seconds;
+        totals.mask_calls += part.mask_calls;
+        totals.mask_nodes += part.mask_nodes;
+        totals.mask_upload_bytes += part.mask_upload_bytes;
+        totals.mask_seconds += part.mask_seconds;
+    }
+
     // The by-value request keeps it alive while retire_request may drop the caller's reference
     // (for example slots_[lane]).
     // NOLINTNEXTLINE(performance-unnecessary-value-param): lifetime copy, see above
@@ -864,6 +890,13 @@ private:
     // (for example slots_[lane]).
     // NOLINTNEXTLINE(performance-unnecessary-value-param): lifetime copy, see above
     void complete_success(std::shared_ptr<Request> request, FinishReason reason) {
+        if (reason != FinishReason::Cancelled && !request->pending_tool_events.empty()) {
+            auto events = std::move(request->pending_tool_events);
+            request->pending_tool_events.clear();
+            append_output(request, std::move(events), false, true);
+        } else {
+            request->pending_tool_events.clear();
+        }
         if (request->cycle_exclusions != 0 || !request->recovery_cause.empty()) {
             publish_recovery(request, RecoveryEventKind::Finished,
                              reason == FinishReason::Cancelled         ? "cancelled"
@@ -891,6 +924,8 @@ private:
             (reason == FinishReason::StopToken || reason == FinishReason::StopString)) {
             instance_.program->mark_turn_closed(*request->lane);
         }
+        result.constraint = request->output.constraint_stats();
+        add_constraint_work(result.constraint, request->previous_constraint);
         result.recovery                  = request->recovery;
         result.recovery.cycle_exclusions = request->cycle_exclusions;
         if (!request->output.has_token_grammar()) {
@@ -1247,6 +1282,7 @@ private:
         request->previous_decode_seconds += previous.decode_seconds;
         add_speculative(request->previous_speculative,
                         instance_.program->speculative_stats_lane(lane));
+        add_constraint_work(request->previous_constraint, request->output.constraint_stats());
         request->previous_reasoning_tokens += request->output.reasoning_tokens();
         request->prompt                 = std::move(*spliced);
         request->output                 = std::move(session);
@@ -1334,6 +1370,7 @@ private:
         const auto reasoning =
             std::string_view(request->reasoning).substr(request->recovery_reasoning_begin);
         if (request->recovery_context && request->recovery_context->repeats(calls, reasoning)) {
+            request->pending_tool_events.clear();
             request->recovery.discarded_tool_calls += static_cast<std::uint32_t>(calls.size());
             request->recovery.discarded_reasoning_tokens += request->output.reasoning_tokens();
             request->recovery_cause = "duplicate_tool_call";
@@ -1681,8 +1718,8 @@ private:
         try {
             std::rethrow_exception(error);
         } catch (const RequestError& request_error) {
-            return std::make_exception_ptr(
-                RequestError(request_error.kind(), request_error.what(), stats));
+            return std::make_exception_ptr(RequestError(request_error.kind(), request_error.what(),
+                                                        stats, request_error.location()));
         } catch (...) { return error; }
     }
 

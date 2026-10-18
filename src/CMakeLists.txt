@@ -136,9 +136,16 @@ target_link_libraries(ninfer_r9700_target_bindings PUBLIC ninfer_artifact hip::h
 # CPU text/frontend support used by the one exact Qwen runtime. Keeping utf8proc in this closed
 # target avoids depending on the removed legacy Engine graph for tokenizer linkage.
 add_library(ninfer_r9700_text STATIC
+  text/json_input.cpp
+  text/json_schema.cpp
+  text/schema_composition.cpp
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_r9700_internal_includes(ninfer_r9700_text)
+target_include_directories(ninfer_r9700_text SYSTEM PRIVATE
+  ${PROJECT_SOURCE_DIR}/third_party/xgrammar/cpp
+  ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
+target_link_libraries(ninfer_r9700_text PRIVATE ninfer_token_grammar)
 
 find_package(PkgConfig REQUIRED)
 if(NINFER_BUILD_APPS)
@@ -154,7 +161,7 @@ if(NINFER_BUILD_APPS)
   add_library(ninfer_product_prompt_input STATIC
     product/prompt_input/prompt_input.cpp)
   ninfer_r9700_internal_includes(ninfer_product_prompt_input)
-  target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire)
+  target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire ninfer_r9700_text)
 
   add_library(ninfer_product_load_progress STATIC
     product/load_progress/load_progress.cpp)
@@ -260,6 +267,7 @@ if(NINFER_BUILD_APPS)
   # HTTP protocol/product adapter. It depends on the one public Engine and owns no model
   # mathematics, target state, or device backend selection.
   add_library(ninfer_serve STATIC
+    serve/json_input.cpp
     serve/openai_schema.cpp
     serve/responses_schema.cpp
     serve/anthropic_schema.cpp

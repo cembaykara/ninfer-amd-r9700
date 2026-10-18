@@ -100,6 +100,7 @@ public:
     // for them; a delta with tokens and no text is still emitted.
     std::vector<std::string> content_delta(const std::string& text,
                                            std::span<const TokenLogprobEntry> logprobs = {});
+    std::vector<std::string> tool_delta(const ninfer::ToolCallDelta& delta);
     ResponsesStreamFinish finish(const GenerationOutcome& outcome);
     std::string terminal(const BuiltResponse& response);
     std::string failed(const ApiError& error);

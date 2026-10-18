@@ -72,6 +72,7 @@ struct CompletionUsage {
 // llama.cpp-compatible timing block for Open WebUI / LiteLLM info bubbles.
 struct CompletionTimings {
     ninfer::GenerationRecoveryStats recovery;
+    ninfer::ConstraintStats constraint;
     int prompt_n = 0;
     // Prefix tokens served from prefix reuse (no recompute). Prefill rates below are
     // computed over the non-reused suffix only, so cached prefixes do not inflate them.
@@ -127,6 +128,7 @@ struct ToolDefinition {
     std::string name;
     std::string description;
     std::string parameters_json;
+    std::string schema_pointer;  // original wire JSON Pointer, preserved through named selection
     std::string definition_json; // normalized OpenAI function-tool object for Qwen prompt rendering
     bool strict = false;
 };

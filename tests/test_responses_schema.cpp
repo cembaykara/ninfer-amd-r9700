@@ -671,12 +671,26 @@ int test_sse_function_call(const Json& choice) {
     outcome.completion_tokens = 4;
     outcome.finish_reason     = ninfer::FinishReason::StopToken;
     outcome.tool_calls.push_back(ToolCall{"call_weather", "weather", R"({"city":"Paris"})"});
+    for (const auto& delta : std::vector<ninfer::ToolCallDelta>{
+             {ninfer::ToolCallDeltaKind::Start, 0, "call_weather", "weather", {}},
+             {ninfer::ToolCallDeltaKind::Arguments, 0, "call_weather", "weather", "{\"city\":\"Pa"},
+             {ninfer::ToolCallDeltaKind::Arguments, 0, "call_weather", "weather", "ris\"}"},
+             {ninfer::ToolCallDeltaKind::Completed, 0, "call_weather", "weather", {}}}) {
+        auto events = encoder.tool_delta(delta);
+        wire.insert(wire.end(), events.begin(), events.end());
+    }
+    const auto live_event_count  = wire.size();
     ResponsesStreamFinish finish = encoder.finish(outcome);
     wire.insert(wire.end(), finish.events_before_terminal.begin(),
                 finish.events_before_terminal.end());
     wire.push_back(encoder.terminal(finish.response));
 
-    int failures = 0;
+    int failures = check(
+        live_event_count == 5 && finish.events_before_terminal.size() == 2 &&
+            parse_event(finish.events_before_terminal[0]).at("type") ==
+                "response.function_call_arguments.done" &&
+            parse_event(finish.events_before_terminal[1]).at("type") == "response.output_item.done",
+        "tool starts/arguments did not stream early or accepted completion was not terminal");
     std::string arguments;
     std::string item_id;
     for (const std::string& event : wire) {
@@ -694,6 +708,79 @@ int test_sse_function_call(const Json& choice) {
     failures += check(item.at("type") == "function_call" && item.at("id") == item_id &&
                           item.at("call_id") == "call_weather" && item_id != "call_weather",
                       "function stream preserves distinct stable Item id and call_id");
+    return failures;
+}
+
+int test_sse_incomplete_function_call() {
+    ResponsesRequest request = parse_responses_request(
+        Json{{"model", "qwen3.8-27b"}, {"input", "weather"}, {"stream", true}}, limits());
+    ResponsesEventStream encoder("resp_partial_tool", 123, request, {});
+    (void)encoder.start();
+    const auto start =
+        encoder.tool_delta({ninfer::ToolCallDeltaKind::Start, 0, "call_partial", "weather", {}});
+    (void)encoder.tool_delta(
+        {ninfer::ToolCallDeltaKind::Arguments, 0, "call_partial", "weather", "{\"city\":\"Pa"});
+    const auto incomplete = encoder.tool_delta(
+        {ninfer::ToolCallDeltaKind::Incomplete, 0, "call_partial", "weather", {}});
+    GenerationOutcome outcome;
+    outcome.finish_reason = ninfer::FinishReason::OutputLimit;
+    const auto finished   = encoder.finish(outcome);
+    int failures = check(start.size() == 1 && incomplete.size() == 1 &&
+                             parse_event(incomplete[0]).at("type") == "response.output_item.done" &&
+                             parse_event(incomplete[0]).at("item").at("status") == "incomplete",
+                         "partial call claimed completed arguments");
+    failures += check(finished.response.body.at("status") == "incomplete" &&
+                          finished.response.body.at("output")[0].at("call_id") == "call_partial" &&
+                          finished.response.body.at("output")[0].at("status") == "incomplete" &&
+                          finished.response.output_history[0].tool_calls.empty(),
+                      "partial call lost its stable item identity or entered executable history");
+    return failures;
+}
+
+int test_sse_completed_then_cancelled_tool() {
+    ResponsesRequest request = parse_responses_request(
+        Json{{"model", "qwen3.8-27b"}, {"input", "weather"}, {"stream", true}}, limits());
+    ResponsesEventStream encoder("resp_cancel_tools", 123, request, {});
+    (void)encoder.start();
+    (void)encoder.tool_delta({ninfer::ToolCallDeltaKind::Start, 0, "call_first", "weather", {}});
+    (void)encoder.tool_delta(
+        {ninfer::ToolCallDeltaKind::Arguments, 0, "call_first", "weather", "{}"});
+    const auto syntactic =
+        encoder.tool_delta({ninfer::ToolCallDeltaKind::Completed, 0, "call_first", "weather", {}});
+    (void)encoder.tool_delta({ninfer::ToolCallDeltaKind::Start, 1, "call_second", "weather", {}});
+    (void)encoder.tool_delta(
+        {ninfer::ToolCallDeltaKind::Arguments, 1, "call_second", "weather", "{\"city\":"});
+    const auto interrupted = encoder.tool_delta(
+        {ninfer::ToolCallDeltaKind::Incomplete, 1, "call_second", "weather", {}});
+    GenerationOutcome outcome;
+    outcome.finish_reason = ninfer::FinishReason::Cancelled;
+    const auto finished   = encoder.finish(outcome);
+    int failures =
+        check(syntactic.empty(), "syntactic completion prematurely published accepted done");
+    int completed_arguments = 0, tool_items_done = 0;
+    auto inspect = [&](const std::vector<std::string>& events) {
+        for (const auto& wire : events) {
+            const auto event = parse_event(wire);
+            if (event.at("type") == "response.function_call_arguments.done") ++completed_arguments;
+            if (event.at("type") == "response.output_item.done" &&
+                event.at("item").at("type") == "function_call") {
+                ++tool_items_done;
+                failures += check(event.at("item").at("status") == "incomplete",
+                                  "cancelled tool emitted contradictory completed done status");
+            }
+        }
+    };
+    inspect(interrupted);
+    inspect(finished.events_before_terminal);
+    const auto& items = finished.response.body.at("output");
+    failures += check(
+        completed_arguments == 0 && tool_items_done == 2 &&
+            items[0].at("call_id") == "call_first" && items[0].at("status") == "incomplete" &&
+            items[1].at("call_id") == "call_second" && items[1].at("status") == "incomplete" &&
+            finished.response.output_history[0].tool_calls.empty() &&
+            parse_event(encoder.terminal(finished.response)).at("type") == "response.cancelled",
+        "cancellation after completed first/partial second tool lost lifecycle or polluted "
+        "history");
     return failures;
 }
 
@@ -796,6 +883,8 @@ int main() {
     failures += test_sse_function_call("auto");
     failures += test_sse_function_call("required");
     failures += test_sse_function_call(Json{{"type", "function"}, {"name", "weather"}});
+    failures += test_sse_incomplete_function_call();
+    failures += test_sse_completed_then_cancelled_tool();
     failures += test_input_tokens_schema();
     failures += test_system_prepend();
     if (failures == 0) { std::cout << "ok\n"; }

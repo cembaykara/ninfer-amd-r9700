@@ -230,6 +230,7 @@ ops::SamplingConfig TokenMaskExchange::root_into(const OutputSession* output,
         output->fill_token_masks(token, parent, {root_mask(row), kWords});
         HIP_CHECK(hipMemcpyAsync(const_cast<std::uint32_t*>(device_mask(row)), root_mask(row),
                                  kWords * sizeof(std::uint32_t), hipMemcpyHostToDevice, stream));
+        output->record_token_mask_upload(kWords * sizeof(std::uint32_t));
         config.allowed_token_words = device_mask(row);
     }
     return config;
@@ -370,6 +371,7 @@ void TokenMaskExchange::fill(bool tree) {
         config.allowed_token_words         = device_mask(row);
         config.allowed_token_column_stride = shared ? 0 : static_cast<std::int32_t>(kWords);
         mail_mask_words_[row] = static_cast<std::uint32_t>((shared ? 1U : count) * kWords);
+        outputs_[row]->record_token_mask_upload(mail_mask_words_[row] * sizeof(std::uint32_t));
     }
 }
 

@@ -1,4 +1,5 @@
 #include "serve/metrics.h"
+#include "serve/constraint_stats.h"
 
 #include "product/speculative_options.h"
 #include "serve/request_log.h"
@@ -371,7 +372,22 @@ struct Startup {
     std::vector<std::pair<const char*, std::string>> build_labels;
 };
 
+struct ConstraintTotals {
+    std::uint64_t requests   = 0;
+    std::uint64_t complete   = 0;
+    std::uint64_t terminated = 0;
+    std::array<std::uint64_t, 4> branches{};
+    std::array<std::uint64_t, 4> compile_cache{};
+    double compile_seconds          = 0.0;
+    double compile_wait_seconds     = 0.0;
+    std::uint64_t mask_calls        = 0;
+    std::uint64_t mask_nodes        = 0;
+    std::uint64_t mask_upload_bytes = 0;
+    double mask_seconds             = 0.0;
+};
+
 struct Series {
+    ConstraintTotals constraint;
     // Key: route << 24 | method << 16 | status (0 renders as "other").
     std::map<std::uint32_t, std::uint64_t> http_requests;
     std::array<LatencyHistogram, kRouteCount> http_duration{};
@@ -793,6 +809,40 @@ std::string render_text(const MetricsSnapshotData& data) {
               series.ignored_tool_markup);
     w.counter("ninfer_generation_media_requests_total",
               "Generation attempts whose prompt had media.", series.media_requests);
+    const auto& constraint = series.constraint;
+    w.counter("ninfer_constraint_requests_total",
+              "Terminal constrained requests with observations.", constraint.requests);
+    w.counter("ninfer_constraint_complete_total",
+              "Terminal requests with a complete constrained value.", constraint.complete);
+    w.counter("ninfer_constraint_terminated_total",
+              "Terminal requests whose constrained matcher terminated.", constraint.terminated);
+    w.family("ninfer_constraint_branch_total", "Constrained terminal branch.", "counter");
+    for (std::size_t i = 0; i < constraint.branches.size(); ++i) {
+        w.sample(label_text({{"branch",
+                              constraint_branch_name(static_cast<ninfer::ConstraintBranch>(i))}}),
+                 constraint.branches[i]);
+    }
+    w.family("ninfer_constraint_compile_cache_total", "Constrained request compile-cache outcome.",
+             "counter");
+    for (std::size_t i = 0; i < constraint.compile_cache.size(); ++i) {
+        w.sample(label_text({{"result", constraint_compile_cache_name(
+                                            static_cast<ninfer::ConstraintCompileCache>(i))}}),
+                 constraint.compile_cache[i]);
+    }
+    w.counter("ninfer_constraint_compile_seconds_total",
+              "Host compilation seconds including compiler wait and preparation.",
+              constraint.compile_seconds);
+    w.counter("ninfer_constraint_compile_wait_seconds_total",
+              "Compiler-lock wait seconds, a subset of compile seconds.",
+              constraint.compile_wait_seconds);
+    w.counter("ninfer_constraint_mask_calls_total", "Token-mask construction invocations.",
+              constraint.mask_calls);
+    w.counter("ninfer_constraint_mask_nodes_total",
+              "Reachable matcher nodes whose next-token mask was computed.", constraint.mask_nodes);
+    w.counter("ninfer_constraint_mask_seconds_total",
+              "Host matcher fork and mask-computation seconds.", constraint.mask_seconds);
+    w.counter("ninfer_constraint_mask_upload_bytes_total",
+              "Token-mask payload bytes enqueued for device upload.", constraint.mask_upload_bytes);
     w.family("ninfer_token_count_requests_total", "Token-count requests.", "counter");
     for (std::size_t i = 0; i < kProtocolCount; ++i) {
         w.sample(label_text({{"protocol", kProtocols[i]}}), series.token_count_requests[i]);
@@ -1114,6 +1164,26 @@ Json render_json(const MetricsSnapshotData& data) {
           {"tool_calls", series.tool_calls},
           {"ignored_tool_markup", series.ignored_tool_markup},
           {"media_requests", series.media_requests},
+          {"constraint",
+           {{"requests_total", series.constraint.requests},
+            {"complete_total", series.constraint.complete},
+            {"terminated_total", series.constraint.terminated},
+            {"branches",
+             {{"none", series.constraint.branches[0]},
+              {"reasoning", series.constraint.branches[1]},
+              {"answer", series.constraint.branches[2]},
+              {"tool_call", series.constraint.branches[3]}}},
+            {"compile_cache",
+             {{"none", series.constraint.compile_cache[0]},
+              {"hit", series.constraint.compile_cache[1]},
+              {"built", series.constraint.compile_cache[2]},
+              {"waited", series.constraint.compile_cache[3]}}},
+            {"compile_seconds", series.constraint.compile_seconds},
+            {"compile_wait_seconds", series.constraint.compile_wait_seconds},
+            {"mask_calls", series.constraint.mask_calls},
+            {"mask_nodes", series.constraint.mask_nodes},
+            {"mask_seconds", series.constraint.mask_seconds},
+            {"mask_upload_bytes", series.constraint.mask_upload_bytes}}},
           {"ttft", summary_all(series.ttft)},
           {"e2e", summary_all(series.e2e)},
           {"inter_token_latency", summary_all(series.inter_token)},
@@ -1245,6 +1315,21 @@ void ServeMetrics::observe_generation(const GenerationObservation& observation) 
     if (observation.result == GenerationResult::Rejected) { return; }
     if (observation.outcome != nullptr) {
         observe_terminal_recovery(series, observation.outcome->metrics.recovery);
+        const auto& constraint = observation.outcome->metrics.constraint;
+        if (constraint.active) {
+            auto& total = series.constraint;
+            ++total.requests;
+            total.complete += constraint.complete ? 1U : 0U;
+            total.terminated += constraint.terminated ? 1U : 0U;
+            ++total.branches[static_cast<std::size_t>(constraint.branch)];
+            ++total.compile_cache[static_cast<std::size_t>(constraint.compile_cache)];
+            total.compile_seconds += constraint.compile_seconds;
+            total.compile_wait_seconds += constraint.compile_wait_seconds;
+            total.mask_calls += constraint.mask_calls;
+            total.mask_nodes += constraint.mask_nodes;
+            total.mask_seconds += constraint.mask_seconds;
+            total.mask_upload_bytes += constraint.mask_upload_bytes;
+        }
     } else if (observation.recovery != nullptr) {
         observe_terminal_recovery(series, *observation.recovery);
     }

@@ -7,7 +7,7 @@ An AMD port of [Neroued/NInfer](https://github.com/Neroued/ninfer), distributed 
 ## What it does
 
 - **Works with chat clients.** Run from the terminal or connect a client that uses OpenAI Chat Completions, Responses or Anthropic Messages. Answers stream as they are generated, with reasoning kept separate from the answer.
-- **Calls tools and returns structured answers.** Let the model choose a tool or require a specific one. Limit output to JSON, a JSON Schema or an EBNF grammar.
+- **Calls tools and returns structured answers.** Let the model choose a tool or require a specific one, with incremental tool-call streams. Constrain answers to JSON, a JSON Schema, an EBNF grammar, a full-match regex or literal choices.
 - **Reads images and video.** Add `--vision` at startup to accept media alongside text.
 - **DFlash2 decoding.** A small draft model proposes tokens for the main model to check together. Draft length adapts automatically, up to seven tokens. Use DFlash rather than MTP.
 - **Reuses conversation history.** Cached prefixes avoid processing the same text again. Keep them in GPU memory, add a RAM cache, or save them to SSD for reuse after a restart.

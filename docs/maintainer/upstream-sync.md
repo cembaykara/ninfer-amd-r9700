@@ -6,6 +6,83 @@ Upstream is the RTX 5090/CUDA `dylanbrodiefafard/ninfer` repository’s `experim
 
 Reconciled through upstream `edaad03a737aa1a9e8288c47af3f07ada50ae905` (2026-10-17), advanced from `62687bd3` (2026-10-16), `17c504c9` (2026-10-12), `d5c38cda` (2026-10-09), `6e5b576e` (2026-10-06), `f0d3922e` (2026-10-04), `945515ea` (2026-10-04), `48eb0b01` (2026-10-03), `593c2d0c` (2026-10-03), `574a8d91` (2026-10-02), `f7f70d89` (2026-10-02), `9639c32f` (2026-09-30), `34c7119b` (2026-09-28) and `e04fad3728573a0109236929f5d473475a8657f2` (2026-09-21, AMD ports `7187d95d`, `2eab0a50`, `49c896dd`) by the dispositions below. The next sync reviews upstream changes after `edaad03a` against current AMD behavior.
 
+## Secondary-source review and selective ports (2026-10-18)
+
+Reviewed all 204 commits in Neroued/ninfer’s `experimental` range
+`e31bc99b13f517c8aae70b997b7c4a49b4dcdc5d..05327b22c1596ddca12635d8e04aea278f800724`
+against current AMD behavior. This is a selective source review, not merged ancestry or a
+replacement for the Dylan baseline above. Commit-by-commit local dispositions are retained in
+`profiles/upstream-review/commit-dispositions.csv`.
+
+| Source | AMD disposition |
+|---|---|
+| `81c8ce093b2c` (source precision) | Reject schema assertion numbers whose decimal source is changed by JSON parsing; preserve exact integer literals and represented-value identity above 2^53. Check raw HTTP bodies, CLI messages, and Engine schema strings; report source pointers. Broader numeric language expansion is deferred. |
+| `91d568a6e065` (LayerNorm) | Retain ordinary FP32 arithmetic; scale and center finite BF16 extreme inputs when the original moments or variance-plus-epsilon overflow. Independent FP64 oracle at Vision D=1152 and the epsilon-overflow edge. |
+| `75a890502e0c` (deferred cancellation) | Investigated, no blanket synchronization port: fixed startup-owned buffers and same-stream reuse already preserve lifetime. Added a pending-compute cancellation/reuse regression with exact seeded cold-lane and resident-peer controls at C6/K7/max-context 262144. |
+| `a8e212aca` (tokenizer) | Ported per-encode scratch and adjacency/generation-checked heap merges, retaining the scalar short-word route. Independent official-tokenizer goldens cover ties, Unicode, and long words. |
+| `0a8530d44141` (bounded-string masks) | Ported counted-repeat/dense mask compilation. Flattened complete JSON scalar/escape units so the fast path actually applies. Independent byte-language and scalar-prefix oracles cover all token bits and rollback. |
+| `2e098d5bb` (sampling) | Native challenger rejected: greedy improved 1.84–2.77%, but default p-less slowed 0.3–0.9%, with B6/B7 paired intervals excluding zero. Existing vectorized argmax and sampler retained; independent eager/graph regression cases retained. |
+| `4d6316eea8ef` (convolution) | Ported carried-window standalone tiled causal convolution. Independent FP64 convolution and exact final history, including aliasing, pass. Matched Release ABBA shows approximately 3–10% improvement at 128–8192 rows, with 64-row noise. Default LQ4 prefill already uses a different fused rolling route; no default Engine throughput claim. |
+| `bc70d7c872df` (tool streaming) | Ported transactional provisional tool events through Engine, CLI, Chat, Responses, and Anthropic. Ambiguous delimiters, constrained arguments, cancellation, truncation, rejected recovery attempts, and multiple calls in one token preserve the publication contract. Responses completed events wait for accepted terminal success. |
+| `2734a56e0` and dependencies (schemas/diagnostics) | Ported Unicode string bounds/pattern intersections, supported allOf/local-ref siblings, finite exact-one oneOf and provably disjoint alternatives, source-aware admission errors, compile-cache observations, committed constraint state, mask work/transfer metrics. Unsupported proof forms reject explicitly. |
+| `8ffa31317` (choice/regex) | Ported Engine and CLI literal choices/full-match regex plus the Chat structured_outputs extension, sharing the existing constrained sampler. |
+| `4126ecf40` (media) | Resolve CLI/example/reference media paths relative to the containing messages file. Preserve filesystem symlink/.. traversal semantics. |
+
+The CPU grammar dependency is now one vendored `ninfer_token_grammar` target rather than a
+network fetch plus six build-time patches. `third_party/xgrammar/README.ninfer.md` records the
+source baseline, selected mask changes, licenses, and retained native guarantees. Canonical
+Qwen framing, required/unique named arguments in any order, strict Unicode/escapes, raw tokenizer
+bytes, and the existing bounded-number language remain supported.
+
+Other reviewed correctness candidates required no missing AMD patch: production KV publication
+callers already pass explicit streams (`064965c74563`); DFlash chunk bindings are refreshed
+(`4201b5d2d`); native claims/copy holds preserve cache sources (`911d34db6`), and the faulty
+upstream prefix-forest scoring algorithm is absent from bounded FIFO scheduling (`452c3f5fa`).
+The Jinja trimming and Q8 D=2048 gather fixes have no corresponding native consumer.
+
+Optional/deferred: combined tool-or-constrained-answer branches, broader bounded binary64 and
+fractional integer bounds, tuple intersections, TOML, startup graph calibration changes,
+Vision/KV-transfer/direct-host-loading experiments, and NVIDIA-specific kernels. Additional
+checkpoints and hardware backends remain excluded by the product contract. These items are not
+silently admitted by this port.
+
+### Qualification and scope
+
+Qualification uses the R9700/gfx1201, ROCm 10 / Clang 23, Release build, the fixed
+FP8-K/INT4-V/FP16-scale cache, and the explicit production `qwen3.8-27b-r9700-lq4.ninfer`
+artifact. No weights, clocks, power policy, production sampler, or cache format changed.
+Independent reviewers covered numeric/state lifetime, schema language/source attribution, and
+tokenizer/tool publication; actionable findings were repaired and rechecked.
+
+Final Release build and all 62 host tests passed; the same 62 host tests passed with ASan/UBSan,
+including the instrumented vendored grammar library. Static analysis reported zero diagnostics
+across 147 affected translation units and the two subsequently corrected test files; pinned
+formatting/lint/file gates and changed-document reference checks passed.
+
+Schema composition includes 1,995 independent accept/reject comparisons
+from an independent Draft 2020-12 validator with ECMAScript Unicode pattern semantics, plus
+an explicit unsupported-proof admission case; tokenizer qualification compares 96 cases with
+the official tokenizer and retains 28 goldens. Live HTTP checks passed with speculation
+disabled, MTP, and default DFlash across Chat, Responses, and Anthropic, including incremental tools, constraints,
+truncation, concurrent requests, disconnects, and readmission. The CLI literal-choice smoke
+returned the required exact choice. LayerNorm, convolution/history, and sampling use independent
+mathematical oracles; deferred cancellation uses the real production state geometry. Device
+memcheck and initcheck passed all six selected eager/GDN/sampling executions; focused
+racecheck passed all three qualifiers. The latter checks instrumented cross-wave LDS accesses,
+not arbitrary global-memory races.
+
+Tokenizer matched CPU ABBA on the Ryzen 9 7950X3D measured 1.05x ordinary prompts, 1.27x
+identifier-heavy input, and 86x an 8192-byte word. Counted masks with the real Qwen vocabulary
+reduced the measured initial mask from 1.1–235 ms to 10–17 us, while cold schema compilation
+increased from 5.5–6.9 ms to 21–25 ms. Near-boundary masks improved; the already tiny completed
+mask increased from 0.64 to 1.27 us. These are measured CPU/operator scopes, not Engine TTFT or
+whole-inference speedups. The convolution window removes overlapping input reloads; the
+selected tile-4 gfx1201 route uses 18 VGPRs, reports occupancy 16, and has no LDS, private, or
+scratch allocation. Its independent oracle and public-route qualification passed. No unresolved
+attribution question required a profiler capture to select it. Raw commands, workloads, paired
+results, and limitations remain local
+under `profiles/upstream-review/`.
+
 ## Ported features (`c450798c..e04fad37`)
 
 - Sampling/API: full-domain p-less and epsilon sampling with the 1/1024 probability floor, suppression, masks and root-only cycle exclusion, configured argmax eligibility, DFlash p-less one-hot proposal, per-row position offsets; ordinary and speculative. HIP uses wave32/hipCUB with device-scope release/acquire completion counters and caller-owned workspace.

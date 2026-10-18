@@ -51,7 +51,7 @@ The complete `.ninfer` inventory is validated even when some features are disabl
     "content": [
       {
         "type": "image",
-        "image": "examples/cli/media/visual_chart.png"
+        "image": "../media/visual_chart.png"
       },
       {
         "type": "text",
@@ -62,7 +62,7 @@ The complete `.ninfer` inventory is validated even when some features are disabl
 ]
 ```
 
-Run message files from the repository root when they contain repository-relative media paths:
+Local media paths resolve relative to the messages JSON file, independently of the working directory. Absolute paths, HTTP(S) URLs, and data URIs retain their meanings:
 
 ```bash
 ./build-r9700/apps/ninfer /path/to/qwen3.8-27b-r9700-lq4.ninfer \
@@ -84,7 +84,7 @@ Message content may be a string or an ordered array containing:
 
 `image_url` and `video_url` may be strings or objects containing a string `url`. Assistant history may include `reasoning_content` and `tool_calls`; a tool result uses role `tool` and `tool_call_id`.
 
-Declare `tools` to enable schema-constrained tool calls. Completed calls are returned separately from content; the CLI prints them as a `{"tool_calls":[...]}` JSON object after streamed text. Interrupted calls are not printed as executable calls. Raw output remains raw token text. The schema subset and unsupported tool-choice modes are described in `docs/serving.md`.
+Declare `tools` to enable schema-constrained tool calls. The CLI prints completed calls as a `{"tool_calls":[...]}` JSON object after streamed text. During generation, stderr emits `tool_call_event` JSON records (`start`, `arguments`, `completed`, `incomplete`) with stable call indices and IDs. Fragments and envelope completion are provisional until the terminal result; interrupted calls never enter executable results. An unconstrained first string parameter streams incrementally; other values wait for complete-call validation. Raw output remains raw token text. See `docs/serving.md` for schema and tool-choice support.
 
 See [`examples/cli/`](../examples/cli/) for committed text, image, video, mixed-media, thinking, long-decode, and long-context inputs.
 
@@ -233,7 +233,7 @@ All weight, sequence, workspace, request-transient, and graph allocations are re
 
 ## Constrained output
 
-Use `--json-object` for an arbitrary JSON object, `--json-schema FILE` to read a JSON Schema, or `--grammar FILE` to read an XGrammar EBNF grammar with a `root` rule. Select one constraint:
+Use `--json-object` for arbitrary JSON objects, `--json-schema FILE` for a JSON Schema, `--grammar FILE` for XGrammar EBNF with a `root` rule, `--regex PATTERN` for a full-match regex, or repeated `--choice TEXT` for literal alternatives. Select one mode; choice alternatives may include the empty string.
 
 ```bash
 build-r9700/apps/ninfer /path/to/qwen3.8-27b-r9700-lq4.ninfer --prompt 'Return a JSON object with an answer.' \
@@ -241,3 +241,7 @@ build-r9700/apps/ninfer /path/to/qwen3.8-27b-r9700-lq4.ninfer --prompt 'Return a
 ```
 
 The constraint applies to answer content after reasoning, and supports Device Graphs, MTP, and DFlash through the same token masks used for tools. Schema assertions are enforced at decoding; unsupported assertions are rejected at preparation rather than relaxed. Describe the desired answer in the prompt; the schema is not added to the conversation. Tools and output constraints cannot be combined. Stops, cancellation, or output/context limits may truncate a valid prefix; complete JSON validity requires finishing the grammar. See the constrained-output contract in `docs/serving.md` for the supported schema subset and HTTP triggers.
+
+The shared schema subset supports string pattern/Unicode-length conjunctions, supported `allOf` intersections, and finite-value filtering against sibling assertions. Tuple intersections, fractional integer bounds, and broader binary64 bounded-number emission remain unsupported. Bounded numbers use at most six fractional digits; inexact source numbers and unrepresentable bounds fail admission. See `docs/serving.md` for exact limits and source diagnostics.
+
+For active constraints, the generation summary reports terminal branch and complete/terminated states, compile-cache outcome, compile/wait/mask host times, mask calls/nodes, and enqueued mask payload bytes. Wait is part of compile elapsed time. Recovery work is counted once; terminal state describes the final attempt. These counters do not measure GPU synchronization time.

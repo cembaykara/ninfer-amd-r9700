@@ -21,6 +21,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -96,8 +101,7 @@ ninfer::runtime::ResolvedExecutionOptions request(std::uint32_t lane) {
     return result;
 }
 
-ninfer::TokenId admit(execution::ProgramImplCore& program, family::Frontend& frontend,
-                      std::uint32_t lane) {
+auto admission_prompt(family::Frontend& frontend, std::uint32_t lane) {
     ninfer::PromptInput input;
     input.options.enable_thinking = false;
     ninfer::ChatMessage message;
@@ -105,7 +109,12 @@ ninfer::TokenId admit(execution::ProgramImplCore& program, family::Frontend& fro
         .text = "Continue this sentence with a short account of experiment number " +
                 std::to_string(lane) + ": The researcher opened the notebook and"});
     input.messages.push_back(std::move(message));
-    auto prompt = family::PreparedPromptAccess::take(frontend.prepare(input));
+    return family::PreparedPromptAccess::take(frontend.prepare(input));
+}
+
+ninfer::TokenId admit(execution::ProgramImplCore& program, family::Frontend& frontend,
+                      std::uint32_t lane) {
+    auto prompt = admission_prompt(frontend, lane);
     auto base   = program.plan_request_base(prompt, request(lane));
     auto plan   = program.plan_request_for_lane(lane, prompt, base);
     auto step   = program.start_prefill_lane(lane, std::move(prompt), std::move(plan), {});
@@ -117,6 +126,77 @@ ninfer::TokenId admit(execution::ProgramImplCore& program, family::Frontend& fro
                 (lane == kBadLane ? 0 : 1),
             "lane suppression was not installed");
     return first;
+}
+
+// Exercise the exact cancellation window before the first mixed target forward. A
+// queued host gate makes pending compute deterministic without an injection hook.
+void deferred_prefill_cancel(execution::ProgramImplCore& program, family::Frontend& frontend,
+                             ninfer::DeviceContext& device, std::uint32_t lane,
+                             ninfer::TokenId cold_first) {
+    require(program.mixed_forward != 0, "deferred cancellation requires mixed forwarding");
+    auto prompt = admission_prompt(frontend, lane);
+    auto base   = program.plan_request_base(prompt, request(lane));
+    auto plan   = program.plan_request_for_lane(lane, prompt, base);
+
+    struct Gate {
+        hipStream_t stream;
+        std::atomic<bool> entered{false};
+        std::atomic<bool> released{false};
+        std::mutex mutex;
+        std::condition_variable cancelled;
+        bool cancellation_done = false;
+
+        ~Gate() {
+            released.store(true, std::memory_order_release);
+            released.notify_all();
+            // The callback holds this object's address, including during exception teardown.
+            (void)hipStreamSynchronize(stream);
+        }
+    } gate{device.stream};
+
+    HIP_CHECK(hipLaunchHostFunc(
+        device.stream,
+        [](void* opaque) {
+            auto& pending = *static_cast<Gate*>(opaque);
+            pending.entered.store(true, std::memory_order_release);
+            pending.entered.notify_all();
+            pending.released.wait(false, std::memory_order_acquire);
+        },
+        &gate));
+    std::jthread release([&] {
+        gate.entered.wait(false, std::memory_order_acquire);
+        std::unique_lock lock(gate.mutex);
+        // Bound an inconclusive synchronous runtime without hanging exception teardown.
+        (void)gate.cancelled.wait_for(lock, std::chrono::seconds(2),
+                                      [&] { return gate.cancellation_done; });
+        gate.released.store(true, std::memory_order_release);
+        gate.released.notify_all();
+    });
+    const auto first =
+        program.start_prefill_lane(lane, std::move(prompt), std::move(plan), {}, nullptr, true);
+    const auto& prefill = program.requests[lane].prefill;
+    require(prefill.has_value(), "deferred prefill state missing");
+    require(!first.complete && first.round.tokens.empty() &&
+                prefill.value().cursor == prefill.value().base,
+            "cancellation did not precede the first deferred mixed forward");
+    require(!gate.released.load(std::memory_order_acquire),
+            "deferred cancellation phase was not reached before pending compute settled");
+    require(!program.revert_cancelled_prefill_lane(lane),
+            "cold cancelled prefill unexpectedly retained a prefix");
+    program.abort_lane(lane);
+    require(!gate.released.load(std::memory_order_acquire),
+            "cancellation waited for the fallback release instead of completing with pending work");
+    require(!program.sequences[lane].kv &&
+                program.requests[lane].lifecycle == execution::Lifecycle::Empty,
+            "deferred cancellation retained its lane or KV pages");
+    {
+        std::lock_guard lock(gate.mutex);
+        gate.cancellation_done = true;
+    }
+    gate.cancelled.notify_all();
+    require(admit(program, frontend, lane) == cold_first,
+            "deferred cancellation/reuse changed the seeded cold first token");
+    program.abort_lane(lane);
 }
 
 void require_empty(const execution::ProgramImplCore& program) {
@@ -281,6 +361,31 @@ void exercise(const std::filesystem::path& artifact) {
             "clean readmission changed the same-profile seeded cold control");
     for (const auto lane : kAll) program.abort_lane(lane);
     require_empty(program);
+    const std::array<std::uint32_t, 1> peer{1U};
+    const auto peer_times       = program.adaptive_t_by_batch;
+    const auto peer_batch_k     = program.adaptive_batch_k_by_c;
+    const auto peer_calibration = program.p_less_calibration;
+    (void)admit(program, frontend, 1U);
+    const auto peer_decode_times       = program.adaptive_t_by_batch;
+    const auto peer_decode_k           = program.adaptive_batch_k_by_c;
+    const auto peer_decode_calibration = program.p_less_calibration;
+    const auto peer_control            = decode(program, peer, false);
+    program.abort_lane(1U);
+    program.adaptive_t_by_batch   = peer_times;
+    program.adaptive_batch_k_by_c = peer_batch_k;
+    program.p_less_calibration    = peer_calibration;
+    (void)admit(program, frontend, 1U);
+    deferred_prefill_cancel(program, frontend, device, 0U, first[0]);
+    deferred_prefill_cancel(program, frontend, device, kBadLane, first[kBadLane]);
+    program.adaptive_t_by_batch   = peer_decode_times;
+    program.adaptive_batch_k_by_c = peer_decode_k;
+    program.p_less_calibration    = peer_decode_calibration;
+    require(decode(program, peer, false) == peer_control,
+            "deferred cancellation or reuse changed the resident peer's same-profile continuation");
+    program.abort_lane(1U);
+    require_empty(program);
+    std::cout << "PASS: deferred mixed-prefill cancellation before its first forward, "
+                 "ordered reuse, exact cold readmission with a live peer\n";
     std::cout << "PASS: six-lane graph repack, isolated nonfinite detection, whole-batch "
                  "rejection, clean readmission\n";
 }

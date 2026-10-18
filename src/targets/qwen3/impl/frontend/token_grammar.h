@@ -26,6 +26,7 @@ struct TokenGrammarData {
     // Tool grammars have declarations; response grammars have no tool-publication metadata.
     std::vector<Definition> definitions;
     xgrammar::CompiledGrammar compiled;
+    ConstraintStats constraint;
     [[nodiscard]] std::optional<ToolCall> decode_call(std::string_view text) const;
 };
 
@@ -41,6 +42,8 @@ public:
     void preview(std::span<const TokenId> tokens);
     void commit_preview() noexcept;
     void discard_preview() noexcept;
+    [[nodiscard]] ConstraintStats constraint_stats() const noexcept;
+    void record_upload(std::size_t bytes) const noexcept;
 
     // Node zero is the committed root; its token/parent are ignored. Each other
     // node consumes its draft token from an earlier parent. Output is node-major,
@@ -55,6 +58,7 @@ private:
     std::vector<TokenId> ignored_model_stops_;
     xgrammar::GrammarMatcher committed_;
     std::optional<xgrammar::GrammarMatcher> preview_;
+    mutable ConstraintStats work_;
 };
 
 // One compiler per resident frontend/tokenizer. Request grammars are immutable;

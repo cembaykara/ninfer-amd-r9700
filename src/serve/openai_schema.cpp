@@ -1,4 +1,5 @@
 #include "serve/openai_schema.h"
+#include "serve/constraint_stats.h"
 
 #include <array>
 #include <algorithm>
@@ -319,7 +320,8 @@ void parse_tools(const Json& body, GenerationRequest& out) {
         Json normalized = item;
         Json& fn        = normalized["function"];
         ToolDefinition tool;
-        tool.name = require_function_name(fn, "tools");
+        tool.schema_pointer = "/tools/" + std::to_string(i) + "/function/parameters";
+        tool.name           = require_function_name(fn, "tools");
         if (fn.contains("description") && !fn.at("description").is_null()) {
             if (!fn.at("description").is_string()) {
                 bad_request("function description must be a string", "tools");
@@ -531,14 +533,13 @@ Json base_chunk(const std::string& id, const std::string& model, std::int64_t cr
         {"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", model}};
 }
 
-Json tool_calls_json(const std::vector<ToolCall>& tool_calls, bool include_index) {
+Json tool_calls_json(const std::vector<ToolCall>& tool_calls) {
     Json out = Json::array();
     for (std::size_t i = 0; i < tool_calls.size(); ++i) {
         const ToolCall& call = tool_calls[i];
         Json item = {{"id", call.id},
                      {"type", "function"},
                      {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
-        if (include_index) { item["index"] = static_cast<int>(i); }
         out.push_back(std::move(item));
     }
     return out;
@@ -694,6 +695,9 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
         ninfer["kv_disk"] = {{"save_ms", json_decimal3(timings->kv_disk_save_ms)},
                              {"load_ms", json_decimal3(timings->kv_disk_load_ms)},
                              {"h2d_ms", json_decimal3(timings->kv_disk_h2d_ms)}};
+    }
+    if (timings->constraint.active) {
+        ninfer["constraint"] = constraint_stats_json(timings->constraint);
     }
     ptd["ninfer"]                = std::move(ninfer);
     out["prompt_tokens_details"] = std::move(ptd);
@@ -926,14 +930,32 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
             bad_request("structured_outputs conflicts with response_format", "structured_outputs",
                         "invalid_output_constraint");
         }
-        if (!structured.is_object() || structured.size() != 1 || !structured.contains("grammar") ||
-            !structured.at("grammar").is_string() ||
-            structured.at("grammar").get<std::string>().empty()) {
-            bad_request("structured_outputs requires one nonempty EBNF grammar string",
+        if (!structured.is_object() || structured.size() != 1) {
+            bad_request("structured_outputs requires exactly one of grammar, regex or choice",
                         "structured_outputs", "invalid_output_constraint");
         }
-        out.output_constraint = ninfer::OutputConstraint{
-            ninfer::OutputConstraintKind::Grammar, structured.at("grammar").get<std::string>()};
+        if (structured.contains("choice")) {
+            const auto& values = structured.at("choice");
+            if (!values.is_array() || values.empty() ||
+                !std::all_of(values.begin(), values.end(),
+                             [](const Json& value) { return value.is_string(); })) {
+                bad_request("choice requires a nonempty array of literal strings",
+                            "structured_outputs.choice", "invalid_output_constraint");
+            }
+            out.output_constraint = ninfer::OutputConstraint{
+                ninfer::OutputConstraintKind::Choice, {}, values.get<std::vector<std::string>>()};
+        } else {
+            const bool regex = structured.contains("regex");
+            const char* key  = regex ? "regex" : "grammar";
+            if (!structured.contains(key) || !structured.at(key).is_string() ||
+                (!regex && structured.at(key).get<std::string>().empty())) {
+                bad_request("structured_outputs requires a grammar or regex string",
+                            "structured_outputs", "invalid_output_constraint");
+            }
+            out.output_constraint = ninfer::OutputConstraint{
+                regex ? ninfer::OutputConstraintKind::Regex : ninfer::OutputConstraintKind::Grammar,
+                structured.at(key).get<std::string>()};
+        }
         out.output_constraint_param = "structured_outputs";
     }
     if (out.output_constraint && !out.tools.empty()) {
@@ -1010,12 +1032,13 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
                                                const std::vector<ToolCall>& tool_calls,
                                                const CompletionUsage& usage,
                                                const CompletionTimings* timings,
-                                               const std::vector<TokenLogprobEntry>* logprobs) {
+                                               const std::vector<TokenLogprobEntry>* logprobs,
+                                               const char* finish_reason) {
     Json message = {{"role", "assistant"},
                     {"content", content.empty() ? Json(nullptr) : Json(content)},
-                    {"tool_calls", tool_calls_json(tool_calls, false)}};
+                    {"tool_calls", tool_calls_json(tool_calls)}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
-    Json choice = {{"index", 0}, {"message", std::move(message)}, {"finish_reason", "tool_calls"}};
+    Json choice = {{"index", 0}, {"message", std::move(message)}, {"finish_reason", finish_reason}};
     if (logprobs != nullptr) { choice["logprobs"] = choice_logprobs_json(*logprobs); }
     Json payload = {{"id", id},
                     {"object", "chat.completion"},
@@ -1061,16 +1084,24 @@ std::string make_chat_chunk_content_logprobs(const std::string& id, const std::s
     return sse_event(payload);
 }
 
-std::string make_chat_chunk_tool_calls(const std::string& id, const std::string& model,
-                                       std::int64_t created,
-                                       const std::vector<ToolCall>& tool_calls,
+std::string make_chat_chunk_tool_delta(const std::string& id, const std::string& model,
+                                       std::int64_t created, const ninfer::ToolCallDelta& delta,
                                        bool include_usage) {
-    Json payload = base_chunk(id, model, created);
-    payload["choices"] =
-        Json::array({Json{{"index", 0},
-                          {"delta", Json{{"tool_calls", tool_calls_json(tool_calls, true)}}},
-                          {"finish_reason", nullptr}}});
-    if (include_usage) { payload["usage"] = nullptr; }
+    if (delta.kind != ninfer::ToolCallDeltaKind::Start &&
+        delta.kind != ninfer::ToolCallDeltaKind::Arguments)
+        return {};
+    Json call = {{"index", delta.index}};
+    if (delta.kind == ninfer::ToolCallDeltaKind::Start) {
+        call["id"]       = delta.id;
+        call["type"]     = "function";
+        call["function"] = {{"name", delta.name}, {"arguments", ""}};
+    } else
+        call["function"] = {{"arguments", delta.arguments}};
+    Json payload       = base_chunk(id, model, created);
+    payload["choices"] = Json::array({Json{{"index", 0},
+                                           {"delta", Json{{"tool_calls", Json::array({call})}}},
+                                           {"finish_reason", nullptr}}});
+    if (include_usage) payload["usage"] = nullptr;
     return sse_event(payload);
 }
 

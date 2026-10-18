@@ -26,6 +26,7 @@ struct CandidateScoreRequest;
 
 struct GenerationMetrics {
     ninfer::GenerationRecoveryStats recovery;
+    ninfer::ConstraintStats constraint;
     double prepare_seconds       = 0.0;
     double ttft_seconds          = 0.0;
     double vision_seconds        = 0.0;
@@ -89,11 +90,13 @@ struct StreamSink {
     std::function<void(const std::string& delta_text, std::span<const TokenLogprobEntry> logprobs)>
         on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
+    std::function<void(const ninfer::ToolCallDelta&)> on_tool_call;
     std::function<bool()> is_cancelled;
 };
 
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
-ApiError request_error_to_api_error(const ninfer::RequestError& exception);
+ApiError request_error_to_api_error(const ninfer::RequestError& exception,
+                                    const GenerationRequest* request = nullptr);
 
 // HTTP 400 owner for capture_context_checkpoint on a server that cannot pin.
 // Throws before Engine submit. No-op when capture is not requested, or when

@@ -446,15 +446,52 @@ __global__ void layernorm_kernel(const hip_bfloat16* input, const hip_bfloat16* 
     for (std::uint32_t feature = lane; feature < features; feature += 32U) {
         sum += static_cast<float>(input[base + feature]);
     }
-    const float mean = wave_sum(sum) / static_cast<float>(features);
-    float variance   = 0.0F;
+    float mean     = wave_sum(sum) / static_cast<float>(features);
+    float variance = 0.0F;
     for (std::uint32_t feature = lane; feature < features; feature += 32U) {
         const float centered = static_cast<float>(input[base + feature]) - mean;
         variance             = fmaf(centered, centered, variance);
     }
-    const float inverse = rsqrtf(wave_sum(variance) / static_cast<float>(features) + eps);
+    variance = wave_sum(variance) / static_cast<float>(features);
+    if (isfinite(mean) && isfinite(variance + eps)) {
+        const float inverse = rsqrtf(variance + eps);
+        for (std::uint32_t feature = lane; feature < features; feature += 32U) {
+            const float normalized = (static_cast<float>(input[base + feature]) - mean) * inverse;
+            output[base + feature] = hip_bfloat16(normalized * static_cast<float>(weight[feature]) +
+                                                  static_cast<float>(bias[feature]));
+        }
+        return;
+    }
+    // Finite BF16 inputs can overflow either raw FP32 reduction. Normalize their
+    // exponent before centering; the scale is a normal power of two, including
+    // at BF16's largest exponent. This keeps both centered values and squares
+    // bounded without imposing a different arithmetic path on ordinary rows.
+    float maximum = 0.0F;
     for (std::uint32_t feature = lane; feature < features; feature += 32U) {
-        const float normalized = (static_cast<float>(input[base + feature]) - mean) * inverse;
+        maximum = fmaxf(maximum, fabsf(static_cast<float>(input[base + feature])));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        maximum = fmaxf(maximum, __shfl_xor(maximum, offset, 32));
+    }
+    const float scale  = ldexpf(1.0F, -min(126, max(0, ilogbf(maximum))));
+    const float anchor = static_cast<float>(input[base]) * scale;
+    sum                = 0.0F;
+    for (std::uint32_t feature = lane; feature < features; feature += 32U) {
+        sum += static_cast<float>(input[base + feature]) * scale - anchor;
+    }
+    mean     = wave_sum(sum) / static_cast<float>(features);
+    variance = 0.0F;
+    for (std::uint32_t feature = lane; feature < features; feature += 32U) {
+        const float centered = static_cast<float>(input[base + feature]) * scale - anchor - mean;
+        variance             = fmaf(centered, centered, variance);
+    }
+    variance            = wave_sum(variance) / static_cast<float>(features);
+    const float inverse = rsqrtf(variance + (eps * scale) * scale);
+    for (std::uint32_t feature = lane; feature < features; feature += 32U) {
+        const float centered = static_cast<float>(input[base + feature]) * scale - anchor - mean;
+        // Scaling may underflow eps for a large constant row; its normalized value
+        // is exactly zero regardless of the positive original eps.
+        const float normalized = centered == 0.0F ? 0.0F : centered * inverse;
         output[base + feature] = hip_bfloat16(normalized * static_cast<float>(weight[feature]) +
                                               static_cast<float>(bias[feature]));
     }

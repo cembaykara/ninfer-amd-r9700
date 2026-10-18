@@ -768,6 +768,169 @@ void qualify_validation(ninfer::DeviceContext& device) {
     } catch (const std::invalid_argument&) {}
 }
 
+// Public greedy selection at ragged cross-tile domains. Logical maxima are
+// checked independently; failed rows only promise a sticky status and safe id.
+void qualify_greedy_replay(ninfer::DeviceContext& device) {
+    for (const int tokens : {257, 12801, 248077}) {
+        const int physical = tokens + 3, words = (tokens + 31) / 32;
+        for (int rows = 1; rows <= 8; ++rows) {
+            const std::size_t elements = static_cast<std::size_t>(physical) * rows;
+            std::vector<hip_bfloat16> logits(elements, bf16(NAN));
+            std::vector<std::uint32_t> masks(static_cast<std::size_t>(words) * rows, 0U);
+            std::vector<int> counts(static_cast<std::size_t>(tokens) * rows, 3);
+            std::vector<int> positions(rows, 811);
+            std::vector<ninfer::ops::SamplingConfig> configs(rows);
+            ninfer::DeviceBuffer dl(elements * sizeof(logits[0]));
+            ninfer::DeviceBuffer dm(masks.size() * sizeof(masks[0]));
+            ninfer::DeviceBuffer dh(counts.size() * sizeof(counts[0]));
+            ninfer::DeviceBuffer ds(rows * sizeof(std::uint32_t));
+            ninfer::DeviceBuffer dc(rows * sizeof(configs[0]));
+            ninfer::DeviceBuffer dp(rows * sizeof(int)), dout(rows * sizeof(int));
+            const auto bytes = ninfer::ops::sampling_workspace_capacity_bytes(tokens, rows, rows);
+            ninfer::DeviceBuffer workspace(bytes);
+            ninfer::DeviceArena arena(ninfer::DeviceSpan{workspace.data(), bytes});
+            for (int row = 0; row < rows; ++row) {
+                masks[row * words] = 1U | (1U << 7);
+                masks[row * words + (tokens - 1) / 32] |= 1U << ((tokens - 1) % 32);
+                auto& cfg                  = configs[row];
+                cfg.temperature            = 0.0F;
+                cfg.p_less                 = 1; // Positive-temperature gate must keep this greedy.
+                cfg.presence_penalty       = 7.0F;
+                cfg.frequency_penalty      = 9.0F;
+                cfg.seed                   = 0x901324ULL + row;
+                cfg.token_counts           = static_cast<int*>(dh.data()) + row * tokens;
+                cfg.suppressed_token_count = 1;
+                cfg.suppressed_tokens[0]   = 0;
+                cfg.allowed_token_words    = static_cast<std::uint32_t*>(dm.data()) + row * words;
+                cfg.nonfinite_logits       = static_cast<std::uint32_t*>(ds.data()) + row;
+            }
+            dm.copy_from_host(masks.data(), dm.size());
+            dh.copy_from_host(counts.data(), dh.size());
+            dc.copy_from_host(configs.data(), dc.size());
+            dp.copy_from_host(positions.data(), dp.size());
+            ninfer::Tensor input(dl.data(), ninfer::DType::BF16, {physical, rows});
+            ninfer::Tensor output(dout.data(), ninfer::DType::I32, {rows});
+            ninfer::Tensor position(dp.data(), ninfer::DType::I32, {rows});
+            {
+                const auto launch = [&] {
+                    ninfer::ops::sample(input, output, tokens,
+                                        static_cast<const ninfer::ops::SamplingConfig*>(dc.data()),
+                                        position, ninfer::ops::kSamplePurposeDecode, arena,
+                                        device.stream);
+                };
+                hipGraph_t graph          = nullptr;
+                hipGraphExec_t executable = nullptr;
+                HIP_CHECK(hipStreamBeginCapture(device.stream, hipStreamCaptureModeGlobal));
+                launch();
+                HIP_CHECK(hipStreamEndCapture(device.stream, &graph));
+                HIP_CHECK(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+                // Include cross-tile ties and signed zero, isolated/all-eligible
+                // NaN/Inf, and recovery with dirty workspace after every failure.
+                for (int scenario = 0; scenario < 8; ++scenario) {
+                    const bool dirty = scenario >= 1 && scenario <= 6;
+                    for (int row = 0; row < rows; ++row) {
+                        const float value                   = row % 2 == 0 ? 0.0F : 5.0F;
+                        logits[row * physical]              = bf16(NAN); // Explicitly suppressed.
+                        logits[row * physical + 7]          = bf16(value);
+                        logits[row * physical + tokens - 1] = bf16(row % 2 == 0 ? -0.0F : value);
+                        if (dirty) {
+                            const float poison         = scenario <= 2   ? NAN
+                                                         : scenario <= 4 ? INFINITY
+                                                                         : -INFINITY;
+                            logits[row * physical + 7] = bf16(poison);
+                            if (scenario % 2 == 0)
+                                logits[row * physical + tokens - 1] = bf16(poison);
+                        }
+                    }
+                    dl.copy_from_host(logits.data(), dl.size());
+                    // Unrelated status bits remain caller-owned; workspaces do
+                    // not depend on a prior invocation or graph capture writes.
+                    const std::vector<std::uint32_t> initial(rows, 2U);
+                    for (int replay = 0; replay < 2; ++replay) {
+                        ds.copy_from_host(initial.data(), ds.size());
+                        workspace.fill(0xa5);
+                        dout.fill(0xff);
+                        if (replay == 0)
+                            launch();
+                        else
+                            HIP_CHECK(hipGraphLaunch(executable, device.stream));
+                        device.synchronize();
+                        std::vector<int> actual(rows), observed_counts(counts.size());
+                        std::vector<std::uint32_t> status(rows);
+                        dout.copy_to_host(actual.data(), dout.size());
+                        ds.copy_to_host(status.data(), ds.size());
+                        dh.copy_to_host(observed_counts.data(), dh.size());
+                        for (int row = 0; row < rows; ++row) {
+                            if (status[row] != (dirty ? 3U : 2U)) fail("greedy status isolation");
+                            if (actual[row] < 0 || actual[row] >= tokens) fail("greedy unsafe id");
+                            if (!dirty && actual[row] != 7) fail("greedy exact lower-id tie");
+                        }
+                        if (observed_counts != counts) fail("greedy unexpectedly updated counts");
+                    }
+                }
+                HIP_CHECK(hipGraphExecDestroy(executable));
+                HIP_CHECK(hipGraphDestroy(graph));
+            }
+            // Supplement the independent greedy checks with fixed-input mixed
+            // replay parity. Both positive-temperature paths must keep their RNG
+            // draws and exactly-once count transitions when greedy rows coexist.
+            for (int row = 0; row < rows; ++row) {
+                configs[row].temperature = row % 3 == 0 ? 0.0F : 0.8F;
+                configs[row].p_less      = row % 3 == 2;
+                configs[row].top_k       = 2;
+            }
+            dc.copy_from_host(configs.data(), dc.size());
+            std::vector<int> control;
+            {
+                hipGraph_t graph          = nullptr;
+                hipGraphExec_t executable = nullptr;
+                const auto launch         = [&] {
+                    ninfer::ops::sample(input, output, tokens,
+                                        static_cast<const ninfer::ops::SamplingConfig*>(dc.data()),
+                                        position, ninfer::ops::kSamplePurposeDecode, arena,
+                                        device.stream);
+                };
+                HIP_CHECK(hipStreamBeginCapture(device.stream, hipStreamCaptureModeGlobal));
+                launch();
+                HIP_CHECK(hipStreamEndCapture(device.stream, &graph));
+                HIP_CHECK(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+                for (int replay = 0; replay < 2; ++replay) {
+                    dh.copy_from_host(counts.data(), dh.size());
+                    ds.fill();
+                    workspace.fill(0xa5);
+                    if (replay == 0)
+                        launch();
+                    else
+                        HIP_CHECK(hipGraphLaunch(executable, device.stream));
+                    device.synchronize();
+                    std::vector<int> actual(rows), observed_counts(counts.size());
+                    std::vector<std::uint32_t> status(rows);
+                    dout.copy_to_host(actual.data(), dout.size());
+                    dh.copy_to_host(observed_counts.data(), dh.size());
+                    ds.copy_to_host(status.data(), ds.size());
+                    if (control.empty()) control = actual;
+                    if (actual != control) fail("mixed-row greedy RNG replay mismatch");
+                    auto expected_counts = counts;
+                    for (int row = 0; row < rows; ++row) {
+                        if (status[row] != 0U) fail("mixed-row greedy false nonfinite");
+                        if (actual[row] != 7 && actual[row] != tokens - 1)
+                            fail("mixed-row greedy eligibility mismatch");
+                        if (row % 3 == 0 && actual[row] != 7)
+                            fail("mixed-row greedy exact tie mismatch");
+                        if (row % 3 != 0) ++expected_counts[row * tokens + actual[row]];
+                    }
+                    if (observed_counts != expected_counts)
+                        fail("mixed-row greedy count publication mismatch");
+                }
+                HIP_CHECK(hipGraphExecDestroy(executable));
+                HIP_CHECK(hipGraphDestroy(graph));
+            }
+        }
+    }
+    std::cout << "greedy final reduction: "
+                 "B1..8/ragged/ties/masks/nonfinite/counts/dirty-workspace/eager+graph PASS\n";
+}
+
 void benchmark(ninfer::DeviceContext& device) {
     constexpr int rows               = static_cast<int>(ninfer::kMaximumConcurrency);
     std::vector<hip_bfloat16> logits = make_logits(rows, kPhysicalVocabulary);
@@ -830,6 +993,7 @@ int main() {
                   << " wave=" << device.props.warpSize
                   << " vram_mib=" << device.props.totalGlobalMem / (1024U * 1024U) << '\n';
         qualify_validation(device);
+        qualify_greedy_replay(device);
         qualify_nonfinite_status(device);
         qualify_low_positive_temperature(device);
         qualify_rng_and_small_route(device);

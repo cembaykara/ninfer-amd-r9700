@@ -6,7 +6,8 @@ Offline `--messages` examples for short text, chat history, images, video, mixed
 
 ## Quick start
 
-Run from the repository root because media paths in the JSON files are repository-relative:
+The commands below use repository-relative messages paths. Media paths inside each JSON file
+are relative to that file, so an absolute messages path also works from another directory:
 
 ```bash
 CLI=./build-r9700/apps/ninfer

@@ -41,6 +41,21 @@ int main() {
     failures += check(conflict_rejected, "CLI accepted competing output constraints");
 
 
+    const auto choices =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--choice", "", "--choice", "a|b"});
+    failures += check(choices.output_choices == std::vector<std::string>{"", "a|b"},
+                      "CLI changed literal choices");
+    const auto regex = parse({"ninfer", "model.ninfer", "--prompt", "hi", "--regex", "[A-Z]+"});
+    failures += check(regex.output_regex == "[A-Z]+", "CLI changed regex source");
+    for (const std::string flag : {"--grammar", "--json-schema", "--regex"}) {
+        bool conflict = false;
+        try {
+            (void)parse(
+                {"ninfer", "model.ninfer", "--prompt", "hi", "--choice", "yes", flag, "value"});
+        } catch (const std::invalid_argument&) { conflict = true; }
+        failures += check(conflict, "CLI accepted conflicting choice constraint");
+    }
+
     const auto default_spec = parse({"ninfer", "model.ninfer", "--prompt", "hi"});
     failures += check(default_spec.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
                           default_spec.speculative.draft_tokens == 7 &&

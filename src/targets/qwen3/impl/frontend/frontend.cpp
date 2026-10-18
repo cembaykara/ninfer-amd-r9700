@@ -431,7 +431,7 @@ std::size_t channel_index(OutputChannel channel) noexcept {
 
 void append_delta(PublishedOutput& output, OutputChannel channel, std::string text) {
     if (text.empty()) { return; }
-    if (!output.empty() && output.back().channel == channel) {
+    if (!output.empty() && !output.back().tool_call && output.back().channel == channel) {
         output.back().text += text;
     } else {
         output.push_back(OutputDelta{.channel = channel, .text = std::move(text)});
@@ -792,6 +792,96 @@ public:
     struct ToolPublication {
         std::string pending;
         std::vector<ToolCall> calls;
+        std::string active_name;
+        std::string streamed_arguments;
+        std::size_t streamed_raw_bytes = 0;
+        bool selected_tool             = false;
+        bool raw_started               = false;
+        bool raw_frozen                = false;
+
+        void emit(PublishedOutput& output, ToolCallDeltaKind kind, std::string arguments = {}) {
+            if (kind == ToolCallDeltaKind::Start) selected_tool = true;
+            OutputDelta delta;
+            delta.tool_call = ToolCallDelta{.kind      = kind,
+                                            .index     = static_cast<std::uint32_t>(calls.size()),
+                                            .id        = {},
+                                            .name      = active_name,
+                                            .arguments = std::move(arguments)};
+            output.push_back(std::move(delta));
+        }
+
+        void stream_prefix(PublishedOutput& output, const TokenGrammarData& grammar) {
+            if (raw_frozen) return;
+            auto body = std::string_view(pending);
+            if (!body.starts_with(kToolOpen)) return;
+            body.remove_prefix(kToolOpen.size());
+            while (!body.empty() && std::isspace(static_cast<unsigned char>(body.front())))
+                body.remove_prefix(1);
+            if (!body.starts_with("<function=")) return;
+            body.remove_prefix(std::string_view("<function=").size());
+            const auto name_end = body.find('>');
+            if (name_end == std::string_view::npos) return;
+            const auto name = body.substr(0, name_end);
+            const auto definition =
+                std::find_if(grammar.definitions.begin(), grammar.definitions.end(),
+                             [&](const auto& item) { return item.name == name; });
+            if (definition == grammar.definitions.end()) return;
+            if (active_name.empty()) {
+                active_name = name;
+                emit(output, ToolCallDeltaKind::Start);
+            }
+            body.remove_prefix(name_end + 1);
+            while (!body.empty() && std::isspace(static_cast<unsigned char>(body.front())))
+                body.remove_prefix(1);
+            if (!body.starts_with("<parameter=")) return;
+            body.remove_prefix(std::string_view("<parameter=").size());
+            const auto key_end = body.find('>');
+            if (key_end == std::string_view::npos) return;
+            const std::string key(body.substr(0, key_end));
+            // Only a completely unconstrained string guarantees the decoder's first (raw)
+            // interpretation for every completion. Unions, literals and constrained values
+            // retain the native schema-guided whole-call backtracking semantics.
+            const auto& schema = definition->parameters;
+            if (!schema.contains("properties") || !schema["properties"].contains(key)) return;
+            const auto& value_schema = schema["properties"][key];
+            if (!value_schema.is_object() || !value_schema.contains("type") ||
+                value_schema["type"] != "string")
+                return;
+            // Metadata never narrows the instance language. Every other keyword keeps the
+            // complete-call validator in charge, including const/enum/pattern/length and refs.
+            for (const auto& item : value_schema.items()) {
+                const auto& field = item.key();
+                if (field != "type" && field != "$schema" && field != "$id" && field != "title" &&
+                    field != "description" && field != "default" && field != "examples" &&
+                    field != "deprecated" && field != "readOnly" && field != "writeOnly" &&
+                    field != "$comment")
+                    return;
+            }
+            body.remove_prefix(key_end + 1);
+            if (body.empty() || body.front() != '\n') return;
+            body.remove_prefix(1);
+            // A candidate close may be literal string data. Once one appears, hold the
+            // ambiguous suffix until decode_call resolves the complete envelope.
+            constexpr std::string_view close = "\n</parameter>";
+            const auto found                 = body.find(close, streamed_raw_bytes);
+            const auto hold                  = longest_suffix_prefix(body, close);
+            const auto stable = found != std::string_view::npos ? found : body.size() - hold;
+            std::string fragment;
+            if (!raw_started) {
+                fragment    = "{" + Json(key).dump() + ":\"";
+                raw_started = true;
+            }
+            auto encoded =
+                Json(std::string(body.substr(streamed_raw_bytes, stable - streamed_raw_bytes)))
+                    .dump();
+            fragment += encoded.substr(1, encoded.size() - 2);
+            if (!fragment.empty()) {
+                streamed_arguments += fragment;
+                emit(output, ToolCallDeltaKind::Arguments, std::move(fragment));
+            }
+            streamed_raw_bytes = stable;
+            raw_frozen         = found != std::string_view::npos;
+        }
 
         void filter(PublishedOutput& output, const TokenGrammarData& grammar, bool terminal) {
             PublishedOutput visible;
@@ -828,13 +918,32 @@ public:
                         append_delta(visible, OutputChannel::Content, pending.substr(0, open));
                     }
                     pending.erase(0, open);
+                    selected_tool = true;
+                    stream_prefix(visible, grammar);
                     auto close     = pending.find(kToolClose);
                     bool completed = false;
                     while (close != std::string::npos) {
                         const auto end = close + kToolClose.size();
                         if (auto call =
                                 grammar.decode_call(std::string_view(pending).substr(0, end))) {
+                            // stream_prefix publishes only a guaranteed prefix of this native
+                            // decoder result, including literal closing markup and whitespace.
+                            if (!call->arguments_json.starts_with(streamed_arguments))
+                                throw std::logic_error(
+                                    "tool argument stream lost its prefix invariant");
+                            if (active_name.empty()) {
+                                active_name = call->name;
+                                emit(visible, ToolCallDeltaKind::Start);
+                            }
+                            if (call->arguments_json.size() > streamed_arguments.size())
+                                emit(visible, ToolCallDeltaKind::Arguments,
+                                     call->arguments_json.substr(streamed_arguments.size()));
+                            emit(visible, ToolCallDeltaKind::Completed);
                             calls.push_back(std::move(*call));
+                            active_name.clear();
+                            streamed_arguments.clear();
+                            streamed_raw_bytes = 0;
+                            raw_started = raw_frozen = false;
                             pending.erase(0, end);
                             completed = true;
                             break;
@@ -848,6 +957,12 @@ public:
             // envelope. Never convert that partial call into an executable call
             // or leak its markup into a streamed prose answer.
             if (terminal) {
+                selected_tool = selected_tool || pending.starts_with("<tool_call");
+                if (!active_name.empty()) {
+                    emit(visible, ToolCallDeltaKind::Incomplete);
+                    active_name.clear();
+                    streamed_arguments.clear();
+                }
                 const bool separator =
                     !calls.empty() &&
                     std::all_of(pending.begin(), pending.end(),
@@ -941,29 +1056,6 @@ double PreparedPrompt::prepare_seconds() const noexcept {
 }
 
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
-
-PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
-    : values_(std::move(other.values_)), size_(std::exchange(other.size_, 0)) {}
-
-PublishedOutput& PublishedOutput::operator=(PublishedOutput&& other) noexcept {
-    if (this != &other) {
-        values_ = std::move(other.values_);
-        size_   = std::exchange(other.size_, 0);
-    }
-    return *this;
-}
-
-void PublishedOutput::clear() noexcept {
-    for (std::size_t index = 0; index < size_; ++index) { values_[index] = {}; }
-    size_ = 0;
-}
-
-void PublishedOutput::push_back(OutputDelta value) {
-    if (size_ == values_.size()) {
-        throw std::logic_error("output decoder produced more than two channel transitions");
-    }
-    values_[size_++] = std::move(value);
-}
 
 OutputSession::OutputSession() noexcept                           = default;
 OutputSession::~OutputSession()                                   = default;
@@ -1063,6 +1155,8 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
             // The token that closes reasoning is the marker, not reasoning text.
             if (impl_->preview_state.in_reasoning) { channel = OutputChannel::Reasoning; }
         } else if (!was_tool && !in_tool_region(impl_->preview_state, impl_->tool_output_enabled) &&
+                   !(impl_->tool_output_enabled && !impl_->raw &&
+                     bytes.find(kToolOpen) != std::string_view::npos) &&
                    !(was_stripping && impl_->preview_state.strip_content_leading)) {
             channel = OutputChannel::Content;
         }
@@ -1193,6 +1287,19 @@ bool OutputSession::reasoning_cycle_exclusion_allowed(TokenId token) const {
                            std::string(impl_->tokenizer->decode_token_bytes(token));
     return candidate.find(kThinkClose) == std::string::npos &&
            longest_suffix_prefix(candidate, kThinkClose, true) == 0;
+}
+
+ConstraintStats OutputSession::constraint_stats() const noexcept {
+    if (!has_token_grammar()) return {};
+    auto result   = impl_->token_grammar->constraint_stats();
+    result.branch = in_reasoning()               ? ConstraintBranch::Reasoning
+                    : impl_->tools.selected_tool ? ConstraintBranch::ToolCall
+                                                 : ConstraintBranch::Answer;
+    return result;
+}
+
+void OutputSession::record_token_mask_upload(std::size_t bytes) const noexcept {
+    if (has_token_grammar()) impl_->token_grammar->record_upload(bytes);
 }
 
 bool OutputSession::has_token_grammar() const noexcept {

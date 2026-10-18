@@ -352,6 +352,17 @@ int test_official_tokenizer_merge() {
                           "official tokenizer_config.json token did not merge exactly");
     }
 
+    // Frozen independent official-tokenizer results exercise heap adjacency invalidation,
+    // rank ties and the short/long word boundary, including represented NFC text.
+    const auto merge_cases =
+        nlohmann::json::parse(read_file(NINFER_SOURCE_DIR "/tests/fixtures/tokenizer_merge.json"));
+    for (const auto& item : merge_cases.at("cases")) {
+        const auto expected = item.at("expected").get<std::vector<int>>();
+        failures +=
+            check(tokenizer.encode(item.at("text").get<std::string>()) == expected,
+                  ("official BPE rank regression: " + item.at("name").get<std::string>()).c_str());
+    }
+
     FrontendResources conflicting = resources();
     nlohmann::json config         = nlohmann::json::parse(conflicting.tokenizer_config_json);
     config["added_tokens_decoder"]["248045"]["special"] = false;
@@ -2371,6 +2382,50 @@ int test_constrained_output() {
     failures +=
         check(ignored_stop_content == answer, "disabled model EOS leaked into constrained content");
 
+    // Literal choices are raw text, not regex/EBNF; regex matches the whole answer.
+    for (const auto& [constraint, instances] : std::vector<
+             std::pair<ninfer::OutputConstraint, std::vector<std::pair<std::string, bool>>>>{
+             {{ninfer::OutputConstraintKind::Choice,
+               {},
+               {"", "a|b", "你😀", "\"\\", "<tool_call>"}},
+              {{"", true},
+               {"a|b", true},
+               {"a", false},
+               {"b", false},
+               {"你😀", true},
+               {"你", false},
+               {"\"\\", true},
+               {"<tool_call>", true}}},
+             {{ninfer::OutputConstraintKind::Regex, "[A-Z]{2}[0-9]{1,2}"},
+              {{"AB1", true},
+               {"AB12", true},
+               {"AB123", false},
+               {"xAB1", false},
+               {"AB1x", false},
+               {"ab1", false}}},
+             {{ninfer::OutputConstraintKind::Regex, "你(好|们)"},
+              {{"你好", true}, {"你们", true}, {"你", false}, {"你好吗", false}}}}) {
+        auto constrained_input                      = input;
+        constrained_input.options.output_constraint = constraint;
+        const auto constrained_prompt               = frontend.prepare(constrained_input);
+        const auto compiled = FrontendFactory::inspect(constrained_prompt).token_grammar;
+        for (const auto& [text, valid] : instances) {
+            xgrammar::GrammarMatcher matcher(compiled->compiled);
+            failures += check((matcher.AcceptString(text) && matcher.IsCompleted()) == valid,
+                              "literal choice or full-match regex changed its language");
+            if (!valid || text.empty()) continue;
+            auto session = frontend.make_output_session(constrained_prompt, {});
+            auto encoded = tokenizer.encode(text);
+            (void)session.preview(encoded, 100, ninfer::FinishReason::OutputLimit);
+            session.discard_preview();
+            (void)session.preview(encoded, 100, ninfer::FinishReason::OutputLimit);
+            std::string visible_choice;
+            for (const auto& delta : session.commit_preview()) visible_choice += delta.text;
+            failures +=
+                check(visible_choice == text, "discarded choice/regex preview changed publication");
+        }
+    }
+
     ninfer::PromptInput length_input = input;
     length_input.options.output_constraint =
         ninfer::OutputConstraint{ninfer::OutputConstraintKind::JsonSchema,
@@ -2393,7 +2448,8 @@ int test_constrained_output() {
                                                    {"\"a\"b\"", false}}) {
         xgrammar::GrammarMatcher matcher(length_grammar->compiled);
         const bool accepted = matcher.AcceptString(text) && matcher.IsCompleted();
-        failures += check(accepted == valid, "length grammar disagrees with Unicode string oracle");
+        failures += check(accepted == valid,
+                          ("length grammar disagrees with Unicode string oracle: " + text).c_str());
         if (accepted) {
             failures += check(nlohmann::json::accept(text), "length grammar accepted invalid JSON");
         }
@@ -2433,6 +2489,12 @@ int test_constrained_output() {
     const std::array<std::int32_t, 3> parents{-1, 0, 0};
     std::vector<std::uint32_t> masks(3 * fi::TokenGrammarState::mask_words);
     transactional.fill_token_masks(nodes, parents, masks);
+    const auto work_before_preview = transactional.constraint_stats();
+    failures +=
+        check(work_before_preview.active && !work_before_preview.complete &&
+                  !work_before_preview.terminated && work_before_preview.mask_calls == 1 &&
+                  work_before_preview.mask_nodes == 2 && work_before_preview.mask_upload_bytes == 0,
+              "constraint observations did not count real matcher work only");
     const auto root_masks = std::vector<std::uint32_t>(
         masks.begin(), masks.begin() + fi::TokenGrammarState::mask_words);
     (void)transactional.preview(first, 100, ninfer::FinishReason::OutputLimit);
@@ -2440,6 +2502,17 @@ int test_constrained_output() {
     transactional.fill_token_masks(nodes, parents, masks);
     failures += check(std::equal(root_masks.begin(), root_masks.end(), masks.begin()),
                       "discarded constrained prefix advanced the matcher");
+    failures +=
+        check(!transactional.constraint_stats().complete &&
+                  transactional.constraint_stats().branch == ninfer::ConstraintBranch::Answer,
+              "discarded constraint preview changed committed observations");
+    (void)transactional.preview(tokens, 100, ninfer::FinishReason::OutputLimit);
+    failures += check(!transactional.constraint_stats().complete,
+                      "uncommitted completed constraint leaked into observations");
+    (void)transactional.commit_preview();
+    failures += check(transactional.constraint_stats().complete &&
+                          transactional.constraint_stats().terminated,
+                      "committed completed constraint lost completion/termination observations");
     const auto invalid_node = std::span(masks).subspan(2 * fi::TokenGrammarState::mask_words);
     failures += check(std::all_of(invalid_node.begin(), invalid_node.end(),
                                   [](std::uint32_t word) { return word == ~std::uint32_t{0}; }),
@@ -2626,8 +2699,7 @@ int test_constrained_output() {
     }
 
     for (const std::string& invalid :
-         {std::string(R"({"type":"array","uniqueItems":true})"), std::string(R"({"minLength":3})"),
-          std::string(R"({"type":"string","pattern":"^.*$"})"),
+         {std::string(R"({"type":"array","uniqueItems":true})"),
           std::string(R"({"type":"string","minLength":4294967296})"),
           std::string(R"({"$ref":"#missing"})"),
           std::string(R"({"type":"object","minProperties":2})"),
@@ -2662,12 +2734,17 @@ int test_declared_tool_publication() {
     // This component tokenizer must encode the rendered tool declaration, which is literal client
     // text, so every printable ASCII byte needs an ordinary byte-level vocabulary symbol.
     auto& vocab = tokenizer["model"]["vocab"];
-    std::array<ninfer::TokenId, 128> ascii_ids{};
-    for (int c = 32; c < 127; ++c) {
+    std::array<ninfer::TokenId, 256> ascii_ids{};
+    for (int c = 32; c < 256; ++c) {
         const std::string symbol = byte_level_symbol(static_cast<std::uint8_t>(c));
         if (!vocab.contains(symbol)) { vocab[symbol] = 1000 + c; }
         ascii_ids[static_cast<std::size_t>(c)] = vocab[symbol].get<ninfer::TokenId>();
     }
+    const std::string empty_call = "<tool_call>\n<function=f>\n\n</function>\n</tool_call>";
+    const auto two_calls         = std::string(empty_call).append("\n").append(empty_call);
+    std::string two_call_symbol;
+    for (unsigned char c : two_calls) two_call_symbol += byte_level_symbol(c);
+    vocab[two_call_symbol]  = 2000;
     owned.tokenizer_json    = tokenizer.dump();
     const Frontend frontend = FrontendFactory::create_component(owned);
     ninfer::PromptInput input;
@@ -2683,6 +2760,7 @@ int test_declared_tool_publication() {
     int failures = check(output.has_token_grammar(), "declared tools did not attach a grammar");
     const std::vector<ninfer::TokenId> tokens{22, 16, 17, 32, 18, 32, 32, 19, 32, 20};
     std::string visible;
+    std::vector<ninfer::ToolCallDelta> events;
     for (auto token : tokens) {
         (void)output.preview(std::span<const ninfer::TokenId>(&token, 1), 100,
                              ninfer::FinishReason::OutputLimit);
@@ -2690,8 +2768,16 @@ int test_declared_tool_publication() {
         failures += check(output.tool_calls().empty(), "discard published a completed tool");
         (void)output.preview(std::span<const ninfer::TokenId>(&token, 1), 100,
                              ninfer::FinishReason::OutputLimit);
-        for (const auto& delta : output.commit_preview()) { visible += delta.text; }
+        for (const auto& delta : output.commit_preview()) {
+            visible += delta.text;
+            if (delta.tool_call) events.push_back(*delta.tool_call);
+        }
     }
+    failures += check(
+        events.size() == 3 && events[0].kind == ninfer::ToolCallDeltaKind::Start &&
+            events[1].kind == ninfer::ToolCallDeltaKind::Arguments && events[1].arguments == "{}" &&
+            events[2].kind == ninfer::ToolCallDeltaKind::Completed,
+        "committed empty-call lifecycle duplicated a discarded preview or missed completion");
     failures += check(visible == "preface", "tool markup leaked into streamed content");
     failures += check(output.tool_calls().size() == 1 && output.tool_calls()[0].name == "f" &&
                           output.tool_calls()[0].arguments_json == "{}",
@@ -2704,11 +2790,32 @@ int test_declared_tool_publication() {
     failures += check(visible == "preface" && output.tool_calls().size() == 1,
                       "terminal publication repeated a tool or leaked markup");
 
+    auto multiple = frontend.make_output_session(prompt, {});
+    try {
+        (void)multiple.preview(std::array<ninfer::TokenId, 1>{2000}, 100,
+                               ninfer::FinishReason::OutputLimit);
+    } catch (const std::exception& error) {
+        throw std::runtime_error(std::string("two-call token fixture: ") + error.what());
+    }
+    failures += check(multiple.preview_token_channels().size() == 1 &&
+                          !multiple.preview_token_channels()[0],
+                      "whole-envelope token was attributed as content logprob");
+    const auto multiple_events = multiple.commit_preview();
+    failures += check(multiple.tool_calls().size() == 2 && multiple_events.size() == 6 &&
+                          multiple_events[3].tool_call && multiple_events[3].tool_call->index == 1,
+                      "one target token could not publish two ordered tool lifecycles");
+
     auto interrupted = frontend.make_output_session(prompt, {});
-    (void)interrupted.preview(std::array<ninfer::TokenId, 3>{16, 17, 32}, 3,
+    (void)interrupted.preview(std::array<ninfer::TokenId, 5>{16, 17, 32, 18, 32}, 5,
                               ninfer::FinishReason::OutputLimit);
-    failures += check(interrupted.commit_preview().empty() && interrupted.tool_calls().empty(),
-                      "output budget published a partial declared tool");
+    const auto interrupted_events = interrupted.commit_preview();
+    failures +=
+        check(channel_text(interrupted_events, ninfer::OutputChannel::Content).empty() &&
+                  interrupted.tool_calls().empty() && interrupted_events.size() == 2 &&
+                  interrupted_events[0].tool_call && interrupted_events[1].tool_call &&
+                  interrupted_events[0].tool_call->kind == ninfer::ToolCallDeltaKind::Start &&
+                  interrupted_events[1].tool_call->kind == ninfer::ToolCallDeltaKind::Incomplete,
+              "output budget missed incomplete lifecycle or published an executable partial tool");
     for (bool between_rounds : {false, true}) {
         auto partial = frontend.make_output_session(prompt, {});
         std::string partial_visible;
@@ -2778,13 +2885,109 @@ int test_declared_tool_publication() {
         const ninfer::TokenId token = c == '\n' ? 32 : ascii_ids[c];
         (void)embedded_output.preview(std::span<const ninfer::TokenId>(&token, 1), 1000,
                                       ninfer::FinishReason::OutputLimit);
-        failures +=
-            check(embedded_output.commit_preview().empty(), "literal tool close leaked as prose");
+        const auto publication = embedded_output.commit_preview();
+        failures += check(channel_text(publication, ninfer::OutputChannel::Content).empty(),
+                          "literal tool close leaked as prose");
+        for (const auto& delta : publication)
+            if (delta.tool_call && delta.tool_call->kind == ninfer::ToolCallDeltaKind::Arguments)
+                failures += check(!embedded_output.tool_calls().empty(),
+                                  "const string streamed before full schema validation");
     }
     failures += check(embedded_output.tool_calls().size() == 1 &&
                           nlohmann::json::parse(
                               embedded_output.tool_calls()[0].arguments_json)["value"] == literal,
                       "streamed XML-looking string was lost or split into another call");
+    // A plain string's raw-first interpretation guarantees an incremental JSON prefix.
+    // Embedded candidate delimiters freeze that prefix until whole-call backtracking resolves
+    // them; constrained/union values remain buffered. Preview/discard must publish nothing.
+    ninfer::PromptInput streamed_input;
+    streamed_input.messages.push_back(ninfer::ChatMessage{
+        .role = ninfer::ChatRole::User, .parts = {ninfer::MessagePart{.text = "x"}}});
+    streamed_input.options.enable_thinking = false;
+    streamed_input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}}})");
+    auto annotated_input  = streamed_input;
+    auto annotated_tool   = nlohmann::json::parse(annotated_input.options.tool_jsons[0]);
+    auto& annotated_value = annotated_tool["function"]["parameters"]["properties"]["value"];
+    annotated_value["description"]        = "a client-visible string";
+    annotated_value["title"]              = "Value";
+    annotated_value["default"]            = "example";
+    annotated_value["examples"]           = {"example"};
+    annotated_input.options.tool_jsons[0] = annotated_tool.dump();
+    const auto streamed_prompt            = frontend.prepare(std::move(streamed_input));
+    const auto annotated_prompt           = frontend.prepare(std::move(annotated_input));
+    for (const auto* candidate_prompt : {&streamed_prompt, &annotated_prompt})
+        for (const std::string& value :
+             {std::string(" \"quoted\" \\ text\n"),
+              std::string("prefix\n</parameter>not another parameter"), std::string("null"),
+              std::string("\"json-looking\""), std::string("你😀\n"), std::string()}) {
+            auto streamed   = frontend.make_output_session(*candidate_prompt, {});
+            const auto text = "<tool_call>\n<function=f>\n<parameter=value>\n" + value +
+                              "\n</parameter>\n</function>\n</tool_call>";
+            std::string arguments;
+            int starts = 0, completed = 0, fragments = 0;
+            bool early_fragment = false;
+            for (std::size_t offset = 0; offset < text.size(); ++offset) {
+                const unsigned char c       = static_cast<unsigned char>(text[offset]);
+                const ninfer::TokenId token = c == '\n' ? 32 : ascii_ids[c];
+                try {
+                    (void)streamed.preview(std::span<const ninfer::TokenId>(&token, 1), 1000,
+                                           ninfer::FinishReason::OutputLimit);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error("raw string fixture " + nlohmann::json(value).dump() +
+                                             " at byte " + std::to_string(offset) + ": " +
+                                             error.what());
+                }
+                streamed.discard_preview();
+                failures +=
+                    check(streamed.tool_calls().empty(), "discard published raw-string tool");
+                (void)streamed.preview(std::span<const ninfer::TokenId>(&token, 1), 1000,
+                                       ninfer::FinishReason::OutputLimit);
+                for (const auto& delta : streamed.commit_preview()) {
+                    failures += check(delta.text.empty(), "raw tool data leaked to content");
+                    if (!delta.tool_call) continue;
+                    const auto& event = *delta.tool_call;
+                    failures +=
+                        check(event.index == 0 && event.name == "f", "tool event identity changed");
+                    if (event.kind == ninfer::ToolCallDeltaKind::Start) ++starts;
+                    if (event.kind == ninfer::ToolCallDeltaKind::Completed) ++completed;
+                    if (event.kind == ninfer::ToolCallDeltaKind::Arguments) {
+                        ++fragments;
+                        arguments += event.arguments;
+                        early_fragment |= offset + 1 < text.size();
+                    }
+                }
+                // Before final envelope completion, no partial executable call is observable.
+                if (offset + 1 < text.size())
+                    failures += check(streamed.tool_calls().empty(),
+                                      "raw-string partial entered executable history");
+            }
+            failures +=
+                check(starts == 1 && completed == 1 && fragments >= 2 && early_fragment &&
+                          nlohmann::json::parse(arguments) == nlohmann::json{{"value", value}} &&
+                          streamed.tool_calls().size() == 1 &&
+                          streamed.tool_calls()[0].arguments_json == arguments,
+                      "raw-string incremental arguments changed decoder semantics or lifecycle");
+        }
+    auto cancelled_string          = frontend.make_output_session(streamed_prompt, {});
+    const std::string partial_text = "<tool_call>\n<function=f>\n<parameter=value>\npartial";
+    for (unsigned char c : partial_text) {
+        const ninfer::TokenId token = c == '\n' ? 32 : ascii_ids[c];
+        (void)cancelled_string.preview(std::span<const ninfer::TokenId>(&token, 1), 1000,
+                                       ninfer::FinishReason::OutputLimit);
+        (void)cancelled_string.commit_preview();
+    }
+    (void)cancelled_string.preview_terminal(ninfer::FinishReason::Cancelled);
+    const auto cancelled_events = cancelled_string.commit_preview();
+    failures +=
+        check(cancelled_events.size() == 1 && cancelled_events[0].tool_call &&
+                  cancelled_events[0].tool_call->kind == ninfer::ToolCallDeltaKind::Incomplete &&
+                  cancelled_string.tool_calls().empty(),
+              "cancelled raw string lost incomplete lifecycle");
+    failures +=
+        check(cancelled_string.constraint_stats().branch == ninfer::ConstraintBranch::ToolCall &&
+                  !cancelled_string.constraint_stats().complete,
+              "cancelled partial tool lost its committed branch observations");
     failures += check(ninfer::targets::qwen3::unconstrained_tool_call_names(
                           "prefix<tool_call><function=f><parameter=x>true</parameter>"
                           "</function></tool_call>",
