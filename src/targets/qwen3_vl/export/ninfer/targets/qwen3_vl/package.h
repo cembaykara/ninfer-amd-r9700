@@ -29,6 +29,7 @@ struct Package;
 namespace detail {
 
 struct EncoderWeights;  // defined in impl/encoder_forward.h
+    struct VisionWeights;  // defined in impl/vision_forward.h
 
 enum class WeightsProfile : std::uint8_t {
     R9700Bf16,
@@ -55,6 +56,7 @@ class LoadedModel {
 public:
     ~LoadedModel();
     [[nodiscard]] const detail::EncoderWeights& weights() const;
+    [[nodiscard]] const detail::VisionWeights& vision_weights() const;
     LoadedModel(const LoadedModel&)            = delete;
     LoadedModel& operator=(const LoadedModel&) = delete;
     LoadedModel(LoadedModel&&)                 = delete;
@@ -76,6 +78,14 @@ public:
 
     // ids: [1, seq] I32. Writes the final hidden states [1, seq, 4096] to out_hidden.
     void embed(const Tensor& ids, Tensor& out_hidden, hipStream_t stream) const;
+
+    // v2v: ids [1,seq] I32 (with the contiguous <image> block at visual_start), patches FP32
+    // [1152, P] (the preprocessed image patches), position_ids I32 [P,2] (h/w coords),
+    // pos_indices I32 [4,P] + pos_weights FP32 [4,P] (4-corner pos-embed interpolation).
+    // Writes the combined text+vision hidden states [1, seq, 4096] to out_hidden.
+    void embed_v2v(const Tensor& ids, const float* patches, int patches_count,
+                   const int* position_ids, const int* pos_indices, const float* pos_weights,
+                   int visual_start, Tensor& out_hidden, hipStream_t stream) const;
 
 private:
     class Impl;

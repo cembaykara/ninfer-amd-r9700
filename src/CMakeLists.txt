@@ -231,6 +231,8 @@ add_library(ninfer_r9700_qwen3_vl_runtime STATIC
   targets/qwen3_vl/impl/causal_gqa.hip
   targets/qwen3_vl/impl/encoder_forward.hip
   targets/qwen3_vl/impl/vision_forward.hip
+  targets/qwen3_vl/impl/v2v_kernels.hip
+  targets/qwen3_vl/impl/v2v_forward.hip
   targets/qwen3_vl/impl/package.cpp)
 ninfer_r9700_internal_includes(ninfer_r9700_qwen3_vl_runtime)
 set_target_properties(ninfer_r9700_qwen3_vl_runtime PROPERTIES
