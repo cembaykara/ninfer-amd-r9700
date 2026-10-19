@@ -342,6 +342,7 @@ set(ninfer_r9700_qualifiers
   ninfer_r9700_instruction_qual
   ninfer_r9700_kv_qual
   ninfer_r9700_linear_qual
+  ninfer_r9700_vision_bf16_linear_qual
   ninfer_r9700_state_qual
   ninfer_r9700_dflash_state_qual
   ninfer_r9700_dflash2_select_qual

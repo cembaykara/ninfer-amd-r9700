@@ -59,6 +59,36 @@ python3.11 -m tools.convert.qwen3_8_27b_r9700.convert_lq4 \
 
 LQ4 Linears run per-token E4M3 activations: prefill a 256-token x 128-row FP8 WMMA GEMM with the group scale folded into the decoded weight bytes, verification widths a small-T WMMA kernel, one token an FP8 dot4 GEMV. Quality and speed evidence are in `docs/performance.md`.
 
+`r9700-lq4-vision-bf16` is the accurate Vision recipe on the admitted LQ4 Text weights. It preserves every object outside the 111 Vision matrices byte-exact from an explicit `r9700-lq4` artifact, including Text's 21 FP8 protections, MTP, DFlash2 and frontend resources. The 111 Vision matrices contain exact original BF16 source words; the 222 direct Vision controls remain unchanged. Select this artifact explicitly for image/video inference. There is no runtime dtype selector or weight repacking.
+
+```bash
+python3.11 -m tools.convert.qwen3_8_27b_r9700.convert_vision_bf16 \
+  --base /explicit/r9700-lq4.ninfer \
+  --model /path/to/models/qwen3.8-27b-bf16 \
+  --out /explicit/fresh-r9700-lq4-vision-bf16.ninfer
+```
+
+Conversion is CPU-only and create-only. It validates the full 18-shard BF16 source and the base signatures, then verifies the output directory, digests and every preserved payload. The adjacent `.conversion.json` records the selected source/base and copied/re-encoded objects. Tensor payload grows by 640.30 MiB versus Q4 Vision. Vision-disabled materialization plans remain identical: no Vision matrices are placed on the GPU. With Vision enabled, this consumes the additional weight memory but eliminates the Q4 activation workspace; other Vision buffers are unchanged. Automatic KV sizing uses the remaining budget, so Vision-enabled cache capacity decreases with the larger fixed weight allocation.
+
+The seven Vision Linear shapes use cooperatively staged BF16 operands, one WMMA contraction per K16 and FP32 accumulation, with one final BF16 output cast. A measured fixed-shape/width dispatch selects 32x32/K64 or 64x64/K64 tiles. Other BF16 shapes and two-byte-offset dense views retain the ordinary route. The independent FP64 oracle evaluates the complete dot from represented BF16 operands; no staging casts are copied. The public qualifier covers all seven shapes, token/row/K tails, both tile families, graph replay, NaN propagation and legal unaligned views. Device memory, initialization and race checks pass.
+
+R9700/ROCm 10 qualification on 2026-10-18 uses direct native/source comparisons, exact source-weight checks, all local Op oracles, the chart/natural-image/short-video/multi-image/temporal-video fixtures, and HTTP answer checks. Final embeddings must satisfy relative L2 at most 5% and cosine at least 0.999. CPU attention references now evaluate the complete FP64 formula before the schedule's explicit BF16 boundary; local attention checks retain FP64 output. Comparing two BF16 SDPA implementations had incorrectly flagged a low-activity feature despite the native result passing the mathematical oracle. No numerical criterion was relaxed.
+
+All 2,826 boundaries across six media items pass. Final native embedding errors are:
+
+| Fixture | Source mathematical schedule L2 | Direct Hugging Face BF16 L2 |
+|---|---:|---:|
+| chart | 1.76% | 2.34% |
+| natural image | 2.53% | 4.10% |
+| short video | 1.99% | 1.66% |
+| comparison image 1 | 3.46% | 4.07% |
+| comparison image 2 | 1.87% | 3.11% |
+| temporal video, 4400 patches | 1.90% | 3.87% |
+
+Every final cosine exceeds 0.999 for both comparisons. The mathematical schedule uses source weights, explicit BF16 Op boundaries and FP64 attention; the direct Hugging Face result independently checks its library arithmetic. The stable artifact's 1,190 payloads are byte-identical to the evaluated artifact, and final native chart captures agree byte-exact after registering the stable identity.
+
+Full BF16 was selected over the W8 prototype and a 28-BF16/83-W8 mixed recipe. W8 failed source-weight column and natural-image final gates. The mixed recipe reduces additional storage to 350.73 MiB but takes about 67 ms per chart/natural Vision encode versus BF16's 35–36 ms, with greater source drift. Losing prototype registrations, converters and kernel challengers were removed. On balanced ABBA measurements with driver `auto`, chart Vision encode is 31.49 ms for Q4 and 35.50 ms for BF16. Paired HTTP first-token medians are chart 303.64 → 308.63 ms and natural image 297.59 → 301.10 ms (C1, 8192 context/KV, chunk 128, greedy, no speculation/graphs/prefix reuse). Default DFlash, Device Graph and prefix-reuse serving also passes chart, natural-image, temporal and multi-image answer facts. The ABBA Text-only controls agree exactly. These are bounded fixture results, not a broad visual-task accuracy guarantee or a proof of global optimality. Evidence is retained under `profiles/vision-optimal-20261018/`.
+
 `r9700-q4-selective-protected-n16k16-eval` is a separate source-derived evaluation base, not a production selection. It starts from the exact all-Q4 N16K16 artifact and replaces 28 physical objects: W8G32 token embedding/output head; BF16 attention query_key and gate_value at layers 3,7,11,15,19,23, attention output at 3,7, and GDN output at 4; row-scaled FP8 attention output at 11, query_key/gate_value at 27,31,51, and MLP gate_up/down at 62,63. All other objects, including draft-head shortlist/map, MTP and Vision, are copied byte-exact. Its file is 17,678,295,040 bytes; the tensor arena is 17,665,277,440 bytes, excluding runtime workspace and caches. Conversion is CPU-only and create-only:
 
 ```bash

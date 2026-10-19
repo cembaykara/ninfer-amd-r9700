@@ -23,6 +23,7 @@ from tools.convert.qwen3_8_27b_r9700 import (
     fp8_hybrid_inventory,
     q4_inventory,
     q4_w8_mse_inventory,
+    vision_bf16_inventory,
 )
 from tools.convert.qwen3_8_27b_r9700 import (
     inventory as candidate_inventory,
@@ -446,14 +447,22 @@ _SUPPORTED_INVENTORIES = {
 
 
 def _validate_inventory(artifact: Artifact, *, vision_only: bool = False) -> None:
-    if vision_only and artifact.identity == ArtifactIdentity(MODEL_ID, "r9700-lq4"):
-        # LQ4 changes Text and carries DFlash2 objects. Vision and its frontend retain
-        # the exact Q4 signatures; this binding neither exposes nor decodes Text.
+    if vision_only and artifact.identity in (
+        ArtifactIdentity(MODEL_ID, "r9700-lq4"),
+        ArtifactIdentity(MODEL_ID, vision_bf16_inventory.WEIGHTS_ID),
+    ):
+        # LQ4 changes Text and carries DFlash2 objects. Validate only the selected
+        # Vision recipe and frontend; this binding neither exposes nor decodes Text.
         expected_objects = tuple(
             obj
             for obj in q4_inventory.OBJECT_SPECS
             if obj.name.startswith(("vision/", "frontend/"))
         )
+        if artifact.identity.weights_id == vision_bf16_inventory.WEIGHTS_ID:
+            expected_objects = (
+                tuple(obj for obj in expected_objects if obj.name.startswith("frontend/"))
+                + vision_bf16_inventory.VISION_SPECS
+            )
         actual_objects = tuple(
             obj for obj in artifact.objects if obj.name.startswith(("vision/", "frontend/"))
         )

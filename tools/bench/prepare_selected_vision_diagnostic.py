@@ -41,10 +41,13 @@ REFERENCE_AUTHORITIES = tuple(
         "tools/reference/qwen3_8_27b/vision.py",
         "tools/reference/qwen3/common/frontend.py",
         "tools/reference/qwen3/common/multimodal.py",
+        "tools/reference/qwen3/common/vision_ops.py",
         "tools/convert/qwen3_8_27b_r9700/inventory.py",
         "tools/convert/qwen3_8_27b_r9700/q4_inventory.py",
         "tools/convert/qwen3_8_27b_r9700/q4_w8_mse_inventory.py",
         "tools/convert/qwen3_8_27b_r9700/fp8_hybrid_inventory.py",
+        "tools/convert/qwen3_8_27b_r9700/vision_bf16_inventory.py",
+        "tools/convert/qwen3_8_27b_r9700/source_inventory.py",
     )
 )
 AT_FDCWD = -100

@@ -1880,7 +1880,7 @@ std::optional<std::size_t> Variant::calibrated_dflash_graph_allowance_bytes(
         !ops::r9700::kv::kTextP129WmmaTailCandidate;
     const bool qualified_chunk =
         prefill_chunk == 2048U || (prefill_chunk == 1024U && concurrency == 6U);
-    if (!qualified_build || profile != WeightsProfile::R9700Lq4 || features.vision ||
+    if (!qualified_build || !is_lq4_text_profile(profile) || features.vision ||
         !features.dflash() || !features.optimized_proposal() || capacity != maximum_context ||
         concurrency == 0U || concurrency > 8U || !qualified_chunk || draft_window != 7U ||
         !adaptive_draft)
@@ -2941,6 +2941,7 @@ QType Variant::dflash_matrix_qtype(WeightsProfile profile) {
     case WeightsProfile::R9700Q4W8Evaluation:
         return QType::W8G32_F16S;
     case WeightsProfile::R9700Lq4:
+    case WeightsProfile::R9700Lq4VisionBf16:
 #define NINFER_QWEN38_FP8_ENDPOINT(symbol, id, base, embed, head) case WeightsProfile::symbol:
 #include "targets/qwen3_8_27b/impl/load/fp8_endpoint_selection.inc"
 #undef NINFER_QWEN38_FP8_ENDPOINT
@@ -3048,6 +3049,7 @@ std::size_t Variant::linear_workspace_capacity_bytes(WeightsProfile profile, std
         return ops::linear_workspace_capacity_bytes(QType::Q4G64_F16S, tokens,
                                                     TextConfig::intermediate);
     case WeightsProfile::R9700Lq4:
+    case WeightsProfile::R9700Lq4VisionBf16:
 #define NINFER_QWEN38_FP8_ENDPOINT(symbol, id, base, embed, head) case WeightsProfile::symbol:
 #include "targets/qwen3_8_27b/impl/load/fp8_endpoint_selection.inc"
 #undef NINFER_QWEN38_FP8_ENDPOINT
@@ -3059,6 +3061,7 @@ std::size_t Variant::linear_workspace_capacity_bytes(WeightsProfile profile, std
 std::size_t Variant::vision_linear_workspace_capacity_bytes(WeightsProfile profile,
                                                             std::int32_t tokens) {
     validate_profile(profile);
+    if (profile == WeightsProfile::R9700Lq4VisionBf16) return 0U;
     profile = fp8_capped_base_profile(profile);
     switch (profile) {
     case WeightsProfile::R9700Q4Fp8SelectiveCapDFlash2Q4Evaluation:
@@ -3102,6 +3105,7 @@ std::size_t Variant::vision_linear_workspace_capacity_bytes(WeightsProfile profi
         return ops::linear_workspace_capacity_bytes(QType::Q4G64_F16S, tokens,
                                                     VisionConfig::merger_hidden);
     case WeightsProfile::R9700Lq4:
+    case WeightsProfile::R9700Lq4VisionBf16:
 #define NINFER_QWEN38_FP8_ENDPOINT(symbol, id, base, embed, head) case WeightsProfile::symbol:
 #include "targets/qwen3_8_27b/impl/load/fp8_endpoint_selection.inc"
 #undef NINFER_QWEN38_FP8_ENDPOINT

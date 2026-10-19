@@ -57,6 +57,7 @@ NumericFormat matrix_format(WeightsProfile profile, bool source_q4) {
     case WeightsProfile::R9700Q4W8MseDFlash2W8MseEvaluation:
         return source_q4 ? NumericFormat::Q4G64_F16S : NumericFormat::W8G32_F16S;
     case WeightsProfile::R9700Lq4:
+    case WeightsProfile::R9700Lq4VisionBf16:
 #define NINFER_QWEN38_FP8_ENDPOINT(symbol, id, base, embed, head) case WeightsProfile::symbol:
 #include "targets/qwen3_8_27b/impl/load/fp8_endpoint_selection.inc"
 #undef NINFER_QWEN38_FP8_ENDPOINT
@@ -322,6 +323,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // An LQ4 Text profile binds exactly its base recipe except for the Text-layer matrices
     // outside its own FP8 protection set and the output head.
     const WeightsProfile text_profile = weights_profile;
+    const bool vision_bf16            = weights_profile == WeightsProfile::R9700Lq4VisionBf16;
     const bool lq4_text               = is_lq4_text_profile(weights_profile);
     if (lq4_text) weights_profile = fp8_capped_base_profile(weights_profile);
     (void)matrix_format(weights_profile, false);
@@ -410,9 +412,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     const artifact::TensorPlacement vision_placement =
         features.vision ? artifact::TensorPlacement::Device
                         : artifact::TensorPlacement::ValidateOnly;
-    const qwen3::VisionMatrixFormats vision_formats{.source_q4 =
-                                                        matrix_format(weights_profile, true),
-                                                    .other = matrix_format(weights_profile, false)};
+    const qwen3::VisionMatrixFormats vision_formats{
+        .source_q4 = vision_bf16 ? NumericFormat::BF16 : matrix_format(weights_profile, true),
+        .other     = vision_bf16 ? NumericFormat::BF16 : matrix_format(weights_profile, false)};
     out.vision_backbone = qwen3::bind_vision_backbone(binder, vision_formats, vision_placement);
     out.vision_merger_input =
         qwen3::bind_vision_merger_input(binder, vision_formats, vision_placement);

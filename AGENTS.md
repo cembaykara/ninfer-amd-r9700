@@ -84,13 +84,15 @@ NInfer is a from-scratch C++/HIP inference engine for maximum single-GPU inferen
 compiled only for `gfx1201` and tuned on one AMD Radeon AI PRO R9700. The sole supported model is
 Qwen3.8-27B. Its growing Text/MTP cache has exactly three planes: FP8 E4M3FN keys, signed INT4
 values, and FP16 value scales; there is no cache dtype selector, K scale, alternate cache path, or
-retained compatibility backend. The production weights are `qwen3.8-27b/r9700-lq4` (profile
+retained compatibility backend. The production Text weights are `qwen3.8-27b/r9700-lq4` (profile
 `R9700Lq4`): GPTQ-rounded LQ4 Text projections and output head with 21 row-scaled FP8
 protections (2026-09-30), admitted by the BF16-source PPL, NIAH, exact-token, and whole-inference
 gates. The weight-precision bar is no worse than the 5090 NVFP4 build on every BF16-source cell
 (measured with the frozen 5090 scorer); protected attention query/key projections are not demoted
-below FP8. Other `-eval` identities
-remain evaluation and conversion-base artifacts. DFlash2 keeps its model-specified BF16 selector
+below FP8. The selected image/video recipe is `qwen3.8-27b/r9700-lq4-vision-bf16` (profile
+`R9700Lq4VisionBf16`): identical Text/MTP/DFlash2 payloads with exact original BF16 Vision
+matrices. Vision-off binding validates those matrices without placing them on the GPU.
+Other `-eval` identities remain evaluation and conversion-base artifacts. DFlash2 keeps its model-specified BF16 selector
 codebook and private fixed BF16 state.
 
 The workload is one R9700, one resident model instance, and a startup-fixed one to eight active
