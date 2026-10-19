@@ -193,6 +193,13 @@ const targets::VaeInstance& vae_target(const targets::ActiveTarget& active) {
     if (vae == nullptr) { throw std::logic_error("Engine target is not the VAE"); }
     return *vae;
 }
+
+const targets::DitInstance& dit_target(const targets::ActiveTarget& active) {
+    if (active == nullptr) { throw std::logic_error("Engine target is not active"); }
+    const auto* dit = std::get_if<targets::DitInstance>(&*active);
+    if (dit == nullptr) { throw std::logic_error("Engine target is not the DiT"); }
+    return *dit;
+}
 } // namespace
 
 PreparedPrompt Engine::prepare(PromptInput input) const {
@@ -419,6 +426,28 @@ Engine::image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_
     HIP_CHECK(hipFree(d_latent));
     HIP_CHECK(hipFree(d_out));
     return out_host;
+}
+
+std::vector<std::uint8_t>
+Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
+                      int image_w) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    const auto& target = dit_target(impl_->active);
+    void* d_emb = nullptr;
+    HIP_CHECK(hipMalloc(&d_emb, emb_bytes_count));
+    HIP_CHECK(hipMemcpy(d_emb, emb_bytes, emb_bytes_count, hipMemcpyHostToDevice));
+    Tensor emb(d_emb, DType::BF16, {1, M, 4096});
+    const std::size_t latent_bytes = (std::size_t)image_h * image_w * 64 * 2;  // [1,h*w,64] BF16
+    void* d_latent = nullptr;
+    HIP_CHECK(hipMalloc(&d_latent, latent_bytes));
+    Tensor out_latent(d_latent, DType::BF16, {1, image_h * image_w, 64});
+    target.loaded->program->denoise(emb, image_h, image_w, out_latent, impl_->device.stream);
+    impl_->device.synchronize();
+    std::vector<std::uint8_t> latent_host(latent_bytes);
+    HIP_CHECK(hipMemcpy(latent_host.data(), d_latent, latent_bytes, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipFree(d_emb));
+    HIP_CHECK(hipFree(d_latent));
+    return latent_host;
 }
 
 } // namespace ninfer

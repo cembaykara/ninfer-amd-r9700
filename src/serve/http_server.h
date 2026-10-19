@@ -55,6 +55,8 @@ private:
     // VAE component route: latent (base64) -> image (base64). Internal (not OpenAI-shaped);
     // the front door swaps to the VAE target before calling.
     void handle_vae_decode(const httplib::Request& req, httplib::Response& res);
+    // DiT component route: text_emb (base64) + shape -> latent (base64).
+    void handle_dit_denoise(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 

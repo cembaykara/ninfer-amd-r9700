@@ -111,6 +111,10 @@ public:
     // VAE: latent (host bytes, [1,64,H/16,W/16] BF16) -> image (host bytes, [1,4,H,W] BF16).
     [[nodiscard]] std::vector<std::uint8_t>
     image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_count, int H, int W) const;
+    // DiT: text_emb (host bytes, [1,M,4096] BF16) -> latent (host bytes, [1,image_h*image_w,64] BF16).
+    [[nodiscard]] std::vector<std::uint8_t>
+    image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
+                  int image_w) const;
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;

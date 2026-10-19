@@ -160,6 +160,12 @@ public:
     image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_count, int H, int W) const {
         return engine_->image_decode(latent_bytes, latent_bytes_count, H, W);
     }
+    // DiT: text_emb -> latent. The active target must be the DiT.
+    [[nodiscard]] std::vector<std::uint8_t>
+    image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
+                  int image_w) const {
+        return engine_->image_denoise(emb_bytes, emb_bytes_count, M, image_h, image_w);
+    }
 
     void warmup();
 

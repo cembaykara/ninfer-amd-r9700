@@ -469,6 +469,10 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_vae_decode(req, res);
                  });
+    server_.Post("/v1/ninfer/dit/denoise",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_dit_denoise(req, res);
+                 });
     server_.Post("/v1/responses/input_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_input_tokens(req, res);
@@ -589,6 +593,51 @@ void HttpServer::handle_vae_decode(const httplib::Request& req, httplib::Respons
     response["image"]  = b64_encode(image.data(), image.size());
     response["height"] = H;
     response["width"]  = W;
+    res.set_content(response.dump(), "application/json");
+}
+
+void HttpServer::handle_dit_denoise(const httplib::Request& req, httplib::Response& res) {
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(req.body);
+    } catch (const std::exception& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_json";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    }
+    const int M = body.value("M", 0);
+    const int image_h = body.value("image_h", 0);
+    const int image_w = body.value("image_w", 0);
+    if (M <= 0 || image_h <= 0 || image_w <= 0) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_shape";
+        error.message = "M, image_h, image_w must be positive";
+        emit_openai_error(res, error);
+        return;
+    }
+    const std::vector<std::uint8_t> emb_bytes = b64_decode(body.value("text_emb", ""));
+    const std::size_t expected = (std::size_t)M * 4096 * 2;
+    if (emb_bytes.size() != expected) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_text_emb";
+        error.message = "text_emb byte count does not match M";
+        emit_openai_error(res, error);
+        return;
+    }
+    std::vector<std::uint8_t> latent =
+        service_->image_denoise(emb_bytes.data(), emb_bytes.size(), M, image_h, image_w);
+    nlohmann::json response;
+    response["latent"]  = b64_encode(latent.data(), latent.size());
+    response["image_h"] = image_h;
+    response["image_w"] = image_w;
     res.set_content(response.dump(), "application/json");
 }
 
