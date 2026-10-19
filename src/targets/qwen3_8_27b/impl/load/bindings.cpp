@@ -1,3 +1,4 @@
+#include "targets/qwen3_8_27b/impl/config.h"
 #include "targets/qwen3_8_27b/impl/load/bindings.h"
 
 #include "artifact/typed_binding.h"
@@ -316,6 +317,40 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 NumericFormat token_embedding_format(WeightsProfile profile) {
     if (is_lq4_text_profile(profile)) profile = fp8_capped_base_profile(profile);
     return base_token_embedding_format(profile);
+}
+
+std::vector<artifact::TensorContentSelection>
+cache_tensor_selections(const artifact::Reader& reader, qwen3::StartupFeatures features) {
+    std::vector<artifact::TensorContentSelection> selections;
+    for (const auto& object : reader.objects()) {
+        const auto* tensor = std::get_if<artifact::TensorDescriptor>(&object);
+        if (tensor == nullptr) { continue; }
+        const std::string_view name = tensor->name;
+        const auto whole            = [&] { selections.push_back({name, std::nullopt}); };
+        const auto rows             = [&](std::uint64_t first, std::uint64_t count) {
+            selections.push_back({name, artifact::TensorRowRange{first, count}});
+        };
+        if (name.starts_with("text/")) {
+            if (name != "text/output_head" && name != "text/draft_head" &&
+                name != "text/draft_head_token_ids") {
+                whole();
+            }
+        } else if (name.starts_with("vision/") || (features.mtp() && name.starts_with("mtp/"))) {
+            // A directory can retain media entries across Vision on/off reopens. Native MTP
+            // autoregressive hidden states feed later K/V, so its complete block produces state.
+            whole();
+        } else if (features.dflash() && name.starts_with("dflash/")) {
+            if (name == "dflash/feature_projection" || name == "dflash/context_norm" ||
+                name.ends_with("/attention/key_norm")) {
+                whole();
+            } else if (name.ends_with("/attention/query_key_value")) {
+                // Context append projects the same target features independently at each
+                // layer. Query, selector, output, and MLP paths produce proposals only.
+                rows(DFlashConfig::query_size, 2 * DFlashConfig::kv_size);
+            }
+        }
+    }
+    return selections;
 }
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,

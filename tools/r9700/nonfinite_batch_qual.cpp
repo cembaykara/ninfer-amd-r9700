@@ -2,8 +2,8 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
-#include "core/device.h"
 #include "targets/qwen3_8_27b/impl/load/bindings.h"
+#include "core/device.h"
 #include "targets/qwen3_8_27b/impl/variant.h"
 
 #include <ninfer/targets/qwen3/frontend.h>
@@ -268,11 +268,13 @@ void exercise(const std::filesystem::path& artifact) {
     options.speculative.adaptive_draft = true;
     ninfer::artifact::Reader reader(artifact);
     ninfer::artifact::Binder binder(reader);
-    options.model_id               = reader.identity().model_id;
-    options.weights_id             = reader.identity().weights_id;
-    options.artifact_file_identity = reader.file_identity();
-    const auto profile             = Package::resolve_weights(reader.identity());
-    auto load = target::bind_artifact(binder, profile, family::startup_features(options));
+    options.model_id                 = reader.identity().model_id;
+    options.weights_id               = reader.identity().weights_id;
+    options.artifact_tensor_identity = reader.tensor_content_identity(
+        ninfer::targets::qwen3_8_27b::detail::cache_tensor_selections(
+            reader, ninfer::targets::qwen3::startup_features(options)));
+    const auto profile = Package::resolve_weights(reader.identity());
+    auto load          = target::bind_artifact(binder, profile, family::startup_features(options));
     load.bindings.linear_widths = target::Variant::ExecutionState::eager_widths(
         options.prefill_chunk, kLanes,
         family::startup_verify_widths<target::DFlashConfig>(options));

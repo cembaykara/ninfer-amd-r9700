@@ -15,6 +15,7 @@ namespace ninfer {
 struct DeviceContext;
 
 namespace artifact {
+class Reader;
 class Binder;
 class MaterializedArtifact;
 struct ArtifactIdentity;
@@ -133,6 +134,7 @@ public:
     LoadPlan& operator=(const LoadPlan&) = delete;
 
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
+    [[nodiscard]] std::string cache_tensor_identity(const artifact::Reader& reader) const;
 
 private:
     class Impl;

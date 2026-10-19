@@ -2,6 +2,8 @@
 
 `.ninfer` v2 is the sole C++ product artifact. The container owns framing, an exact JSON object directory, aligned payload ranges, and the `(model_id, weights_id)` identity. Target code owns the meaning and complete inventory of those objects.
 
+Cache consumers use `Reader::tensor_content_identity` for SHA-256 over explicitly selected tensor descriptors and encoded payload ranges. Target binding owns those selections; the generic reader owns validation, range normalization and hashing for each registered storage layout. Native tiled row ranges align to N16. Resource bytes and file metadata are excluded; the digest does not identify the entire container. The reader links OpenSSL Crypto, supplied by the host or container toolchain.
+
 ## Framing
 
 The file begins with the eight bytes `NINFER\0\2`, followed by a little-endian unsigned 64-bit directory byte count, then UTF-8 JSON. The payload begins at the next 4096-byte boundary. Every object offset is relative to that payload start. Readers reject v1 magic, malformed or extra JSON members, duplicate names, overlapping ranges, invalid alignment, out-of-file ranges, unknown formats/layouts/encodings, and encoded sizes inconsistent with the descriptor.

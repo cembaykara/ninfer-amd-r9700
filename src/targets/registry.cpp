@@ -103,11 +103,13 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
 
     artifact::Binder binder(reader);
-    EngineOptions planned          = options;
-    planned.model_id               = identity.model_id;
-    planned.weights_id             = identity.weights_id;
-    planned.artifact_file_identity = reader.file_identity();
-    auto load_plan                 = Target::plan_load(binder, planned, weights_profile);
+    EngineOptions planned = options;
+    planned.model_id      = identity.model_id;
+    planned.weights_id    = identity.weights_id;
+    auto load_plan        = Target::plan_load(binder, planned, weights_profile);
+    if (options.kv_disk_capacity_bytes != 0) {
+        planned.artifact_tensor_identity = load_plan.cache_tensor_identity(reader);
+    }
     auto sequence_planner = Target::make_sequence_planner(device, planned, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     const std::size_t preflight_runtime_bytes  = runtime_bytes_after_planned_weights(

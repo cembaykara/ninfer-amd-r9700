@@ -115,7 +115,7 @@ add_library(ninfer_artifact STATIC
   artifact/materializer.cpp
   artifact/typed_binding.cpp)
 ninfer_r9700_internal_includes(ninfer_artifact)
-target_link_libraries(ninfer_artifact PUBLIC ninfer_r9700_core hip::host)
+target_link_libraries(ninfer_artifact PUBLIC ninfer_r9700_core hip::host PRIVATE OpenSSL::Crypto)
 
 # The R9700 target binder is a closed compilable boundary over the registered evaluation
 # inventories. It performs no runtime repacking: every matrix view points directly into artifact

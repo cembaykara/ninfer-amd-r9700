@@ -588,7 +588,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         disk.max_context    = capacity;
         disk.ram            = kv_ram_cache_ ? &*kv_ram_cache_ : nullptr;
         disk.fingerprint    = qwen3::detail::make_disk_fingerprint(
-            plan.model_id, plan.weights_id, plan.artifact_file_identity, speculative_backend,
+            plan.model_id, plan.weights_id, plan.artifact_tensor_identity, speculative_backend,
             text_pool, backend_pool, decoder->text_kv.fingerprint(),
             backend != nullptr ? std::optional(backend->fingerprint()) : std::nullopt,
             &decoder->linear_attention, dflash ? &dflash->local : nullptr);
@@ -3178,8 +3178,8 @@ void ProgramImplCore::shutdown_kv_tiers(LoadProgress progress) {
     }
 }
 
-void ProgramImplCore::request_idle_spill() {
-    if (kv_disk_cache_) { kv_disk_cache_->request_idle_spill(); }
+void ProgramImplCore::set_cache_idle(bool idle) {
+    if (kv_disk_cache_) { kv_disk_cache_->set_cache_idle(idle); }
 }
 
 std::optional<qwen3::detail::KvDiskSnapshot>

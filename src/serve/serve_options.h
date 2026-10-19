@@ -32,7 +32,7 @@ struct ServeOptions {
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::automatic();
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
+    std::uint32_t pending_timeout_ms   = 300000;
     std::uint32_t prefill_chunk        = kDefaultPrefillChunk;
     std::optional<std::uint32_t> mixed_forward; // unset => automatic (Engine resolves)
     std::uint32_t mixed_forward_rounds = 1;

@@ -136,7 +136,7 @@ struct EngineOptions {
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
+    std::uint32_t pending_timeout_ms   = 300000;
     std::uint32_t prefill_chunk        = kDefaultPrefillChunk;
     // Forward width (columns) of each prefill step while other requests are decode-ready; 0 runs
     // the owner's whole prefill before the next decode round. A DFlash text owner's slice shares
@@ -155,7 +155,7 @@ struct EngineOptions {
     // Filled from the loaded artifact at Engine construction for the KV-disk fingerprint.
     std::string model_id;
     std::string weights_id;
-    std::string artifact_file_identity;
+    std::string artifact_tensor_identity;
     // nullopt = default prefill ladder; empty = disable automatic ladder (`off`).
     std::optional<std::vector<std::uint32_t>> context_checkpoint_marks;
     SpeculativeOptions speculative;
@@ -752,8 +752,8 @@ enum class KvDiskDropReason : std::uint8_t {
     IndexLoad,       // a stored entry was rejected while loading the index
     Persist,         // a manifest write or directory fsync failed
     NoteAlloc,       // bookkeeping for a new RAM entry could not allocate
-    SpillNoRoom,     // the filesystem lacks room for the append plus the compaction reserve
-    SpillNoCapacity, // capacity eviction could not free enough logical bytes
+    SpillNoRoom,     // the filesystem lacks room for a cache write and its metadata
+    SpillNoCapacity, // capacity eviction could not free enough pack-file bytes
     SpillFailed,     // a spill failed while preparing, starting, or writing
     ReclaimUnsaved,  // a non-durable RAM entry was evicted without a disk copy
     OptionalAlloc,   // an optional prefetch or idle spill could not allocate
@@ -828,7 +828,8 @@ struct RuntimeStats {
     // Live disk work is independent of scheduler occupancy. Save time is the full elapsed
     // lifetime of completed spills, not time spent blocking requests in an observer interval.
     bool kv_disk_spill_active            = false;
-    bool kv_disk_compaction_active       = false;
+    bool kv_disk_defrag_active           = false;
+    std::size_t kv_disk_storage_bytes    = 0;
     bool kv_disk_restore_active          = false;
     std::size_t kv_disk_pending_jobs     = 0;
     double kv_disk_spill_elapsed_seconds = 0;

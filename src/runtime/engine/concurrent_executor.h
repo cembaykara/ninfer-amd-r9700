@@ -282,6 +282,17 @@ public:
             }
         }
 
+        instance_.program->set_cache_idle(false);
+
+        struct RepollIdle {
+            ConcurrentExecutor& owner;
+
+            ~RepollIdle() {
+                owner.control_dirty_.store(true, std::memory_order_release);
+                owner.queue_cv_.notify_one();
+            }
+        } repoll{*this};
+
         maintenance_lock.unlock();
         std::vector<ScoreResult> results;
         results.reserve(prompts.size());
@@ -387,7 +398,8 @@ private:
         out.kv_disk_used_bytes            = disk.used_bytes;
         out.kv_disk_entry_count           = disk.entry_count;
         out.kv_disk_spill_active          = disk.spill_active;
-        out.kv_disk_compaction_active     = disk.compaction_active;
+        out.kv_disk_defrag_active         = disk.defrag_active;
+        out.kv_disk_storage_bytes         = disk.storage_bytes;
         out.kv_disk_restore_active        = disk.restore_active;
         out.kv_disk_pending_jobs          = disk.pending_jobs;
         out.kv_disk_spill_elapsed_seconds = disk.spill_elapsed_seconds;
@@ -405,7 +417,8 @@ private:
         out.kv_disk_used_bytes            = in.kv_disk_used_bytes;
         out.kv_disk_entry_count           = in.kv_disk_entry_count;
         out.kv_disk_spill_active          = in.kv_disk_spill_active;
-        out.kv_disk_compaction_active     = in.kv_disk_compaction_active;
+        out.kv_disk_defrag_active         = in.kv_disk_defrag_active;
+        out.kv_disk_storage_bytes         = in.kv_disk_storage_bytes;
         out.kv_disk_restore_active        = in.kv_disk_restore_active;
         out.kv_disk_pending_jobs          = in.kv_disk_pending_jobs;
         out.kv_disk_spill_elapsed_seconds = in.kv_disk_spill_elapsed_seconds;
@@ -3066,7 +3079,7 @@ private:
         if (!copy_hold_) {
             try {
                 copies_ready = instance_.program->kv_copies_ready();
-                if (copies_ready) instance_.program->request_idle_spill();
+                if (copies_ready) instance_.program->set_cache_idle(true);
                 // NOLINTNEXTLINE(bugprone-empty-catch): idle work retries next poll
             } catch (...) {}
         }
@@ -3115,7 +3128,10 @@ private:
                         if (!copies_ready)
                             wake = std::min(wake, Clock::now() + std::chrono::milliseconds(20));
                         lock.lock();
-                        const auto ready = [&] { return stopping_ || !pending_.empty(); };
+                        const auto ready = [&] {
+                            return stopping_ || !pending_.empty() ||
+                                   control_dirty_.load(std::memory_order_acquire);
+                        };
                         if (wake == Clock::time_point::max())
                             queue_cv_.wait(lock, ready);
                         else
@@ -3147,6 +3163,7 @@ private:
             }
 
             try {
+                instance_.program->set_cache_idle(false);
                 std::scoped_lock execution_lock(execution_mutex_);
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();

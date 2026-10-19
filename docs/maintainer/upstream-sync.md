@@ -4,7 +4,35 @@ Upstream is the RTX 5090/CUDA `dylanbrodiefafard/ninfer` repository’s `experim
 
 ## Baseline
 
-Reconciled through upstream `edaad03a737aa1a9e8288c47af3f07ada50ae905` (2026-10-17), advanced from `62687bd3` (2026-10-16), `17c504c9` (2026-10-12), `d5c38cda` (2026-10-09), `6e5b576e` (2026-10-06), `f0d3922e` (2026-10-04), `945515ea` (2026-10-04), `48eb0b01` (2026-10-03), `593c2d0c` (2026-10-03), `574a8d91` (2026-10-02), `f7f70d89` (2026-10-02), `9639c32f` (2026-09-30), `34c7119b` (2026-09-28) and `e04fad3728573a0109236929f5d473475a8657f2` (2026-09-21, AMD ports `7187d95d`, `2eab0a50`, `49c896dd`) by the dispositions below. The next sync reviews upstream changes after `edaad03a` against current AMD behavior.
+Reconciled through upstream `7142d4280123d9df507f863c1ae3d16f50e6476e` (2026-10-19), advanced from `edaad03a` (2026-10-17), `62687bd3` (2026-10-16), `17c504c9` (2026-10-12), `d5c38cda` (2026-10-09), `6e5b576e` (2026-10-06), `f0d3922e` (2026-10-04), `945515ea` (2026-10-04), `48eb0b01` (2026-10-03), `593c2d0c` (2026-10-03), `574a8d91` (2026-10-02), `f7f70d89` (2026-10-02), `9639c32f` (2026-09-30), `34c7119b` (2026-09-28) and `e04fad3728573a0109236929f5d473475a8657f2` (2026-09-21, AMD ports `7187d95d`, `2eab0a50`, `49c896dd`) by the dispositions below. The next sync reviews upstream changes after `7142d428` against current AMD behavior.
+
+## `edaad03a..7142d428` (3 upstream commits, reconciled 2026-10-19)
+
+| Source | AMD disposition |
+|---|---|
+| `f899cba810fdd74599559bfc8078c508b11f07d7` | Port target-selected SHA-256 tensor-content cache identity; exclude file metadata, Text output/proposal heads and DFlash proposal-only paths. Include DFlash context K/V row slices and remove cyclic lane capacity from disk identity. Add native row-range hashing for row-scaled FP8, row-split integer, N16 Q4/W8 and tiled LQ4 planes. Preserve qualified native MTP and fingerprint its complete state-producing block; upstream's MTP disablement and NVIDIA attention-profile selectors are excluded. |
+| `35c0d04d6b1baeb1a35a14d0759f13f3e43a74c1` | Port the five-minute pending-request timeout. Automatic KV sizing, DFlash K7/adaptive optimized proposal head and temperature 1.5 are already the native CLI/server defaults. Preserve explicit draft/head/adaptive choices and supported MTP; upstream's NVFP4-specific startup selector, other targets, RTX 5090 measurements and documentation are excluded. |
+| `7142d4280123d9df507f863c1ae3d16f50e6476e` | Port actual pack-file capacity accounting, coalesced-hole reuse, stable pack store with independently checkpointed object maps, Put/Delete/Move replay, paced idle relocation and tail trimming. Preserve AMD fixed-codec payloads, pinned GTT buffers and ordinary-RAM direct-read staging. Integrate Engine idle permission with both generation and synchronous scoring. Expose storage bytes and defrag activity in metrics and request-log schema v25; update its maintained Python readers. |
+
+Disk format is now v8; earlier directories require a fresh location. The stopped deployment's
+incompatible v7 cache was identified for user-authorized cleanup on 2026-10-19. An initial
+cleanup attempt was blocked; the deployment cache directory was subsequently observed empty
+before the requested server launch. Profiling evidence remains. Deployment uses a 12 GiB RAM
+cache setting. After storage recovered, the rebuilt container started healthy and a LiteLLM
+request routed to the AMD deployment on port 8080, returned `OK`, and used no fallback. Native MTP
+execution remains supported. The separate
+Docker RAM-cache setting requested with this work is 12288 MiB (12 GiB).
+
+Qualification uses the R9700/gfx1201 Release build and existing ROCm 10 toolchain. Focused host
+checks cover storage-aware fingerprint mutations and copied artifacts, scheduler idle handoff
+for generation/scoring, request logging, metrics and defaults (seven tests passed). The GPU cache suite checks exact
+raw/Zstd restart bytes, FIFO capacity churn, admission during cancelled relocation, reader extent
+leases and crash snapshots around durable Move publication. Python request-log reader checks
+cover both serving-corpus and NIAH tools (27 tests passed). A real production-artifact C1 greedy
+SSD restart restored 38 prefix tokens and produced the exact 16-token cold continuation. Local evidence is retained under
+`profiles/upstream-sync/20261018/`. The changed-line static analysis covered 150 translation units; all seven findings were repaired
+and the three affected translation units rechecked with zero diagnostics. No kernel or
+inference-throughput change is claimed.
 
 ## Secondary-source review and selective ports (2026-10-18)
 

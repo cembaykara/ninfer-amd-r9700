@@ -30,6 +30,8 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    failures += check(ServeOptions{}.pending_timeout_ms == 300000,
+                      "default pending timeout must be five minutes");
 
     static_assert(ninfer::kMaximumConcurrency == 8);
 

@@ -438,7 +438,7 @@ public:
     [[nodiscard]] bool copy_hold_cancel_settled() const;
     void discard_ram_capture(std::uint64_t ram_id);
     void shutdown_kv_tiers(LoadProgress progress = {});
-    void request_idle_spill();
+    void set_cache_idle(bool idle);
     void install_pending_disk_restore_checkpoints();
     [[nodiscard]] qwen3::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
     qwen3::detail::KvRamCopySeconds harvest_kv_ram_copy_seconds();
