@@ -57,8 +57,6 @@ services:
       - "${NINFER_RAM_CACHE_MIB:-4096}"
       - --kv-disk-capacity
       - "${NINFER_DISK_CACHE_MIB:-32768}"
-      - --kv-disk-location
-      - /cache/prefix
       - --spec
       - dflash
       - --draft-tokens
