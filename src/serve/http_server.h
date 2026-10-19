@@ -52,6 +52,9 @@ private:
     void handle_response_cancel(const httplib::Request& req, httplib::Response& res);
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_score(const httplib::Request& request, httplib::Response& response);
+    // VAE component route: latent (base64) -> image (base64). Internal (not OpenAI-shaped);
+    // the front door swaps to the VAE target before calling.
+    void handle_vae_decode(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 

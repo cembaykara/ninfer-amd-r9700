@@ -154,6 +154,13 @@ public:
     score_candidates(const CandidateScoreRequest& request,
                      std::function<bool()> is_cancelled = {}) const;
 
+    // Image-pipeline component passthrough (VAE: latent -> image). The active target must be the
+    // VAE; the front door swaps to it before calling. Host bytes in/out (BF16).
+    [[nodiscard]] std::vector<std::uint8_t>
+    image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_count, int H, int W) const {
+        return engine_->image_decode(latent_bytes, latent_bytes_count, H, W);
+    }
+
     void warmup();
 
 private:

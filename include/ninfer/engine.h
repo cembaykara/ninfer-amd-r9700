@@ -106,6 +106,12 @@ public:
                                                       std::vector<ScoreOptions> options,
                                                       const CancellationView& cancellation = {});
 
+    // Image-pipeline component entry points. Each requires the active target to be the matching
+    // component (the front door swaps to it before calling).
+    // VAE: latent (host bytes, [1,64,H/16,W/16] BF16) -> image (host bytes, [1,4,H,W] BF16).
+    [[nodiscard]] std::vector<std::uint8_t>
+    image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_count, int H, int W) const;
+
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;

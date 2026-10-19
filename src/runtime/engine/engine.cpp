@@ -186,6 +186,13 @@ const targets::Qwen3_8_27BInstance& text_target(const targets::ActiveTarget& act
     if (qwen == nullptr) { throw std::logic_error("Engine target is not a text model"); }
     return *qwen;
 }
+
+const targets::VaeInstance& vae_target(const targets::ActiveTarget& active) {
+    if (active == nullptr) { throw std::logic_error("Engine target is not active"); }
+    const auto* vae = std::get_if<targets::VaeInstance>(&*active);
+    if (vae == nullptr) { throw std::logic_error("Engine target is not the VAE"); }
+    return *vae;
+}
 } // namespace
 
 PreparedPrompt Engine::prepare(PromptInput input) const {
@@ -391,6 +398,27 @@ RuntimeStats Engine::runtime_stats() const {
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     if (impl_->executor != nullptr) { impl_->executor->reset_memory_peaks(); }
+}
+
+std::vector<std::uint8_t>
+Engine::image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_count, int H, int W) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    const auto& target = vae_target(impl_->active);
+    void* d_latent = nullptr;
+    HIP_CHECK(hipMalloc(&d_latent, latent_bytes_count));
+    HIP_CHECK(hipMemcpy(d_latent, latent_bytes, latent_bytes_count, hipMemcpyHostToDevice));
+    Tensor latent(d_latent, DType::BF16, {1, 64, H / 16, W / 16});
+    const std::size_t out_bytes = (std::size_t)4 * H * W * 2;  // [1,4,H,W] BF16
+    void* d_out = nullptr;
+    HIP_CHECK(hipMalloc(&d_out, out_bytes));
+    Tensor out(d_out, DType::BF16, {1, 4, H, W});
+    target.loaded->program->decode(latent, out, impl_->device.stream);
+    impl_->device.synchronize();
+    std::vector<std::uint8_t> out_host(out_bytes);
+    HIP_CHECK(hipMemcpy(out_host.data(), d_out, out_bytes, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipFree(d_latent));
+    HIP_CHECK(hipFree(d_out));
+    return out_host;
 }
 
 } // namespace ninfer

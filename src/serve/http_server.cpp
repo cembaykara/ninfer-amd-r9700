@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <exception>
@@ -464,6 +465,10 @@ void HttpServer::register_routes() {
     server_.Post("/v1/score", [this](const httplib::Request& req, httplib::Response& res) {
         handle_score(req, res);
     });
+    server_.Post("/v1/ninfer/vae/decode",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_vae_decode(req, res);
+                 });
     server_.Post("/v1/responses/input_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_input_tokens(req, res);
@@ -495,6 +500,96 @@ void HttpServer::register_routes() {
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
+}
+
+// Minimal base64 helpers for the image component routes (latent/image travel as base64 in JSON).
+namespace {
+std::vector<std::uint8_t> b64_decode(std::string_view text) {
+    static const std::array<int, 256> table = [] {
+        std::array<int, 256> t{};
+        for (int& v : t) { v = -1; }
+        const char* chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) { t[(unsigned char)chars[i]] = i; }
+        return t;
+    }();
+    std::vector<std::uint8_t> out;
+    std::uint32_t buf = 0;
+    int bits = 0;
+    for (char c : text) {
+        if (c == '=') { break; }
+        const int v = table[(unsigned char)c];
+        if (v < 0) { continue; }  // skip whitespace
+        buf = (buf << 6) | (std::uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((std::uint8_t)((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+std::string b64_encode(const std::uint8_t* data, std::size_t size) {
+    static const char* chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((size + 2) / 3 * 4);
+    for (std::size_t i = 0; i < size; i += 3) {
+        std::uint32_t octet = (std::uint32_t)data[i] << 16;
+        if (i + 1 < size) { octet |= (std::uint32_t)data[i + 1] << 8; }
+        if (i + 2 < size) { octet |= (std::uint32_t)data[i + 2]; }
+        out.push_back(chars[(octet >> 18) & 0x3F]);
+        out.push_back(chars[(octet >> 12) & 0x3F]);
+        out.push_back(chars[(octet >> 6) & 0x3F]);
+        out.push_back(chars[octet & 0x3F]);
+    }
+    if (size % 3 == 1) { out[out.size() - 2] = '='; out[out.size() - 1] = '='; }
+    else if (size % 3 == 2) { out[out.size() - 1] = '='; }
+    return out;
+}
+}  // namespace
+
+void HttpServer::handle_vae_decode(const httplib::Request& req, httplib::Response& res) {
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(req.body);
+    } catch (const std::exception& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_json";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    }
+    const int H = body.value("height", 0);
+    const int W = body.value("width", 0);
+    if (H <= 0 || W <= 0 || H % 16 != 0 || W % 16 != 0) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_dimensions";
+        error.message = "height and width must be positive multiples of 16";
+        emit_openai_error(res, error);
+        return;
+    }
+    const std::vector<std::uint8_t> latent_bytes = b64_decode(body.value("latent", ""));
+    const std::size_t expected = (std::size_t)64 * (H / 16) * (W / 16) * 2;
+    if (latent_bytes.size() != expected) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_latent";
+        error.message = "latent byte count does not match height/width";
+        emit_openai_error(res, error);
+        return;
+    }
+    std::vector<std::uint8_t> image =
+        service_->image_decode(latent_bytes.data(), latent_bytes.size(), H, W);
+    nlohmann::json response;
+    response["image"]  = b64_encode(image.data(), image.size());
+    response["height"] = H;
+    response["width"]  = W;
+    res.set_content(response.dump(), "application/json");
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
