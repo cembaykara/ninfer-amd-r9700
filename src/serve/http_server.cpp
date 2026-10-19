@@ -473,6 +473,10 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_dit_denoise(req, res);
                  });
+    server_.Post("/v1/ninfer/encoder/encode",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_encoder_encode(req, res);
+                 });
     server_.Post("/v1/responses/input_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_input_tokens(req, res);
@@ -638,6 +642,48 @@ void HttpServer::handle_dit_denoise(const httplib::Request& req, httplib::Respon
     response["latent"]  = b64_encode(latent.data(), latent.size());
     response["image_h"] = image_h;
     response["image_w"] = image_w;
+    res.set_content(response.dump(), "application/json");
+}
+
+void HttpServer::handle_encoder_encode(const httplib::Request& req, httplib::Response& res) {
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(req.body);
+    } catch (const std::exception& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_json";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    }
+    const int seq = body.value("seq", 0);
+    if (seq <= 0) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_seq";
+        error.message = "seq must be positive";
+        emit_openai_error(res, error);
+        return;
+    }
+    const std::vector<std::uint8_t> ids_bytes = b64_decode(body.value("ids", ""));
+    const std::size_t expected = (std::size_t)seq * 4;  // [1,seq] I32
+    if (ids_bytes.size() != expected) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_ids";
+        error.message = "ids byte count does not match seq";
+        emit_openai_error(res, error);
+        return;
+    }
+    std::vector<std::uint8_t> hidden =
+        service_->image_encode(ids_bytes.data(), ids_bytes.size(), seq);
+    nlohmann::json response;
+    response["hidden"] = b64_encode(hidden.data(), hidden.size());
+    response["seq"]    = seq;
     res.set_content(response.dump(), "application/json");
 }
 

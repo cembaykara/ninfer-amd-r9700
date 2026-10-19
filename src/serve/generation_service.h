@@ -166,6 +166,11 @@ public:
                   int image_w) const {
         return engine_->image_denoise(emb_bytes, emb_bytes_count, M, image_h, image_w);
     }
+    // Encoder (T2I): ids -> hidden. The active target must be the encoder.
+    [[nodiscard]] std::vector<std::uint8_t>
+    image_encode(const std::uint8_t* ids_bytes, std::size_t ids_bytes_count, int seq) const {
+        return engine_->image_encode(ids_bytes, ids_bytes_count, seq);
+    }
 
     void warmup();
 
