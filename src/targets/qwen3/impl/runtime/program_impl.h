@@ -4173,6 +4173,15 @@ void ProgramImplCore::mark_workspace_usage(std::size_t phase_bytes) noexcept {
     workspace_logical_peak_bytes = std::max(workspace_logical_peak_bytes, phase_bytes);
 }
 
+void ProgramImplCore::order_persistent_decode_after_transfers(
+    std::size_t batch_size, const DecodeGraphExecutable* executable) {
+    if (batch_size != 1U || executable == nullptr) { return; }
+    // A resident grid must not compete with previously submitted transfer kernels. The worker
+    // alone pumps GPU cache work: these fixed prior-work edges cannot include a future round.
+    if (kv_disk_cache_) { kv_disk_cache_->join_submitted_restore(device.copy_stream); }
+    device.order_compute_after_transfers();
+}
+
 void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                                     std::span<const std::uint32_t> starts,
                                                     std::span<const std::uint32_t> counts) {
@@ -4774,6 +4783,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         roctx::ScopedRange ordinary_round_range(roctx::Name::DecodeOrdinaryRound,
                                                 roctx::Category::Decode, maximum_frontier);
         if (executable != nullptr) { text_transactions.mark_graph_replay(device.stream); }
+        order_persistent_decode_after_transfers(lanes.size(), executable);
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         executable);
         text_transactions.enqueue_resolution();
@@ -5017,6 +5027,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             text_transactions.mark_graph_replay(device.stream);
             mtp_transactions.mark_graph_replay(device.stream);
         }
+        order_persistent_decode_after_transfers(lanes.size(), executable);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()), batch_k,
                                    executable);
         text_transactions.enqueue_resolution();
@@ -5439,6 +5450,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::decode_dflash_batch(
             *prefill_step = advance_prefill(sequences[*prefill_lane], requests[*prefill_lane], true,
                                             &runner, forward_tokens - verify_columns);
         } else {
+            order_persistent_decode_after_transfers(lanes.size(), executable);
             schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                           batch_k, live_w, envelopes, executable);
         }

@@ -320,6 +320,14 @@ set_target_properties(ninfer_r9700_engine_cache_cancel_qual PROPERTIES
   HIP_ARCHITECTURES gfx1201 LINKER_LANGUAGE HIP)
 target_link_libraries(ninfer_r9700_engine_cache_cancel_qual PRIVATE ninfer_engine)
 
+# Manual regression for concurrent long tool prompts, checkpoint copies, reuse and decode batches.
+add_executable(ninfer_r9700_concurrent_long_prompt_qual
+  ${PROJECT_SOURCE_DIR}/tools/r9700/concurrent_long_prompt_qual.cpp)
+ninfer_r9700_internal_includes(ninfer_r9700_concurrent_long_prompt_qual)
+set_target_properties(ninfer_r9700_concurrent_long_prompt_qual PROPERTIES
+  HIP_ARCHITECTURES gfx1201 LINKER_LANGUAGE HIP)
+target_link_libraries(ninfer_r9700_concurrent_long_prompt_qual PRIVATE ninfer_engine)
+
 # Manual Program-level generation-recovery qualification on resident, retained, and RAM-restored
 # KV; requires an explicit artifact and a speculative backend argument.
 add_executable(ninfer_r9700_recovery_kv_qual

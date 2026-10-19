@@ -587,3 +587,18 @@ flock --exclusive "$NINFER_GPU_LOCK" \
 ```
 
 Use `--nodes 1`, `1000`, and `4096` to check launch scaling. Each node has a 512-byte by-value payload and one output pointer. The independent integer oracle checks capture, warmup, and every timed repetition; alternating immutable graphs use distinct arguments. Initialization and capture checks are ordered on the compute stream. JSON reports submission-thread CPU, enqueue wall time, synchronized wall time, process CPU, and signed residency deltas separately. Submission CPU excludes synchronization; synchronized wall time is not GPU-only timing. Do not use `ROC_SKIP_KERNEL_ARG_COPY=1` for bulk replay: the large-graph check failed on the qualified runtime. Model phase parity and whole-inference timings remain separate admission gates.
+
+## Concurrent long-prompt regression
+
+Build `ninfer_r9700_concurrent_long_prompt_qual`, then run
+`build-r9700/src/ninfer_r9700_concurrent_long_prompt_qual ARTIFACT NEW_CACHE_DIRECTORY`
+under the shared GPU lock after sourcing `.ninfer-local.env`. The cache directory must not
+exist. This uses the production C6 adaptive-K7 DFlash configuration, 12 GiB RAM and 25 GiB SSD
+prefix tiers, four approximately 93K–178K tool prompts, and three turns per client. Warm
+followups synchronize after tokenization to exercise concurrent decode and the return to B1.
+It requires valid tool calls, prefix reuse, concurrent decode, and completion of every request.
+Add `--history` for thinking, automatic tool choice, streaming publication, and long historical
+tool results with checkpoint boundaries. Run `ninfer_r9700_persistent_decode_qual` in both runtime graph submission modes when
+changing persistent dispatch, and run both long-prompt cases in the production Compose graph
+environment.
+The cache directory contains disposable experiment data; keep the logs separately.

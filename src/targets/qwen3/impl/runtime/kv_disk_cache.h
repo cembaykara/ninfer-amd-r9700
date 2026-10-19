@@ -350,6 +350,8 @@ public:
     // reads or on the immediate-state H2D stream.
     [[nodiscard]] bool restore_setup_ready(std::uint64_t entry_id) const;
     void pump_restore(hipStream_t stream);
+    // Joins only already-submitted scatter copies; never waits for future SSD reads.
+    void join_submitted_restore(hipStream_t stream);
     void cancel_restore();
     // The non-blocking half of cancel_restore: stops issuing restore work. Reads, state decode
     // and H2D already in flight keep running until restore_cancel_settled().

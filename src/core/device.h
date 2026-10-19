@@ -17,12 +17,14 @@ void hip_check(hipError_t error, const char* expr, const char* file, int line);
 // Owns ordered compute, load and copy streams plus blocking host events.
 // Only wave32 gfx1201 devices are accepted.
 struct DeviceContext {
-    int device                  = 0;
-    hipStream_t stream          = nullptr;
-    hipStream_t load_stream     = nullptr;
-    hipStream_t copy_stream     = nullptr;
-    hipEvent_t copy_order_event = nullptr;
-    hipEvent_t host_wait        = nullptr;
+    int device                          = 0;
+    hipStream_t stream                  = nullptr;
+    hipStream_t load_stream             = nullptr;
+    hipStream_t copy_stream             = nullptr;
+    hipEvent_t copy_order_event         = nullptr;
+    hipEvent_t compute_copy_order_event = nullptr;
+    hipEvent_t compute_load_order_event = nullptr;
+    hipEvent_t host_wait                = nullptr;
     hipDeviceProp_t props{};
 
     explicit DeviceContext(int device_id = 0);
@@ -42,6 +44,8 @@ struct DeviceContext {
     void synchronize() const;
     void synchronize_all() const;
     void order_copy_after_compute() const;
+    // Enqueue compute dependencies on the fixed prior load/copy frontiers, without a host wait.
+    void order_compute_after_transfers() const;
 };
 
 class DeviceEventTimer {

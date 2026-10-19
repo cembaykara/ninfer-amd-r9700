@@ -1930,7 +1930,7 @@ void KVDiskCache::load_pack_map() {
     std::array<
         std::unordered_map<std::uint32_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>>, 5>
         ranges;
-    auto install = [this, &ranges](const PackedMapEntry& entry) {
+    auto install = [this](const PackedMapEntry& entry) {
         if (entry.id == 0 || kind_index(entry.kind) >= 5 || entry.extent_bytes == 0 ||
             entry.extent_bytes % kDiskPageIoAlignment != 0 || entry.stored_bytes == 0 ||
             entry.stored_bytes > entry.extent_bytes || entry.logical_bytes == 0 ||
@@ -7490,6 +7490,15 @@ bool KVDiskCache::restore_window_busy_locked(std::uint64_t entry_id) const {
         if (slot.assigned && !slot.filled && !keep) { return true; }
     }
     return false;
+}
+
+void KVDiskCache::join_submitted_restore(hipStream_t stream) {
+    std::lock_guard lock(mutex_);
+    for (const WindowSlot& slot : window_) {
+        if (slot.assigned && slot.h2d_done && slot.h2d_event != nullptr) {
+            HIP_CHECK(hipStreamWaitEvent(stream, slot.h2d_event, 0));
+        }
+    }
 }
 
 bool KVDiskCache::restore_setup_ready(std::uint64_t entry_id) const {

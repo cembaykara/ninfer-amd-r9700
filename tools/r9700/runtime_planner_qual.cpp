@@ -294,7 +294,7 @@ void qualify_host_ordinary_graph_allowance() {
             const auto plan =
                 runtime::build_sequence_candidate_for_qualification(inputs, physical_pages);
             const std::size_t expected =
-                (24ULL + 4ULL * definitions * concurrency) * 1024ULL * 1024ULL +
+                (24ULL + 20ULL + 4ULL * definitions * concurrency) * 1024ULL * 1024ULL +
                 definitions * kLoweredDefinitionBytes; // B=1 definitions
             require(plan->graph_definition_count == definitions * concurrency &&
                         plan->graph_executable_count == definitions * concurrency &&
@@ -426,7 +426,7 @@ void qualify_host_dflash_graph_allowance() {
                             plan->graph_executable_count == definitions,
                         "DFlash immutable executable inventory omits a reachable profile");
                 require(plan->graph_allowance_bytes ==
-                            (48ULL + 4ULL * definitions) * 1024ULL * 1024ULL +
+                            (48ULL + 20ULL + 4ULL * definitions) * 1024ULL * 1024ULL +
                                 lowered * kLoweredDefinitionBytes,
                         "DFlash reservation omits immutable executable residency");
                 inputs.use_device_graph = false;
@@ -495,7 +495,8 @@ void qualify_host_dflash_graph_allowance() {
                         plan->graph_executable_count == std::size_t{65U} * c,
                     "production immutable executable inventory changed; remeasure residency");
             if (measured_build)
-                require(plan->graph_allowance_bytes == measured_graph_mib[c - 1U] * (1ULL << 20U),
+                require(plan->graph_allowance_bytes ==
+                            (measured_graph_mib[c - 1U] + 20U) * (1ULL << 20U),
                         "production C-specific graph reservation differs from measurement");
             const auto logical = plan->persistent.bytes + plan->workspace.capacity +
                                  plan->request_transient_capacity_bytes +
@@ -638,7 +639,7 @@ void qualify_host_mtp_graph_allowance() {
         require(plan->graph_definition_count == c.definitions &&
                     plan->graph_executable_count == c.definitions,
                 "MTP fixed/adaptive graph inventory differs from its captured K/B profiles");
-        const auto expected = (46ULL + 4ULL * c.definitions) * 1024ULL * 1024ULL +
+        const auto expected = (46ULL + 20ULL + 4ULL * c.definitions) * 1024ULL * 1024ULL +
                               c.definitions / c.concurrency * kLoweredDefinitionBytes;
         require(plan->graph_allowance_bytes == expected,
                 "MTP allowance omitted immutable executable residency");
@@ -777,7 +778,7 @@ std::size_t qualify_plan(ninfer::DeviceContext& device, std::uint32_t concurrenc
                     plan.impl_->graph_executable_count == definitions,
                 "immutable graph inventory omitted a reachable exact-B profile");
         require(plan.impl_->graph_allowance_bytes ==
-                    (family_mib + 4U * definitions) * 1024U * 1024U +
+                    (family_mib + 20U + 4U * definitions) * 1024U * 1024U +
                         lowered * kLoweredDefinitionBytes,
                 "immutable graph allowance differs from its complete profile inventory");
     }

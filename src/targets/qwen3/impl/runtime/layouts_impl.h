@@ -967,6 +967,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 impl->prefill_chunk, impl->draft_window, impl->adaptive_draft)) {
             impl->graph_allowance_bytes = std::min(impl->graph_allowance_bytes, *calibrated);
         }
+        if (lowered_definitions != 0U) {
+            // Cooperative graph dispatch adds shared runtime residency, not a new argument pool
+            // per definition. C6 bulk preparation measured 80 MiB against the previous
+            // 62-MiB inventory (2026-10-19); reserve 20 MiB for the additional graph residency.
+            impl->graph_allowance_bytes = checked_add(impl->graph_allowance_bytes, 20U * kMiB,
+                                                      "cooperative decode dispatch residency");
+        }
     }
     impl->device_reservation_bytes = checked_add(
         checked_add(

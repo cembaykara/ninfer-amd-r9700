@@ -130,6 +130,9 @@ void verify_crc() {
     }
 }
 
+std::uint64_t restore_with_submitted_join_check(cache::KVDiskCache& disk, std::uint64_t entry_id,
+                                                const cache::DiskRestoreTarget& target);
+
 void run_roundtrip(ninfer::DeviceContext& device, ninfer::KvDiskCompress compression) {
     TemporaryDirectory directory;
     Pool source_pool(8);
@@ -238,7 +241,7 @@ void run_roundtrip(ninfer::DeviceContext& device, ninfer::KvDiskCompress compres
     target.reuse          = match.value().reuse;
     target.reuse_base     = match.value().reuse_base;
     target.stream         = device.copy_stream;
-    const auto ticket     = reopened.restore_device(match.value().entry_id, target);
+    const auto ticket = restore_with_submitted_join_check(reopened, match.value().entry_id, target);
     reopened.wait_copies(ticket);
     require(!reopened.restore_failed(), "disk restore failed");
     device.synchronize_all();
@@ -280,6 +283,87 @@ bool wait_pred(Predicate predicate, std::chrono::milliseconds limit) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return predicate();
+}
+
+// The compute-round join covers submitted private scatter work, but must not wait for SSD
+// reads that have not produced GPU work yet. An independent stream avoids the full-restore
+// join already present on target.stream masking a missing submitted-work dependency.
+std::uint64_t restore_with_submitted_join_check(cache::KVDiskCache& disk, std::uint64_t entry_id,
+                                                const cache::DiskRestoreTarget& target) {
+    struct Probe {
+        cache::KVDiskCache& disk;
+        hipStream_t stream = nullptr;
+        hipEvent_t done    = nullptr;
+
+        explicit Probe(cache::KVDiskCache& owner) : disk(owner) {
+            HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+            try {
+                HIP_CHECK(hipEventCreateWithFlags(&done, hipEventDisableTiming));
+            } catch (...) {
+                (void)hipStreamDestroy(stream);
+                throw;
+            }
+        }
+
+        void release_gates() {
+            disk.test_release_page_read_barrier();
+            disk.test_release_scatter_record_barrier();
+        }
+
+        ~Probe() {
+            release_gates();
+            (void)hipStreamSynchronize(stream);
+            (void)hipEventDestroy(done);
+            (void)hipStreamDestroy(stream);
+        }
+
+        bool ready() const {
+            const hipError_t status = hipEventQuery(done);
+            if (status == hipErrorNotReady) { return false; }
+            HIP_CHECK(status);
+            return true;
+        }
+    } probe(disk);
+
+    std::uint64_t ticket = 0;
+    try {
+        disk.test_arm_page_read_barrier();
+        ticket = disk.restore_device(entry_id, target);
+        require(wait_pred([&] { return disk.test_page_read_entered(); }, std::chrono::seconds(2)),
+                "submitted join fixture did not enter its held SSD read");
+        disk.join_submitted_restore(probe.stream);
+        HIP_CHECK(hipEventRecord(probe.done, probe.stream));
+        require(wait_pred([&] { return probe.ready(); }, std::chrono::seconds(2)),
+                "submitted restore join waited for a future SSD read");
+
+        disk.test_arm_scatter_record_barrier(0);
+        disk.test_release_page_read_barrier();
+        require(wait_pred(
+                    [&] {
+                        disk.pump_restore(target.stream);
+                        return disk.test_scatter_record_entered();
+                    },
+                    std::chrono::seconds(2)),
+                "submitted join fixture did not enqueue its held scatter completion");
+        HIP_CHECK(hipEventRecord(probe.done, probe.stream));
+        require(wait_pred([&] { return probe.ready(); }, std::chrono::seconds(2)),
+                "independent stream could not progress beside the held scatter");
+        disk.join_submitted_restore(probe.stream);
+        HIP_CHECK(hipEventRecord(probe.done, probe.stream));
+        require(!wait_pred([&] { return probe.ready(); }, std::chrono::milliseconds(100)),
+                "submitted restore join omitted the pending private scatter");
+        disk.test_release_scatter_record_barrier();
+        require(wait_pred([&] { return probe.ready(); }, std::chrono::seconds(2)),
+                "submitted restore join did not complete after scatter release");
+        return ticket;
+    } catch (...) {
+        probe.release_gates();
+        if (ticket != 0) {
+            disk.cancel_restore();
+            disk.release_restore_ticket(ticket);
+        }
+        throw;
+    }
 }
 
 // Blocks a stream behind a host callback until released, so copies enqueued after it stay pending.
