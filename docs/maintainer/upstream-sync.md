@@ -83,6 +83,48 @@ attribution question required a profiler capture to select it. Raw commands, wor
 results, and limitations remain local
 under `profiles/upstream-review/`.
 
+### Remaining performance candidates (2026-10-18)
+
+All R3/P5/P6/P7/P8 candidates were screened against R9700Lq4 and the viable routes
+were implemented. P1–P4 retain their previously qualified dispositions, including rejection
+of the slower P3 sampler. No weights, cache formats, clocks, power settings, or supported
+features were changed.
+
+| Area | Final selection and evidence |
+|---|---|
+| R3 startup graph allowance | Admit the measured C6/chunk1024/full-context/DFlash adaptive-K7 profile under the existing four-setting bulk-argument environment. Observed/reserved graph memory is 62/62 MiB instead of 62/1,998 MiB; auto-KV rises from 537,408 to 613,696 tokens (+14.2%). The near-capacity runtime retained a 261,824-token prefix plus five 69,632-token prefixes, then generated 256 tokens on every lane, including 211 actual K7 lane-rounds. Mixed execution, six ready decode lanes, 34 minimum free KV pages, and at least 80.24 MiB physical free VRAM passed. The 64 MiB headroom and observed-allocation guard remain. Canonical chunk2048 already reserves 72 MiB at C1 and 62 MiB at C6/C8; this adds no demonstrated default-profile capacity or throughput gain. |
+| P5 Vision RoPE | Select aligned four-BF16 vectors only for paired Vision D72/H16 at T>=256; smaller, single-tensor and misaligned routes remain. Independent represented-input FP64 tests cover real interleaved QKV, 255/256/257 boundaries, T1536/8256, untouched V and graph replay. Physical captured public-Op ABBA confirms about 2x at T1536. ISA has 64-bit vector movement, 35 VGPR, 288 bytes LDS, zero scratch and reported occupancy 16. |
+| P5 feature scatter | Select aligned eight-BF16 vectors for D5120/T>=128; smaller/misaligned/other-width inputs keep the scalar route. Independent whole-image exact-bit tests include NaN encodings, untouched columns, tails, alignment and graph replay. At 384 rows, captured public-Op latency falls about 29–33%. ISA has 128-bit movement, 11 VGPR and zero LDS/scratch. |
+| P5 LayerNorm | Reject the general anchored CTA: FP64 and extreme-value checks passed, but it was about 89% slower at 1536 rows and also lost at 2048. A bounded tiny-image challenger saved only about 0.4 ms per full HTTP request and changed one fixture's greedy token. No LayerNorm change is promoted. |
+| P6 host KV transfers | Long contiguous HeadMajor runs use one pitched transfer per head; short/fragmented ordering and exact plane-major RAM images remain. Nine independent 16-layer exact-image cases cover crossover, partial restore, offset and untouched storage; a five-page failed-restore case covers the async fence. Final plain/memcheck/initcheck pass. At 860 pages, public D2H improves 255.4 to 223.8 ms (1.14x) and H2D 296.4 to 227.5 ms (1.30x). Opt-in RAM tiers benefit; resident D2D already coalesces. |
+| P7 materialization | Ordinary RAM remains the sole direct-I/O destination. Host ranges copy straight into mapped storage; host-only chunks skip pinned staging, whose allocation is planned across every ring-slot occupant. Existing event/read-reuse fences remain. A >576 MiB exact-byte fixture crosses the eight-slot ring in both placement directions; plain/memcheck/initcheck and all 675,430,400 production embedding bytes pass. Greedy IDs are unchanged with Device Graph enabled. This removes 640 MiB of redundant copies; production peak staging remains 1 GiB. Two ABBA startup groups are noisy, so no stable startup percentage or inference-speed gain is claimed. |
+| P8 short Vision attention | Four waves/64 queries serve multiple uniform segments of length 4..64. Singleton, longer and nonuniform routes retain eight waves/128 queries, including unchanged descriptor/workspace ownership. All 47 independent FP64 cases and 38 focused device-check cases pass; racecheck sees 7,392 workgroups and 0 hazards. Matched public-Op graph ABBAABBA with sharp interleaved inputs gives18–23% lower latency at 16 segments. Complete output bits match the previous route in 22 performance cells. Four-wave ISA uses 126 VGPR, 12,032 bytes LDS, zero scratch and reported occupancy 10. |
+| P8 remaining NVIDIA tuning | All 63 source entries have explicit dispositions. Existing AMD partitioning, fused projections, and Q4 WMMA/LDS staging cover transferable mechanisms. The faster BF16 GEMM fallback experiment is rejected as off-production because Vision matrices are Q4G64. CUDA instructions, formats and 2560-wide target constants do not justify another backend or arbitrary kernel campaign. |
+
+Combined qualification includes the warnings-as-errors build, 62 host tests, 62 ASan/UBSan
+host tests, focused clang-tidy, independent reviews, and owning numerical/exact and device
+checks. Whole HTTP ABBA uses cache-free greedy one-token requests with five warmups and
+30 measured requests per process, fixed 2048 context/KV, prefill 128, Vision enabled and
+Device Graph disabled. Final chart TTFT medians were 301.35 to 298.97 ms; short-segment video
+was 181.87 to 179.96 ms (16 segments of 16 patches). Outputs matched in every process. These small request gains do not
+imply a default text-throughput improvement.
+
+The existing whole-Vision diagnostic needed two repairs to run on production: exact
+Vision/frontend admission for the LQ4 identity and n16k16 weight residency/dequantization.
+Its tiny artifact regression checks signed code times stored scale exactly. The production
+schedule passes all 471 artifact-reference comparisons. The diagnostic's older local Linear
+and BF16-source criteria are not all green: the same 109 local Linear failures, five weight
+criteria failures and three artifact/BF16-source failures occur on the baseline. There are
+no new failure records; the baseline's three production/artifact failures disappear.
+Thresholds were unchanged. The owning
+changed Ops use independent represented-input oracles directly.
+
+All GPU work holds the shared card lock, startup tests wait for asynchronous VRAM
+reclamation, and timings are unprofiled. Screening and per-source dispositions remain in
+`profiles/deferred-perf-20261018/`; implementation evidence, final reports and qualification
+are in `profiles/production-perf-20261018/`. Losing challengers remain only in ignored
+experiment files; there are no production forcing switches or alternate cache/weight paths.
+
 ## Ported features (`c450798c..e04fad37`)
 
 - Sampling/API: full-domain p-less and epsilon sampling with the 1/1024 probability floor, suppression, masks and root-only cycle exclusion, configured argmax eligibility, DFlash p-less one-hot proposal, per-row position offsets; ordinary and speculative. HIP uses wave32/hipCUB with device-scope release/acquire completion counters and caller-owned workspace.

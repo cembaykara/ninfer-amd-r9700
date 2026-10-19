@@ -29,6 +29,7 @@
 #include <cstring>
 #include <cstdio>
 #include <initializer_list>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -439,17 +440,15 @@ void qualify_host_dflash_graph_allowance() {
     // These constants come from independent physical measurements, not a model
     // of executable counts. Keep the production capacity regression explicit.
     constexpr std::array<std::size_t, 8> graph_mib{318, 578, 842, 1102, 1364, 1624, 1884, 2144};
-    constexpr std::array<std::size_t, 8> host_argument_graph_mib{56, 56, 60, 60, 62, 62, 62, 62};
+    constexpr std::array<std::size_t, 8> host_argument_graph_mib{72, 56, 60, 60, 62, 62, 62, 62};
     const auto setting = [](const char* name, const char* expected) {
         const char* value = std::getenv(name);
         return value != nullptr && std::strcmp(value, expected) == 0;
     };
-    const auto& measured_graph_mib = setting("DEBUG_HIP_GRAPH_CLASSIC_PATH", "0") &&
-                                             setting("ROC_ENABLE_LARGE_BAR", "0") &&
-                                             setting("ROC_SKIP_KERNEL_ARG_COPY", "0") &&
-                                             setting("HSA_DISABLE_FRAGMENT_ALLOCATOR", "1")
-                                         ? host_argument_graph_mib
-                                         : graph_mib;
+    const bool bulk_arguments =
+        setting("DEBUG_HIP_GRAPH_CLASSIC_PATH", "0") && setting("ROC_ENABLE_LARGE_BAR", "0") &&
+        setting("ROC_SKIP_KERNEL_ARG_COPY", "0") && setting("HSA_DISABLE_FRAGMENT_ALLOCATOR", "1");
+    const auto& measured_graph_mib = bulk_arguments ? host_argument_graph_mib : graph_mib;
     constexpr std::array<std::size_t, 8> main_driver_mib{6, 6, 4, 4, 2, 4, 4, 6};
 #if defined(NINFER_R9700_XATTENTION_QUALIFICATION)
     constexpr bool production_attention = false;
@@ -510,12 +509,99 @@ void qualify_host_dflash_graph_allowance() {
             require(plan->device_reservation_bytes == logical + internal_mib * (1ULL << 20U),
                     "NInfer-owned driver or SSD storage escaped the internal capacity budget");
         }
-        for (const std::uint32_t chunk : {1024U, 4096U})
-            require(!Variant::calibrated_dflash_graph_allowance_bytes(
+        for (const std::uint32_t chunk : {1024U, 4096U}) {
+            const bool qualified = measured_build && c == 6U && chunk == 1024U && bulk_arguments;
+            require(Variant::calibrated_dflash_graph_allowance_bytes(
                         inputs.weights_profile, inputs.features, inputs.capacity, c, chunk,
-                        inputs.draft_window, inputs.adaptive_draft),
-                    "unmeasured prefill chunk used production graph calibration");
+                        inputs.draft_window, inputs.adaptive_draft)
+                            .has_value() == qualified,
+                    "prefill chunk calibration escaped its measured concurrency/environment");
+        }
     }
+
+    // Exercise the measured chunk1024 admission independently of the caller's
+    // shell environment, and restore every driver setting before returning.
+    struct SavedSetting {
+        const char* name;
+        std::optional<std::string> value;
+
+        explicit SavedSetting(const char* key) : name(key) {
+            if (const char* current = std::getenv(key)) { value = current; }
+        }
+
+        ~SavedSetting() {
+            if (value) {
+                (void)::setenv(name, value->c_str(), 1);
+            } else {
+                (void)::unsetenv(name);
+            }
+        }
+    } classic("DEBUG_HIP_GRAPH_CLASSIC_PATH"), large_bar("ROC_ENABLE_LARGE_BAR"),
+        argument_copy("ROC_SKIP_KERNEL_ARG_COPY"), fragment("HSA_DISABLE_FRAGMENT_ALLOCATOR");
+
+    const std::array<std::pair<const char*, const char*>, 4> bulk_settings{
+        {{"DEBUG_HIP_GRAPH_CLASSIC_PATH", "0"},
+         {"ROC_ENABLE_LARGE_BAR", "0"},
+         {"ROC_SKIP_KERNEL_ARG_COPY", "0"},
+         {"HSA_DISABLE_FRAGMENT_ALLOCATOR", "1"}}};
+    for (const auto& [name, value] : bulk_settings)
+        require(::setenv(name, value, 1) == 0, "cannot set graph qualification environment");
+    const ninfer::targets::qwen3::StartupFeatures features{
+        .vision        = false,
+        .speculative   = ninfer::SpeculativeBackend::DFlash,
+        .proposal_head = ninfer::ProposalHead::Optimized};
+    const auto chunk_calibration = [&](Variant::WeightsProfile profile, auto selected_features,
+                                       std::uint32_t capacity, std::uint32_t concurrency,
+                                       std::uint32_t chunk, std::uint32_t drafts, bool adaptive) {
+        return Variant::calibrated_dflash_graph_allowance_bytes(
+            profile, selected_features, capacity, concurrency, chunk, drafts, adaptive);
+    };
+    for (std::uint32_t c = 1; c <= ninfer::kMaximumConcurrency; ++c) {
+        const auto measured = chunk_calibration(Variant::WeightsProfile::R9700Lq4, features,
+                                                262144U, c, 1024U, 7U, true);
+        require(measured.has_value() == (measured_build && c == 6U),
+                "chunk1024 calibration admitted an unmeasured concurrency");
+        if (measured)
+            require(*measured == 62ULL * 1024ULL * 1024ULL,
+                    "C6/chunk1024 complete graph residency differs from measurement");
+    }
+    for (const auto& [name, value] : bulk_settings) {
+        require(::setenv(name, value[0] == '0' ? "1" : "0", 1) == 0,
+                "cannot vary graph qualification environment");
+        require(!chunk_calibration(Variant::WeightsProfile::R9700Lq4, features, 262144U, 6U, 1024U,
+                                   7U, true),
+                "chunk1024 calibration admitted an unmeasured runtime environment");
+        require(::setenv(name, value, 1) == 0, "cannot restore graph qualification environment");
+    }
+    for (const std::uint32_t capacity : {131072U, 262080U})
+        require(!chunk_calibration(Variant::WeightsProfile::R9700Lq4, features, capacity, 6U, 1024U,
+                                   7U, true),
+                "chunk1024 calibration admitted an unmeasured context");
+    for (const std::uint32_t drafts : {3U, 5U, 6U})
+        require(!chunk_calibration(Variant::WeightsProfile::R9700Lq4, features, 262144U, 6U, 1024U,
+                                   drafts, true),
+                "chunk1024 calibration admitted an unmeasured draft inventory");
+    require(!chunk_calibration(Variant::WeightsProfile::R9700Lq4, features, 262144U, 6U, 1024U, 7U,
+                               false),
+            "chunk1024 calibration admitted a fixed-draft inventory");
+    auto incompatible   = features;
+    incompatible.vision = true;
+    require(!chunk_calibration(Variant::WeightsProfile::R9700Lq4, incompatible, 262144U, 6U, 1024U,
+                               7U, true),
+            "chunk1024 calibration admitted Vision allocations");
+    incompatible               = features;
+    incompatible.proposal_head = ninfer::ProposalHead::Full;
+    require(!chunk_calibration(Variant::WeightsProfile::R9700Lq4, incompatible, 262144U, 6U, 1024U,
+                               7U, true),
+            "chunk1024 calibration admitted an unmeasured proposal head");
+    incompatible             = features;
+    incompatible.speculative = ninfer::SpeculativeBackend::Mtp;
+    require(!chunk_calibration(Variant::WeightsProfile::R9700Lq4, incompatible, 262144U, 6U, 1024U,
+                               7U, true),
+            "chunk1024 calibration admitted a different speculative backend");
+    require(!chunk_calibration(Variant::WeightsProfile::R9700Q4G64Evaluation, features, 262144U, 6U,
+                               1024U, 7U, true),
+            "chunk1024 calibration admitted an evaluation weight profile");
     std::printf("r9700_runtime_planner: PASS immutable DFlash C1..8/K/context inventory\n");
 }
 

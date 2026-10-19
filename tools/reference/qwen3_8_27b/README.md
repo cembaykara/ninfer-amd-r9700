@@ -2,6 +2,11 @@
 
 This target-private PyTorch path exercises Text, Vision, MTP, sampling, state, and weight residency over a native `.ninfer` artifact. It is independent from the C++ Engine implementation, but it is an implementation-profile diagnostic rather than an independent numerical oracle: it decodes the same stored W8 values, uses PyTorch BF16/FP32 operations, SDPA, FLA, and PyTorch's FP8 casts, and implements the production-shaped INT4 cache codec with tensor operations.
 
+The separate `tools.parity.qwen3_8_27b.vision` diagnostic also admits the production
+`qwen3.8-27b/r9700-lq4` artifact for Vision alone, validating its exact Q4 Vision and
+frontend signatures. It decodes the stored n16k16 matrix layout; this does not add LQ4 Text
+execution to this reference runtime.
+
 It does not need the original Hugging Face checkpoint at inference time. `Frontend` materializes the tokenizer, chat template, generation defaults, and image/video processor resources embedded in the artifact, then delegates those functions to Transformers.
 
 ## Run

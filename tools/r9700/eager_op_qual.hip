@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 
 #include "ops/r9700/eager/eager_ops.h"
+#include "core/decode_graph.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/embedding.h"
@@ -36,6 +37,7 @@
 #include <string_view>
 #include <cstring>
 #include <vector>
+#include <tuple>
 
 namespace {
 
@@ -347,6 +349,54 @@ void qualify_bf16_movement_and_cast(hipStream_t stream) {
         ninfer::ops::residual_add(addend_tensor, residual_tensor, stream);
         HIP_CHECK(hipStreamSynchronize(stream));
         require_bf16_exact(copy_to_host(d_residual), residual_expected, "BF16 residual add");
+    }
+}
+
+// Whole represented-bit scatter, including vector cutover, alignment fallback and untouched
+// columns.
+void qualify_feature_scatter(hipStream_t stream) {
+    for (const auto [features, rows, prefix, captured] :
+         {std::tuple{5120U, 127U, 0U, false}, std::tuple{5120U, 128U, 0U, false},
+          std::tuple{5120U, 129U, 0U, false}, std::tuple{5120U, 384U, 0U, true},
+          std::tuple{5120U, 128U, 1U, false}, std::tuple{5119U, 129U, 0U, false}}) {
+        const std::uint32_t columns = rows * 2U + 1U;
+        auto source      = bf16_fixture(static_cast<std::size_t>(features) * rows + prefix, 17);
+        auto destination = bf16_fixture(static_cast<std::size_t>(features) * columns + prefix, 19);
+        for (std::size_t i = 0; i < source.size(); ++i)
+            source[i] = bf16_from_bits(static_cast<std::uint16_t>(i * 131U + 17U));
+        auto expected = destination;
+        std::vector<std::int32_t> indices(rows);
+        for (std::uint32_t row = 0; row < rows; ++row) {
+            indices[row] = static_cast<std::int32_t>(2U * (rows - row));
+            std::copy_n(source.data() + prefix + static_cast<std::size_t>(row) * features, features,
+                        expected.data() + prefix +
+                            static_cast<std::size_t>(indices[row]) * features);
+        }
+        DeviceBuffer<hip_bfloat16> d_source(source.size()), d_destination(destination.size());
+        DeviceBuffer<std::int32_t> d_indices(rows);
+        copy_to_device(d_source, source);
+        copy_to_device(d_destination, destination);
+        copy_to_device(d_indices, indices);
+        ninfer::Tensor x(d_source.get() + prefix, ninfer::DType::BF16,
+                         {static_cast<std::int32_t>(features), static_cast<std::int32_t>(rows)});
+        ninfer::Tensor y(d_destination.get() + prefix, ninfer::DType::BF16,
+                         {static_cast<std::int32_t>(features), static_cast<std::int32_t>(columns)});
+        ninfer::Tensor ids(d_indices.get(), ninfer::DType::I32, {static_cast<std::int32_t>(rows)});
+        if (captured) {
+            ninfer::DecodeGraphDefinition definition;
+            definition.capture(stream, [&] { ninfer::ops::scatter(x, ids, y, stream); });
+            ninfer::DecodeGraphExecutable executable;
+            executable.instantiate(definition);
+            executable.upload(stream);
+            executable.launch(stream);
+            HIP_CHECK(hipStreamSynchronize(stream));
+        } else {
+            ninfer::ops::scatter(x, ids, y, stream);
+            HIP_CHECK(hipStreamSynchronize(stream));
+        }
+        std::vector<std::uint16_t> bits(expected.size());
+        std::transform(expected.begin(), expected.end(), bits.begin(), bf16_bits);
+        require_bf16_exact(copy_to_host(d_destination), bits, "feature scatter exact image");
     }
 }
 
@@ -1745,6 +1795,7 @@ int main() {
         HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
         qualify_i32(stream);
         qualify_bf16_movement_and_cast(stream);
+        qualify_feature_scatter(stream);
         qualify_mtp_pack_split(stream);
         qualify_normalization_and_activations(stream);
         qualify_embedding(stream);

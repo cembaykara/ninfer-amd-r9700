@@ -8,20 +8,22 @@
 #include "targets/qwen3/impl/runtime/prefix_identity.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
-#include <unistd.h>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 namespace {
 
@@ -31,9 +33,9 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-q3::PreparedPromptData prompt_data(std::int32_t first_token) {
+q3::PreparedPromptData prompt_data(std::int32_t first_token, std::int32_t count = 7) {
     q3::PreparedPromptData prompt;
-    for (std::int32_t i = 0; i < 7; ++i) { prompt.token_ids.push_back(first_token + i); }
+    for (std::int32_t i = 0; i < count; ++i) { prompt.token_ids.push_back(first_token + i); }
     prompt.token_types.assign(prompt.token_ids.size(), 0);
     prompt.positions.resize(prompt.token_ids.size() * 3U);
     for (std::size_t axis = 0; axis < 3; ++axis) {
@@ -179,21 +181,22 @@ struct HiddenCapture {
     q3::detail::RamCaptureSource source;
 
     HiddenCapture(CopyFixture& fixture, const ninfer::PagedKVAllocation& allocation,
-                  std::int32_t first_token, const ninfer::Tensor& hidden, hipStream_t stream)
-        : prompt(prompt_data(first_token)) {
+                  std::int32_t first_token, const ninfer::Tensor& hidden, hipStream_t stream,
+                  std::uint32_t frontier = 6)
+        : prompt(prompt_data(first_token, static_cast<std::int32_t>(frontier + 1U))) {
         identity.assign(prompt);
-        source.execution_frontier = 6;
-        source.ledger_frontier    = 7;
-        source.text_kv_valid      = 6;
+        source.execution_frontier = frontier;
+        source.ledger_frontier    = frontier + 1U;
+        source.text_kv_valid      = frontier;
         source.tail_hidden_valid  = true;
         source.ledger             = prompt.token_ids;
         source.identity           = &identity;
-        source.hash_f             = q3::detail::prefix_hash_at(prompt.token_ids, identity, 6);
-        source.text               = &allocation;
-        source.text_pool          = fixture.pool.get();
-        source.text_semantics     = fixture.semantics;
-        source.tail_hidden        = &hidden;
-        source.stream             = stream;
+        source.hash_f         = q3::detail::prefix_hash_at(prompt.token_ids, identity, frontier);
+        source.text           = &allocation;
+        source.text_pool      = fixture.pool.get();
+        source.text_semantics = fixture.semantics;
+        source.tail_hidden    = &hidden;
+        source.stream         = stream;
     }
 
     HiddenCapture(const HiddenCapture&)            = delete;
@@ -366,17 +369,18 @@ void stream_wait_does_not_block_host(ninfer::DeviceContext& device,
 // A restore that fails validation after enqueueing H2D reads must still fence the record;
 // otherwise its host block looks idle while a copy reads it.
 void failed_unpack_fences_enqueued_reads(ninfer::DeviceContext& device,
-                                         const ninfer::Fp8KInt4VPagedKVSpec& text_spec) {
+                                         const ninfer::Fp8KInt4VPagedKVSpec& text_spec,
+                                         std::uint32_t pages) {
     CopyFixture fixture(text_spec);
     q3::detail::KVRamCache cache(64ULL << 20);
     ninfer::DeviceBuffer bulk(1ULL << 20);
     ninfer::Tensor hidden(bulk.data(), ninfer::DType::U8, {1 << 20});
     std::uint64_t entry_id = 0;
     {
-        auto source = fixture.pool->reserve(1);
-        source.materialize_pages(1, device.stream);
+        auto source = fixture.pool->reserve(pages);
+        source.materialize_pages(pages, device.stream);
         HIP_CHECK(hipStreamSynchronize(device.stream));
-        HiddenCapture capture(fixture, source, 1001, hidden, device.copy_stream);
+        HiddenCapture capture(fixture, source, 1001, hidden, device.copy_stream, pages * 64U - 1U);
         const auto result = cache.capture(capture.source);
         device.synchronize_all();
         source.release();
@@ -384,14 +388,14 @@ void failed_unpack_fences_enqueued_reads(ninfer::DeviceContext& device,
                 "failed-unpack capture failed");
         entry_id = result.entry_id;
     }
-    auto dest = fixture.pool->reserve(1);
-    dest.materialize_pages(1, device.stream);
+    auto dest = fixture.pool->reserve(pages);
+    dest.materialize_pages(pages, device.stream);
     HIP_CHECK(hipStreamSynchronize(device.stream));
     q3::detail::RamRestoreTarget target;
     target.text           = &dest;
     target.text_pool      = fixture.pool.get();
     target.text_semantics = fixture.semantics;
-    target.text_dst_pages = 1;
+    target.text_dst_pages = pages;
     target.stream         = device.copy_stream;
     // A context-checkpoint restore naming a frontier with no stored head fails after the text
     // pages are already enqueued.
@@ -611,6 +615,133 @@ void rewrite_images_round_trip(ninfer::DeviceContext& device,
         "restore changed or omitted the wrong hidden panel");
 }
 
+// Independent byte oracle for the production three-plane codec. In particular, the
+// expected host image is built from documented [plane][page][head] geometry, not from
+// either transfer implementation or its tensor strides.
+void head_major_host_transfer_oracle(ninfer::DeviceContext& device) {
+    struct Case {
+        std::uint32_t pages;
+        std::uint32_t restored;
+        int fragmentation; // 0: contiguous, 1: every page, 2: mixed short/long runs
+    };
+
+    constexpr std::uint32_t heads = 4;
+    constexpr std::array<std::size_t, 3> head_bytes{64U * 256U, 64U * 128U, 64U * 16U * 2U};
+    for (const auto test :
+         std::array{Case{4, 4, 0}, Case{5, 5, 0}, Case{5, 4, 0}, Case{32, 32, 0}, Case{32, 17, 0},
+                    Case{32, 32, 1}, Case{32, 17, 1}, Case{32, 32, 2}, Case{32, 17, 2}}) {
+        ninfer::Fp8KInt4VPagedKVSpec spec{
+            .page_group_count      = test.pages * (test.fragmentation ? 4U : 2U) + 2U,
+            .logical_page_capacity = test.pages,
+            .table_rows            = 2,
+            .layer_count           = 16,
+            .head_dim              = 256,
+            .num_kv_heads          = static_cast<std::int32_t>(heads),
+            .value_group           = 16,
+            .plane_layouts = {.key         = ninfer::Fp8KInt4VPlaneLayout::TokenFastestHeadMajor,
+                              .value       = ninfer::Fp8KInt4VPlaneLayout::FeatureFastestPageMajor,
+                              .value_scale = ninfer::Fp8KInt4VPlaneLayout::FeatureFastestPageMajor},
+        };
+        ninfer::LayoutBuilder builder;
+        const auto layout = ninfer::plan_fp8_k_int4_v_paged_kv_pool(builder, spec);
+        ninfer::DeviceBuffer backing(builder.finish(256));
+        ninfer::PagedKVPool pool({backing.data(), backing.size()}, layout.storage);
+        std::vector<ninfer::PagedKVAllocation> blockers;
+        blockers.reserve(test.pages * 2U);
+        auto materialize = [&](ninfer::PagedKVAllocation& allocation) {
+            if (!test.fragmentation) {
+                allocation.materialize_pages(test.pages, device.stream);
+                return;
+            }
+            for (std::uint32_t page = 0; page < test.pages; ++page) {
+                allocation.materialize_pages(page + 1U, device.stream);
+                if (test.fragmentation == 1 || page % 7U == 0U) {
+                    auto blocker = pool.reserve(1);
+                    blocker.materialize_pages(1, device.stream);
+                    blockers.push_back(std::move(blocker));
+                }
+            }
+        };
+        auto source = pool.reserve(test.pages);
+        materialize(source);
+        auto destination = pool.reserve(test.pages);
+        materialize(destination);
+
+        std::size_t expected_size = 0;
+        for (std::size_t plane = 0; plane < 48; ++plane)
+            expected_size += test.pages * heads * head_bytes[plane % 3];
+        require(expected_size == ninfer::paged_kv_host_image_bytes(pool, test.pages),
+                "production transfer image size disagrees with exact codec oracle");
+        std::vector<std::uint8_t> expected(expected_size);
+        for (std::size_t byte = 0; byte < expected.size(); byte += sizeof(std::uint64_t)) {
+            const std::uint64_t value =
+                0x9e3779b97f4a7c15ULL * (byte / 8U + 1U) ^ 0xd1b54a32d192ed03ULL;
+            std::memcpy(expected.data() + byte, &value, sizeof(value));
+        }
+        // This formula comes directly from each plane's physical storage contract.
+        const auto physical_offset = [&](std::size_t plane, std::int32_t physical,
+                                         std::size_t head) {
+            const auto page = static_cast<std::size_t>(physical);
+            const auto slot =
+                plane % 3 == 0 ? head * spec.page_group_count + page : page * heads + head;
+            return slot * head_bytes[plane % 3];
+        };
+        std::size_t image_offset = 0;
+        for (std::size_t plane = 0; plane < 48; ++plane) {
+            const auto& tensor = pool.plane(plane);
+            const auto row     = head_bytes[plane % 3];
+            require(tensor.bytes() == spec.page_group_count * heads * row,
+                    "production plane size disagrees with exact codec oracle");
+            std::vector<std::uint8_t> physical(tensor.bytes(), 0xa5);
+            for (std::size_t page = 0; page < test.pages; ++page)
+                for (std::size_t head = 0; head < heads; ++head)
+                    std::memcpy(physical.data() +
+                                    physical_offset(plane, source.page_ids()[page], head),
+                                expected.data() + image_offset + (page * heads + head) * row, row);
+            HIP_CHECK(hipMemcpyAsync(tensor.data, physical.data(), physical.size(),
+                                     hipMemcpyHostToDevice, device.stream));
+            device.synchronize(); // pageable initialization stays alive until consumed
+            image_offset += test.pages * heads * row;
+        }
+        ninfer::PinnedHostBuffer image(expected_size + 256U);
+        std::memset(image.data(), 0xcc, expected_size + 256U);
+        ninfer::pack_paged_kv_allocation_to_host(source, pool, image.data(), test.pages,
+                                                 device.stream);
+        // No intervening synchronization: stream ordering must make the freshly captured
+        // image visible to H2D. Partial restores still stride planes by captured pages.
+        ninfer::unpack_paged_kv_allocation_from_host(destination, pool, image.data(), test.pages,
+                                                     test.restored, device.stream);
+        device.synchronize();
+        require(std::memcmp(image.data(), expected.data(), expected_size) == 0,
+                "production D2H transfer differs from independent byte-image oracle");
+        const auto* guard = static_cast<const std::uint8_t*>(image.data()) + expected_size;
+        require(std::all_of(guard, guard + 256U, [](auto byte) { return byte == 0xcc; }),
+                "production D2H transfer overwrote its image guard");
+        image_offset = 0;
+        for (std::size_t plane = 0; plane < 48; ++plane) {
+            const auto& tensor = pool.plane(plane);
+            const auto row     = head_bytes[plane % 3];
+            std::vector<std::uint8_t> physical(tensor.bytes(), 0xa5), actual(tensor.bytes());
+            for (std::size_t page = 0; page < test.pages; ++page)
+                for (std::size_t head = 0; head < heads; ++head) {
+                    const auto* value =
+                        expected.data() + image_offset + (page * heads + head) * row;
+                    std::memcpy(physical.data() +
+                                    physical_offset(plane, source.page_ids()[page], head),
+                                value, row);
+                    if (page < test.restored)
+                        std::memcpy(physical.data() +
+                                        physical_offset(plane, destination.page_ids()[page], head),
+                                    value, row);
+                }
+            HIP_CHECK(hipMemcpy(actual.data(), tensor.data, actual.size(), hipMemcpyDeviceToHost));
+            require(actual == physical,
+                    "production H2D transfer changed expected bytes or untouched physical storage");
+            image_offset += test.pages * heads * row;
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -795,6 +926,7 @@ int main() {
         require(eviction.entry_count == 1 && eviction.captures == 2 && eviction.evictions == 1,
                 "unpinned FIFO entry was not evicted for the replacement image");
 
+        head_major_host_transfer_oracle(device);
         source_preserving_reads(device, text_spec);
         auto mixed_spec                = text_spec;
         mixed_spec.plane_layouts.key   = ninfer::Fp8KInt4VPlaneLayout::TokenFastestHeadMajor;
@@ -803,7 +935,8 @@ int main() {
         source_preserving_reads(device, mixed_spec);
         two_pending_loads_fold_as_loads(device, text_spec);
         stream_wait_does_not_block_host(device, text_spec);
-        failed_unpack_fences_enqueued_reads(device, text_spec);
+        for (const std::uint32_t pages : {1U, 5U})
+            failed_unpack_fences_enqueued_reads(device, text_spec, pages);
         for (bool disk : {false, true}) {
             for (StateRestore mode : {StateRestore::Frontier, StateRestore::Turn,
                                       StateRestore::Response, StateRestore::Drop}) {

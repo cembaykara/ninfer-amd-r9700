@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from tools.artifact import dequantize_row_split
+from tools.artifact import dequantize_q4_n16k16, dequantize_row_split
 from tools.artifact.numeric import QUANT_FORMATS
 from tools.parity.qwen3_8_27b.vision_contract import (
     CRITERIA,
@@ -281,10 +281,14 @@ def _vision_weight_report(binding: VisionArtifactBinding, model) -> dict[str, ob
     )
     try:
         for block, source in _vision_weight_pairs(binding, model):
-            actual = (
-                store.tensor(block).cpu()
-                if block.layout == "contiguous-le-v1"
-                else dequantize_row_split(
+            if block.layout == "contiguous-le-v1":
+                actual = store.tensor(block).cpu()
+            elif block.layout == "r9700-q4g64-n16-k16-v1":
+                actual = dequantize_q4_n16k16(
+                    binding.payload(block), block.shape, device="cpu", dtype=torch.float32
+                )
+            else:
+                actual = dequantize_row_split(
                     binding.payload(block),
                     block.format,
                     block.shape,
@@ -292,7 +296,6 @@ def _vision_weight_report(binding: VisionArtifactBinding, model) -> dict[str, ob
                     dtype=torch.float32,
                     compiled=False,
                 )
-            )
             expected = source.detach().cpu().reshape(actual.shape)
             name = block.descriptor.name
             if block.layout == "contiguous-le-v1":
