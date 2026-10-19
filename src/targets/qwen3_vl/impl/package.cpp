@@ -1,5 +1,6 @@
 #include "ninfer/targets/qwen3_vl/package.h"
 
+#include "targets/qwen3/impl/frontend/tokenizer.h"
 #include "targets/qwen3_vl/impl/encoder_forward.h"
 #include "targets/qwen3_vl/impl/load/bindings.h"
 #include "targets/qwen3_vl/impl/v2v_forward.h"
@@ -10,7 +11,9 @@
 
 #include <hip/hip_runtime.h>
 
+#include <fstream>
 #include <memory>
+#include <string>
 
 namespace ninfer::targets::qwen3_vl {
 namespace detail {
@@ -24,7 +27,31 @@ struct LoadPlan::Impl {
 struct LoadedModel::Impl {
     EncoderWeights weights;
     VisionWeights vision_weights;
+    // The Qwen3-VL tokenizer (loaded from the Turbo checkpoint's processor/ dir on disk).
+    // The std::string members own the bytes so the Tokenizer's string_views stay valid.
+    std::string tokenizer_json;
+    std::string tokenizer_config_json;
+    std::string generation_config_json;
+    std::unique_ptr<qwen3::frontend_internal::Tokenizer> tokenizer;
 };
+
+// Load the Qwen3-VL tokenizer from the Turbo checkpoint's processor/ dir on disk.
+void load_vl_tokenizer(LoadedModel::Impl& impl, const std::string& processor_dir) {
+    auto read_file = [](const std::string& path) -> std::string {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) { throw std::runtime_error("failed to open tokenizer file: " + path); }
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    };
+    impl.tokenizer_json         = read_file(processor_dir + "/tokenizer.json");
+    impl.tokenizer_config_json  = read_file(processor_dir + "/tokenizer_config.json");
+    impl.generation_config_json = read_file(processor_dir + "/generation_config.json");
+    qwen3::frontend_internal::TokenizerResources resources{
+        .tokenizer_json         = impl.tokenizer_json,
+        .tokenizer_config_json  = impl.tokenizer_config_json,
+        .generation_config_json = impl.generation_config_json,
+    };
+    impl.tokenizer = std::make_unique<qwen3::frontend_internal::Tokenizer>(resources);
+}
 
 struct EncoderProgram::Impl {
     const LoadedModel* model = nullptr;
@@ -48,6 +75,7 @@ LoadedModel::LoadedModel(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(
 LoadedModel::~LoadedModel() = default;
 const EncoderWeights& LoadedModel::weights() const { return impl_->weights; }
 const VisionWeights& LoadedModel::vision_weights() const { return impl_->vision_weights; }
+const qwen3::frontend_internal::Tokenizer& LoadedModel::tokenizer() const { return *impl_->tokenizer; }
 
 EncoderProgram::EncoderProgram(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 EncoderProgram::~EncoderProgram() = default;
@@ -193,6 +221,8 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     auto impl = std::make_unique<detail::LoadedModel::Impl>();
     detail::bind_encoder_weights(impl->weights, plan.impl_->handles, materialized);
     detail::bind_vision_weights(impl->vision_weights, plan.impl_->vision_handles, materialized);
+    // The Qwen3-VL tokenizer lives in the Turbo checkpoint's processor/ dir (on disk).
+    detail::load_vl_tokenizer(*impl, "/home/tengri/mergen-api/models/hf/Qwen/Qwen-Image-2.1-Turbo/processor");
     return std::unique_ptr<detail::LoadedModel>(new detail::LoadedModel(std::move(impl)));
 }
 

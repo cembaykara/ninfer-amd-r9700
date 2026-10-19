@@ -115,9 +115,10 @@ public:
     [[nodiscard]] std::vector<std::uint8_t>
     image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                   int image_w) const;
-    // Encoder (T2I): ids (host bytes, [1,seq] I32) -> hidden (host bytes, [1,seq,4096] BF16).
+    // Encoder (T2I): prompt text -> hidden (host bytes, [1,seq,4096] BF16).
+    // The engine tokenizes the prompt using the Qwen3-VL tokenizer.
     [[nodiscard]] std::vector<std::uint8_t>
-    image_encode(const std::uint8_t* ids_bytes, std::size_t ids_bytes_count, int seq) const;
+    image_encode(const std::string& prompt) const;
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;

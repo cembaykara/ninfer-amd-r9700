@@ -658,29 +658,18 @@ void HttpServer::handle_encoder_encode(const httplib::Request& req, httplib::Res
         emit_openai_error(res, error);
         return;
     }
-    const int seq = body.value("seq", 0);
-    if (seq <= 0) {
+    const std::string prompt = body.value("prompt", "");
+    if (prompt.empty()) {
         ApiError error;
         error.status  = 400;
         error.type    = "invalid_request_error";
-        error.code    = "invalid_seq";
-        error.message = "seq must be positive";
+        error.code    = "invalid_prompt";
+        error.message = "prompt must be non-empty";
         emit_openai_error(res, error);
         return;
     }
-    const std::vector<std::uint8_t> ids_bytes = b64_decode(body.value("ids", ""));
-    const std::size_t expected = (std::size_t)seq * 4;  // [1,seq] I32
-    if (ids_bytes.size() != expected) {
-        ApiError error;
-        error.status  = 400;
-        error.type    = "invalid_request_error";
-        error.code    = "invalid_ids";
-        error.message = "ids byte count does not match seq";
-        emit_openai_error(res, error);
-        return;
-    }
-    std::vector<std::uint8_t> hidden =
-        service_->image_encode(ids_bytes.data(), ids_bytes.size(), seq);
+    std::vector<std::uint8_t> hidden = service_->image_encode(prompt);
+    const int seq = static_cast<int>(hidden.size() / (4096 * 2));  // [1,seq,4096] BF16
     nlohmann::json response;
     response["hidden"] = b64_encode(hidden.data(), hidden.size());
     response["seq"]    = seq;

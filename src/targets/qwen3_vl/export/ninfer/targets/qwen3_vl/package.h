@@ -5,6 +5,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "core/tensor.h"
+#include "targets/qwen3/impl/frontend/tokenizer.h"
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
@@ -57,6 +58,8 @@ public:
     ~LoadedModel();
     [[nodiscard]] const detail::EncoderWeights& weights() const;
     [[nodiscard]] const detail::VisionWeights& vision_weights() const;
+    // The Qwen3-VL tokenizer (loaded from the Turbo checkpoint's processor/ dir).
+    [[nodiscard]] const qwen3::frontend_internal::Tokenizer& tokenizer() const;
     LoadedModel(const LoadedModel&)            = delete;
     LoadedModel& operator=(const LoadedModel&) = delete;
     LoadedModel(LoadedModel&&)                 = delete;
@@ -67,6 +70,7 @@ private:
     explicit LoadedModel(std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;
     friend struct qwen3_vl::Package;
+    friend void load_vl_tokenizer(Impl&, const std::string&);
 };
 
 // The text-encoder entry point: runs the one-shot prefill for one prompt.

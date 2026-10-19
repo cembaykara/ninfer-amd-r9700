@@ -458,18 +458,24 @@ Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count
 }
 
 std::vector<std::uint8_t>
-Engine::image_encode(const std::uint8_t* ids_bytes, std::size_t ids_bytes_count, int seq) const {
+Engine::image_encode(const std::string& prompt) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     const auto& target = encoder_target(impl_->active);
+    // Tokenize the prompt using the Qwen3-VL tokenizer (loaded from the Turbo checkpoint).
+    const auto& tokenizer = target.loaded->model->tokenizer();
+    std::vector<int> ids = tokenizer.encode(prompt);
+    const int seq = static_cast<int>(ids.size());
+    if (seq == 0) { throw std::runtime_error("prompt tokenized to zero tokens"); }
+    const std::size_t ids_bytes = (std::size_t)seq * 4;  // [1,seq] I32
     void* d_ids = nullptr;
-    HIP_CHECK(hipMalloc(&d_ids, ids_bytes_count));
-    HIP_CHECK(hipMemcpy(d_ids, ids_bytes, ids_bytes_count, hipMemcpyHostToDevice));
-    Tensor ids(d_ids, DType::I32, {1, seq});
+    HIP_CHECK(hipMalloc(&d_ids, ids_bytes));
+    HIP_CHECK(hipMemcpy(d_ids, ids.data(), ids_bytes, hipMemcpyHostToDevice));
+    Tensor ids_tensor(d_ids, DType::I32, {1, seq});
     const std::size_t hidden_bytes = (std::size_t)seq * 4096 * 2;  // [1,seq,4096] BF16
     void* d_hidden = nullptr;
     HIP_CHECK(hipMalloc(&d_hidden, hidden_bytes));
     Tensor out_hidden(d_hidden, DType::BF16, {1, seq, 4096});
-    target.loaded->program->embed(ids, out_hidden, impl_->device.stream);
+    target.loaded->program->embed(ids_tensor, out_hidden, impl_->device.stream);
     impl_->device.synchronize();
     std::vector<std::uint8_t> hidden_host(hidden_bytes);
     HIP_CHECK(hipMemcpy(hidden_host.data(), d_hidden, hidden_bytes, hipMemcpyDeviceToHost));
