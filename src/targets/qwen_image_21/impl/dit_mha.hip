@@ -1,106 +1,225 @@
-// Simple full MHA for the Qwen-Image-2.1 DiT (wave32 gfx1201). One block per (token, head, batch).
+// WMMA attention for the Qwen-Image-2.1 DiT (wave32 gfx1201).
+//
+// The tile loop is the vision encoder's: scores are S^T = K Q^T from
+// wmma_f32_16x16x16_bf16, softmax stays in the accumulator, and O^T = V^T P^T
+// consumes each probability as a BF16 value plus its BF16 residual. The mask is the
+// DiT's, which that kernel does not have: text queries are causal, image queries see
+// every key.
 #include "dit_mha.h"
+
+#include "core/device.h"
 
 #include <hip/hip_bfloat16.h>
 
-#include <cfloat>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::targets::qwen_image_21::detail {
 namespace {
 
-template <int HeadDim>
-__global__ void dit_mha_kernel(const hip_bfloat16* __restrict__ q, const hip_bfloat16* __restrict__ k,
-                               const hip_bfloat16* __restrict__ v, hip_bfloat16* __restrict__ out,
-                               int tokens, int heads, float scale) {
-    const int token = blockIdx.x;
-    const int head  = blockIdx.y;
-    const int batch = blockIdx.z;
-    const std::int64_t stride = (std::int64_t)heads * HeadDim;
-    const std::int64_t base    = (std::int64_t)batch * tokens * heads * HeadDim +
-                                (std::int64_t)token * stride + (std::int64_t)head * HeadDim;
-    const hip_bfloat16* qrow = q + base;
-    const hip_bfloat16* kbase = k + (std::int64_t)batch * tokens * heads * HeadDim +
-                                (std::int64_t)head * HeadDim;
-    const hip_bfloat16* vbase = v + (std::int64_t)batch * tokens * heads * HeadDim +
-                                (std::int64_t)head * HeadDim;
-    hip_bfloat16* orow = out + base;
+constexpr int kHeadDim       = 128;
+constexpr int kMatrixTile    = 16;
+constexpr int kWave          = 32;
+constexpr int kWavesPerBlock = 8;
+constexpr int kQueryTile     = kWavesPerBlock * kMatrixTile;
+constexpr int kThreads       = kWave * kWavesPerBlock;
+constexpr int kKeyTile       = 32;
+constexpr int kKeySubtiles   = kKeyTile / kMatrixTile;
+constexpr int kFeatureTiles  = kHeadDim / kMatrixTile;
+constexpr int kChunk         = 8;
+constexpr int kChunks        = kHeadDim / kChunk;
+constexpr int kKeyPitch      = kHeadDim + kChunk;
+constexpr int kValuePitch    = kKeyTile + kChunk;
+constexpr float kScale       = 0.08838834764831845F; // 1/sqrt(128)
+constexpr float kLog2Scale   = kScale * 1.44269504088896340736F;
 
-    __shared__ float qs[HeadDim];
-    for (int i = threadIdx.x; i < HeadDim; i += 256) qs[i] = qrow[i];
-    __syncthreads();
+using Bf16Fragment = short __attribute__((ext_vector_type(8)));
+using F32Fragment  = float __attribute__((ext_vector_type(8)));
 
-    // Pass 1: max and sum-exp over all keys.
-    float m = -FLT_MAX, l = 0.0F;
-    for (int j = threadIdx.x; j < tokens; j += 256) {
-        float dot = 0.0F;
-        for (int d = 0; d < HeadDim; d++) {
-            dot += qs[d] * kbase[(std::int64_t)j * stride + d];
-        }
-        dot *= scale;
-        const float nm = fmaxf(m, dot);
-        l = l * __expf(m - nm) + __expf(dot - nm);
-        m = nm;
-    }
-    // block reduce (m, l)
-    __shared__ float red[2][256 / 32];
-    for (int off = 16; off > 0; off >>= 1) {
-        m = fmaxf(m, __shfl_down_sync(0xffffffffull, m, off));
-        l += __shfl_down_sync(0xffffffffull, l, off);
-    }
-    if ((threadIdx.x & 31) == 0) {
-        red[0][threadIdx.x / 32] = m;
-        red[1][threadIdx.x / 32] = l;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float mm = -FLT_MAX, ll = 0.0F;
-        for (int w = 0; w < 256 / 32; w++) {
-            mm = fmaxf(mm, red[0][w]);
-            ll += red[1][w];
-        }
-        red[0][0] = mm;
-        red[1][0] = ll;
-    }
-    __syncthreads();
-    const float inv_l = 1.0F / red[1][0];
+static_assert(kHeadDim % kMatrixTile == 0);
 
-    // Pass 2: weighted sum of values.
-    float acc[(HeadDim + 255) / 256];  // ceil(HeadDim/256); indexed by d/256
-    for (int d = threadIdx.x; d < HeadDim; d += 256) acc[d / 256] = 0.0F;
-    for (int j = 0; j < tokens; j++) {
-        float dot = 0.0F;
-        for (int d = 0; d < HeadDim; d++) {
-            dot += qs[d] * kbase[(std::int64_t)j * stride + d];
-        }
-        const float w = __expf(dot * scale - red[0][0]) * inv_l;
-        for (int d = threadIdx.x; d < HeadDim; d += 256) {
-            acc[d / 256] += w * vbase[(std::int64_t)j * stride + d];
+__device__ __forceinline__ short bf16_bits(float value) {
+    return static_cast<short>(hip_bfloat16(value).data);
+}
+
+__global__ __launch_bounds__(kThreads) void dit_mha_kernel(const hip_bfloat16* __restrict__ q,
+                                                           const hip_bfloat16* __restrict__ k,
+                                                           const hip_bfloat16* __restrict__ v,
+                                                           hip_bfloat16* __restrict__ out, int seq,
+                                                           int text_len, std::int64_t stride) {
+    __shared__ __attribute__((aligned(16))) short keys[kKeyTile * kKeyPitch];
+    __shared__ __attribute__((aligned(16))) short values_t[kHeadDim * kValuePitch];
+
+    const int tid   = static_cast<int>(threadIdx.x);
+    const int wave  = tid / kWave;
+    const int lane  = tid % kWave;
+    const int half  = lane / kMatrixTile;
+    const int axis  = lane % kMatrixTile;
+    const int head  = static_cast<int>(blockIdx.y);
+    const int q0    = static_cast<int>(blockIdx.x) * kQueryTile;
+    const int query = q0 + wave * kMatrixTile + axis;
+    const bool query_valid = query < seq;
+
+    for (int index = tid; index < kKeyTile; index += kThreads) {
+        *reinterpret_cast<uint4*>(&keys[index * kKeyPitch + kHeadDim]) = uint4{};
+    }
+
+    Bf16Fragment query_fragment[kFeatureTiles];
+#pragma unroll
+    for (int feature_tile = 0; feature_tile < kFeatureTiles; ++feature_tile) {
+        const int chunk              = feature_tile * 2 + half;
+        query_fragment[feature_tile] = Bf16Fragment{};
+        if (query_valid) {
+            query_fragment[feature_tile] = *reinterpret_cast<const Bf16Fragment*>(
+                q + static_cast<std::int64_t>(query) * stride + head * kHeadDim + chunk * kChunk);
         }
     }
-    for (int d = threadIdx.x; d < HeadDim; d += 256) {
-        orow[d] = hip_bfloat16(acc[d / 256]);
+
+    // A text tile stops at its last query; a tile that contains any image query runs to the end.
+    const int q_last = min(q0 + kQueryTile, seq) - 1;
+    const int kv_end = q_last >= text_len ? seq : q_last + 1;
+
+    float maximum     = -INFINITY;
+    float denominator = 0.0F;
+    F32Fragment attended[kFeatureTiles];
+#pragma unroll
+    for (int dimension_tile = 0; dimension_tile < kFeatureTiles; ++dimension_tile) {
+        attended[dimension_tile] = F32Fragment{};
+    }
+
+    for (int key_base = 0; key_base < kv_end; key_base += kKeyTile) {
+        __syncthreads();
+        for (int index = tid; index < kKeyTile * kChunks; index += kThreads) {
+            const int key_local = index / kChunks;
+            const int chunk     = index - key_local * kChunks;
+            const int key       = key_base + key_local;
+            uint4 key_bits{};
+            uint4 value_bits{};
+            if (key < seq) {
+                key_bits = *reinterpret_cast<const uint4*>(
+                    k + static_cast<std::int64_t>(key) * stride + head * kHeadDim + chunk * kChunk);
+                value_bits = *reinterpret_cast<const uint4*>(
+                    v + static_cast<std::int64_t>(key) * stride + head * kHeadDim + chunk * kChunk);
+            }
+            *reinterpret_cast<uint4*>(&keys[key_local * kKeyPitch + chunk * kChunk]) = key_bits;
+            const short* value_elements = reinterpret_cast<const short*>(&value_bits);
+#pragma unroll
+            for (int element = 0; element < kChunk; ++element) {
+                values_t[(chunk * kChunk + element) * kValuePitch + key_local] =
+                    value_elements[element];
+            }
+        }
+        __syncthreads();
+
+        F32Fragment score[kKeySubtiles];
+#pragma unroll
+        for (int key_tile = 0; key_tile < kKeySubtiles; ++key_tile) {
+            score[key_tile] = F32Fragment{};
+#pragma unroll
+            for (int feature_tile = 0; feature_tile < kFeatureTiles; ++feature_tile) {
+                const Bf16Fragment key_fragment = *reinterpret_cast<const Bf16Fragment*>(
+                    &keys[(key_tile * kMatrixTile + axis) * kKeyPitch + feature_tile * kMatrixTile +
+                          half * kChunk]);
+                score[key_tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                    key_fragment, query_fragment[feature_tile], score[key_tile]);
+            }
+        }
+
+        float tile_maximum = -INFINITY;
+#pragma unroll
+        for (int key_tile = 0; key_tile < kKeySubtiles; ++key_tile) {
+#pragma unroll
+            for (int item = 0; item < 8; ++item) {
+                const int key = key_base + key_tile * kMatrixTile + half * kChunk + item;
+                const bool allowed = key < seq && (query >= text_len || key <= query);
+                const float scaled = allowed ? score[key_tile][item] * kLog2Scale : -INFINITY;
+                score[key_tile][item] = scaled;
+                tile_maximum          = fmaxf(tile_maximum, scaled);
+            }
+        }
+        tile_maximum = fmaxf(tile_maximum, __shfl_xor(tile_maximum, kMatrixTile, kWave));
+        const float next_maximum = fmaxf(maximum, tile_maximum);
+        // A fully masked tile has maximum -inf. exp2(-inf - -inf) is NaN, and that
+        // probability poisons the token. Use 0 as the origin so exp2(-inf) is 0.
+        // Finite scores keep the same origin they had, so a matched row is unchanged.
+        const float origin = next_maximum == -INFINITY ? 0.0F : next_maximum;
+        const float alpha  = exp2f(maximum - origin);
+        float tile_sum     = 0.0F;
+#pragma unroll
+        for (int key_tile = 0; key_tile < kKeySubtiles; ++key_tile) {
+#pragma unroll
+            for (int item = 0; item < 8; ++item) {
+                float probability = exp2f(score[key_tile][item] - origin);
+                if (!(probability >= 0.0F)) probability = 0.0F;
+                score[key_tile][item] = probability;
+                tile_sum += probability;
+            }
+        }
+        tile_sum += __shfl_xor(tile_sum, kMatrixTile, kWave);
+        denominator = denominator * alpha + tile_sum;
+        maximum     = next_maximum;
+#pragma unroll
+        for (int dimension_tile = 0; dimension_tile < kFeatureTiles; ++dimension_tile) {
+            attended[dimension_tile] *= alpha;
+        }
+
+#pragma unroll
+        for (int key_tile = 0; key_tile < kKeySubtiles; ++key_tile) {
+            Bf16Fragment probability_high;
+            Bf16Fragment probability_low;
+#pragma unroll
+            for (int item = 0; item < 8; ++item) {
+                const float probability = score[key_tile][item];
+                const hip_bfloat16 high(probability);
+                probability_high[item] = static_cast<short>(high.data);
+                probability_low[item]  = bf16_bits(probability - static_cast<float>(high));
+            }
+#pragma unroll
+            for (int dimension_tile = 0; dimension_tile < kFeatureTiles; ++dimension_tile) {
+                const Bf16Fragment value_fragment = *reinterpret_cast<const Bf16Fragment*>(
+                    &values_t[(dimension_tile * kMatrixTile + axis) * kValuePitch +
+                              key_tile * kMatrixTile + half * kChunk]);
+                attended[dimension_tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                    value_fragment, probability_high, attended[dimension_tile]);
+                attended[dimension_tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+                    value_fragment, probability_low, attended[dimension_tile]);
+            }
+        }
+    }
+
+    if (!query_valid) { return; }
+    // An empty row must write zeros. 0 * (1/0) is NaN and the VAE then paints gray.
+    const float inverse = denominator > 0.0F ? 1.0F / denominator : 0.0F;
+#pragma unroll
+    for (int dimension_tile = 0; dimension_tile < kFeatureTiles; ++dimension_tile) {
+        const int chunk = dimension_tile * 2 + half;
+        Bf16Fragment packed;
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+            packed[item] = bf16_bits(attended[dimension_tile][item] * inverse);
+        }
+        *reinterpret_cast<Bf16Fragment*>(out + static_cast<std::int64_t>(query) * stride +
+                                         head * kHeadDim + chunk * kChunk) = packed;
     }
 }
 
 } // namespace
 
-void dit_mha(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out, hipStream_t stream) {
-    const int tokens = q.ne[1];
-    const int heads  = q.ne[2];
-    const int batch  = q.ne[0];
-    const int head_dim = q.ne[3];
-    const float scale  = 1.0F / sqrtf((float)head_dim);
-    dim3 grid(tokens, heads, batch);
-    dim3 block(256);
-    if (head_dim == 128) {
-        dit_mha_kernel<128><<<grid, block, 0, stream>>>((const hip_bfloat16*)q.data,
-                                                        (const hip_bfloat16*)k.data,
-                                                        (const hip_bfloat16*)v.data,
-                                                        (hip_bfloat16*)out.data, tokens, heads, scale);
-    } else {
-        throw std::runtime_error("dit_mha: unsupported head_dim");
+void dit_mha(const Tensor& q, const Tensor& k, const Tensor& v, int text_len, Tensor& out,
+             hipStream_t stream) {
+    if (q.ne[0] != kHeadDim || k.ne[0] != kHeadDim || v.ne[0] != kHeadDim || out.ne[0] != kHeadDim) {
+        throw std::runtime_error("dit_mha: head_dim must be 128");
     }
+    const int heads = static_cast<int>(q.ne[1]);
+    const int seq   = static_cast<int>(q.ne[2]);
+    if (seq <= 0) { return; }
+    const std::int64_t stride = static_cast<std::int64_t>(heads) * kHeadDim;
+    dim3 grid((seq + kQueryTile - 1) / kQueryTile, heads);
+    dit_mha_kernel<<<grid, kThreads, 0, stream>>>(
+        static_cast<const hip_bfloat16*>(q.data), static_cast<const hip_bfloat16*>(k.data),
+        static_cast<const hip_bfloat16*>(v.data), static_cast<hip_bfloat16*>(out.data), seq, text_len,
+        stride);
+    HIP_CHECK(hipGetLastError());
 }
 
 } // namespace ninfer::targets::qwen_image_21::detail

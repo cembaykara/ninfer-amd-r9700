@@ -107,18 +107,28 @@ public:
                                                       const CancellationView& cancellation = {});
 
     // Image-pipeline component entry points. Each requires the active target to be the matching
-    // component (the front door swaps to it before calling).
+    // component. load_artifact is what swaps the loaded file; the process keeps listening.
     // VAE: latent (host bytes, [1,64,H/16,W/16] BF16) -> image (host bytes, [1,4,H,W] BF16).
     [[nodiscard]] std::vector<std::uint8_t>
     image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_count, int H, int W) const;
-    // DiT: text_emb (host bytes, [1,M,4096] BF16) -> latent (host bytes, [1,image_h*image_w,64] BF16).
+    // DiT: text_emb (host bytes, [1,M,4096] BF16) -> latent (host bytes, [1,N,64] BF16), where
+    // image_h x image_w are pixels and N = (image_h/16)*(image_w/16). `noise` is the initial
+    // latent in the same layout; when empty it is drawn from `seed`.
+    // `lora_path` empty leaves the loaded DiT weights as they are. A safetensors path adds
+    // `lora_scale` * (B @ A) for this call (omitted scale is 1) and restores the weights after.
     [[nodiscard]] std::vector<std::uint8_t>
     image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
-                  int image_w) const;
+                  int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
+                  std::string_view lora_path = {}, float lora_scale = 1.F) const;
     // Encoder (T2I): prompt text -> hidden (host bytes, [1,seq,4096] BF16).
     // The engine tokenizes the prompt using the Qwen3-VL tokenizer.
     [[nodiscard]] std::vector<std::uint8_t>
     image_encode(const std::string& prompt) const;
+
+    // Frees the active target, including its GPU weights, then loads `path`. Encode, denoise,
+    // and decode afterwards use that file, and only when it is the matching component. A path
+    // that is not a `.ninfer` file leaves the current target loaded.
+    [[nodiscard]] LoadSummary load_artifact(const std::filesystem::path& path);
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;

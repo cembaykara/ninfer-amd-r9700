@@ -19,6 +19,8 @@ struct LoadPlan::Impl {
 };
 
 struct LoadedModel::Impl {
+    // Owns the device allocations that weights point into.
+    artifact::MaterializedArtifact backing;
     VaeWeights weights;
 };
 
@@ -26,7 +28,24 @@ struct ImageProgram::Impl {
     const LoadedModel* model = nullptr;
     DeviceContext* device     = nullptr;
     VaeWorkspace workspace;
-    bool workspace_ready = false;
+    std::size_t workspace_bytes = 0;
+
+    ~Impl() {
+        // a–h are the hipMalloc'd maps. Later letters alias those buffers.
+        auto release = [](void* p) noexcept {
+            if (p != nullptr) { (void)hipFree(p); }
+        };
+        release(workspace.a);
+        release(workspace.b);
+        release(workspace.c);
+        release(workspace.d);
+        release(workspace.e);
+        release(workspace.f);
+        release(workspace.g);
+        release(workspace.h);
+        workspace.a = workspace.b = workspace.c = workspace.d = nullptr;
+        workspace.e = workspace.f = workspace.g = workspace.h = nullptr;
+    }
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -46,17 +65,22 @@ void ImageProgram::decode(const Tensor& latent, Tensor& out_image, hipStream_t s
     // latent: [1, 64, H/16, W/16]; out_image: [1, 4, H, W]
     const int h0 = latent.ne[2], w0 = latent.ne[3];
     const int H = h0 * 16, W = w0 * 16;
-    if (!impl_->workspace_ready) {
-        // Allocate the workspace, sized for this resolution. The largest intermediate is
-        // the up_block-4 / head feature map [144, H, W]; every buffer is reused, so size
-        // each to that max. (One-time cost; the VAE decode is not in the denoise loop.)
+    // The largest map is the 288-channel upsample at full resolution. Grow the
+    // workspace if a later request is bigger than the one that allocated it.
+    const std::size_t max_bytes = (std::size_t)288 * H * W * 2;
+    if (impl_->workspace_bytes < max_bytes) {
         auto alloc = [&](std::size_t bytes) {
             void* p = nullptr;
             HIP_CHECK(hipMalloc(&p, bytes));
             return p;
         };
-        const std::size_t max_bytes = (std::size_t)144 * H * W * 2;  // [144, H, W] BF16
         auto& ws = impl_->workspace;
+        auto drop = [](hip_bfloat16*& p) {
+            HIP_CHECK(hipFree(p));
+            p = nullptr;
+        };
+        drop(ws.a); drop(ws.b); drop(ws.c); drop(ws.d);
+        drop(ws.e); drop(ws.f); drop(ws.g); drop(ws.h);
         ws.a = (hip_bfloat16*)alloc(max_bytes);
         ws.b = (hip_bfloat16*)alloc(max_bytes);
         ws.c = (hip_bfloat16*)alloc(max_bytes);
@@ -64,8 +88,8 @@ void ImageProgram::decode(const Tensor& latent, Tensor& out_image, hipStream_t s
         ws.e = (hip_bfloat16*)alloc(max_bytes);
         ws.f = (hip_bfloat16*)alloc(max_bytes);
         ws.g = (hip_bfloat16*)alloc(max_bytes);
-        // (h..z are unused by the current forward; leave null)
-        impl_->workspace_ready = true;
+        ws.h = (hip_bfloat16*)alloc(max_bytes);
+        impl_->workspace_bytes = max_bytes;
     }
     vae_decode(impl_->model->weights(), latent, out_image, impl_->workspace, stream);
 }
@@ -91,6 +115,7 @@ std::unique_ptr<detail::LoadedModel>
 Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
     auto impl = std::make_unique<detail::LoadedModel::Impl>();
     bind_vae_weights(impl->weights, plan.impl_->handles, materialized);
+    impl->backing = std::move(materialized);
     return std::unique_ptr<detail::LoadedModel>(new detail::LoadedModel(std::move(impl)));
 }
 

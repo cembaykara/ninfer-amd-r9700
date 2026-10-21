@@ -75,9 +75,9 @@ public:
     ImageProgram(const ImageProgram&)            = delete;
     ImageProgram& operator=(const ImageProgram&) = delete;
 
-    // text_emb: [1, M, 4096] (from the text encoder); image is image_h x image_w latent tokens.
-    // Writes the denoised latent [1, image_h*image_w, 64] to out_latent.
-    void denoise(const Tensor& text_emb, int image_h, int image_w, Tensor& out_latent,
+    // text_emb: {4096, M} (from the text encoder); the image is grid_h x grid_w latent tokens.
+    // latent {64, grid_h*grid_w} holds the initial noise and is denoised in place.
+    void denoise(const Tensor& text_emb, int grid_h, int grid_w, Tensor& latent,
                  hipStream_t stream) const;
 
 private:

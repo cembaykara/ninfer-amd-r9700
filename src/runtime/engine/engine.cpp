@@ -5,12 +5,22 @@
 #include "runtime/contract/types.h"
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/qwen3/impl/frontend/encoded_history_cache.h"
+#include "targets/qwen_image_21/impl/lora_apply.h"
 #include "targets/registry.h"
 
 #include <ninfer/targets/qwen3/prepared_prompt.h>
 
+#include <hip/hip_bfloat16.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 namespace ninfer {
@@ -148,8 +158,7 @@ public:
             options.mixed_forward = qwen->program->mixed_forward();
             executor              = std::make_unique<Executor>(*qwen, device, options);
         } else {
-            // Qwen-Image DiT: image-generation target, no text executor (served via the
-            // ImageProgram; the HTTP image route is a follow-up).
+            // Encoder, DiT, or VAE: no text executor. POST /v1/ninfer/load replaces the file.
         }
     }
 
@@ -169,6 +178,8 @@ public:
     ModelSamplingDefaults sampling_defaults;
     std::unique_ptr<Executor> executor;
     mutable targets::qwen3::frontend_internal::EncodedHistoryCache host_encode_cache;
+    // Serializes load_artifact with image calls and with readers of the active target.
+    mutable std::mutex model_mu;
 };
 
 Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
@@ -251,6 +262,11 @@ std::uint32_t Engine::count_tokens(PromptInput input) const {
 
 PromptCapabilities Engine::prompt_capabilities() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    // Image targets (encoder / DiT / VAE) have no chat prompt; the server still asks at startup.
+    if (impl_->active == nullptr ||
+        std::get_if<targets::Qwen3_8_27BInstance>(&*impl_->active) == nullptr) {
+        return PromptCapabilities{};
+    }
     const auto& target = text_target(impl_->active);
     return target.loaded->frontend.prompt_capabilities();
 }
@@ -263,6 +279,7 @@ std::string Engine::token_bytes(TokenId token) const {
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
     return impl_->sampling_defaults;
 }
 
@@ -390,33 +407,72 @@ const EngineOptions& Engine::options() const {
 
 LoadSummary Engine::load_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
     return impl_->load;
 }
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    if (impl_->executor == nullptr) {
-        throw std::logic_error("concurrent Engine executor is unavailable");
-    }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
+    // Image targets run without the text executor; startup and /metrics still read these.
+    if (impl_->executor == nullptr) { return MemorySummary{}; }
     return impl_->executor->memory_summary();
 }
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    if (impl_->executor == nullptr) {
-        throw std::logic_error("concurrent Engine executor is unavailable");
-    }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
+    if (impl_->executor == nullptr) { return RuntimeStats{}; }
     return impl_->executor->runtime_stats();
 }
 
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
     if (impl_->executor != nullptr) { impl_->executor->reset_memory_peaks(); }
+}
+
+LoadSummary Engine::load_artifact(const std::filesystem::path& path) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
+    std::error_code ec;
+    const bool is_file = std::filesystem::is_regular_file(path, ec);
+    if (path.empty() || path.extension() != ".ninfer" || ec || !is_file) {
+        throw std::invalid_argument("artifact path is not a .ninfer file: " + path.string());
+    }
+    // Copy first so a failure here still leaves the resident target in place. The free
+    // below is what lets the next file fit: encoder and DiT do not share the device.
+    EngineOptions next = impl_->options;
+    next.artifact_path = path;
+    impl_->device.bind_to_current_thread();
+    impl_->executor.reset();
+    impl_->device.synchronize_all();
+    impl_->active.reset();
+    targets::ConstructedTarget constructed;
+    try {
+        constructed = targets::construct_target(next, impl_->device);
+    } catch (...) {
+        impl_->load = LoadSummary{};
+        impl_->sampling_defaults = ModelSamplingDefaults{};
+        throw;
+    }
+    impl_->options.artifact_path = path;
+    impl_->options.model_id      = constructed.load.model_id;
+    impl_->options.weights_id    = constructed.load.weights_id;
+    impl_->active                = std::move(constructed.active);
+    impl_->load                  = std::move(constructed.load);
+    impl_->sampling_defaults     = constructed.sampling_defaults;
+    if (auto* qwen = std::get_if<targets::Qwen3_8_27BInstance>(&*impl_->active)) {
+        impl_->options.mixed_forward = qwen->program->mixed_forward();
+        impl_->executor = std::make_unique<Engine::Impl::Executor>(*qwen, impl_->device, impl_->options);
+    }
+    return impl_->load;
 }
 
 std::vector<std::uint8_t>
 Engine::image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_count, int H, int W) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
     const auto& target = vae_target(impl_->active);
     void* d_latent = nullptr;
     HIP_CHECK(hipMalloc(&d_latent, latent_bytes_count));
@@ -437,48 +493,102 @@ Engine::image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_
 
 std::vector<std::uint8_t>
 Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
-                      int image_w) const {
+                      int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
+                      std::string_view lora_path, float lora_scale) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
     const auto& target = dit_target(impl_->active);
-    void* d_emb = nullptr;
-    HIP_CHECK(hipMalloc(&d_emb, emb_bytes_count));
-    HIP_CHECK(hipMemcpy(d_emb, emb_bytes, emb_bytes_count, hipMemcpyHostToDevice));
-    Tensor emb(d_emb, DType::BF16, {1, M, 4096});
-    const std::size_t latent_bytes = (std::size_t)image_h * image_w * 64 * 2;  // [1,h*w,64] BF16
-    void* d_latent = nullptr;
-    HIP_CHECK(hipMalloc(&d_latent, latent_bytes));
-    Tensor out_latent(d_latent, DType::BF16, {1, image_h * image_w, 64});
-    target.loaded->program->denoise(emb, image_h, image_w, out_latent, impl_->device.stream);
+    // 8x VAE downsampling and 2x2 packing: one latent token per 16x16 pixels.
+    const int grid_h = image_h / 16;
+    const int grid_w = image_w / 16;
+    const std::size_t latent_bytes = (std::size_t)grid_h * grid_w * 64 * 2;  // {64, N} BF16
+    std::vector<std::uint8_t> latent_host = noise;
+    if (latent_host.empty()) {
+        std::mt19937_64 rng(seed);
+        std::normal_distribution<float> normal(0.0F, 1.0F);
+        latent_host.resize(latent_bytes);
+        // Pack float -> BF16 by hand. The host hip_bfloat16(float) constructor goes
+        // through static_cast<__bf16>, which this host toolchain mis-emits as NaN for
+        // every value, so every noise sample would be NaN and the whole image NaN.
+        // Round-to-nearest-even on the high 16 bits of the IEEE-754 float.
+        auto* words = reinterpret_cast<std::uint16_t*>(latent_host.data());
+        for (std::size_t i = 0; i < latent_bytes / 2; i++) {
+            std::uint32_t bits = 0;
+            const float sample = normal(rng);
+            std::memcpy(&bits, &sample, sizeof(bits));
+            bits += 0x7FFFU + ((bits >> 16) & 1U);
+            words[i] = static_cast<std::uint16_t>(bits >> 16);
+        }
+    } else if (latent_host.size() != latent_bytes) {
+        throw std::invalid_argument("image_denoise: noise byte count does not match the image size");
+    }
+    if (!std::isfinite(lora_scale)) {
+        throw std::invalid_argument("image_denoise: lora scale must be finite");
+    }
+    struct DeviceBuf {
+        void* p = nullptr;
+        ~DeviceBuf() {
+            if (p != nullptr) { (void)hipFree(p); }
+        }
+    };
+    DeviceBuf d_emb;
+    DeviceBuf d_latent;
+    HIP_CHECK(hipMalloc(&d_emb.p, emb_bytes_count));
+    HIP_CHECK(hipMemcpy(d_emb.p, emb_bytes, emb_bytes_count, hipMemcpyHostToDevice));
+    Tensor emb(d_emb.p, DType::BF16, {4096, M});
+    HIP_CHECK(hipMalloc(&d_latent.p, latent_bytes));
+    HIP_CHECK(hipMemcpy(d_latent.p, latent_host.data(), latent_bytes, hipMemcpyHostToDevice));
+    Tensor out_latent(d_latent.p, DType::BF16, {64, grid_h * grid_w});
+    // No LoRA name: the weights loaded from the DiT file stay as they are. A name adds
+    // lora_scale * (B @ A) for this call (scale defaults to 1) and restores those weights after.
+    const auto run_denoise = [&]() {
+        target.loaded->program->denoise(emb, grid_h, grid_w, out_latent, impl_->device.stream);
+    };
+    if (lora_path.empty()) {
+        run_denoise();
+    } else {
+        targets::qwen_image_21::detail::denoise_with_lora(
+            target.loaded->model->weights(), impl_->options.artifact_path, std::filesystem::path(lora_path),
+            lora_scale, impl_->device.stream, run_denoise);
+    }
     impl_->device.synchronize();
-    std::vector<std::uint8_t> latent_host(latent_bytes);
-    HIP_CHECK(hipMemcpy(latent_host.data(), d_latent, latent_bytes, hipMemcpyDeviceToHost));
-    HIP_CHECK(hipFree(d_emb));
-    HIP_CHECK(hipFree(d_latent));
+    HIP_CHECK(hipMemcpy(latent_host.data(), d_latent.p, latent_bytes, hipMemcpyDeviceToHost));
     return latent_host;
 }
 
 std::vector<std::uint8_t>
 Engine::image_encode(const std::string& prompt) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
     const auto& target = encoder_target(impl_->active);
     // Tokenize the prompt using the Qwen3-VL tokenizer (loaded from the Turbo checkpoint).
     const auto& tokenizer = target.loaded->model->tokenizer();
-    std::vector<int> ids = tokenizer.encode(prompt);
+    // The QwenImage21Pipeline T2I template. Its system turn is 14 tokens, which diffusers
+    // drops from the hidden states (`_drop_idx`).
+    constexpr int kDropTokens = 14;
+    const std::string text =
+        "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
+        "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    std::vector<int> ids = tokenizer.encode(text);
     const int seq = static_cast<int>(ids.size());
-    if (seq == 0) { throw std::runtime_error("prompt tokenized to zero tokens"); }
-    const std::size_t ids_bytes = (std::size_t)seq * 4;  // [1,seq] I32
+    if (seq <= kDropTokens) { throw std::runtime_error("prompt tokenized to too few tokens"); }
+    const std::size_t ids_bytes = (std::size_t)seq * 4;  // {seq} I32
     void* d_ids = nullptr;
     HIP_CHECK(hipMalloc(&d_ids, ids_bytes));
     HIP_CHECK(hipMemcpy(d_ids, ids.data(), ids_bytes, hipMemcpyHostToDevice));
-    Tensor ids_tensor(d_ids, DType::I32, {1, seq});
-    const std::size_t hidden_bytes = (std::size_t)seq * 4096 * 2;  // [1,seq,4096] BF16
+    Tensor ids_tensor(d_ids, DType::I32, {seq});
+    const std::size_t row_bytes    = (std::size_t)4096 * 2;  // one token, BF16
+    const std::size_t hidden_bytes = (std::size_t)seq * row_bytes;  // {4096, seq} BF16
     void* d_hidden = nullptr;
     HIP_CHECK(hipMalloc(&d_hidden, hidden_bytes));
-    Tensor out_hidden(d_hidden, DType::BF16, {1, seq, 4096});
+    Tensor out_hidden(d_hidden, DType::BF16, {4096, seq});
     target.loaded->program->embed(ids_tensor, out_hidden, impl_->device.stream);
     impl_->device.synchronize();
-    std::vector<std::uint8_t> hidden_host(hidden_bytes);
-    HIP_CHECK(hipMemcpy(hidden_host.data(), d_hidden, hidden_bytes, hipMemcpyDeviceToHost));
+    const std::size_t kept_bytes = (std::size_t)(seq - kDropTokens) * row_bytes;
+    std::vector<std::uint8_t> hidden_host(kept_bytes);
+    HIP_CHECK(hipMemcpy(hidden_host.data(),
+                        static_cast<const std::uint8_t*>(d_hidden) + kDropTokens * row_bytes,
+                        kept_bytes, hipMemcpyDeviceToHost));
     HIP_CHECK(hipFree(d_ids));
     HIP_CHECK(hipFree(d_hidden));
     return hidden_host;

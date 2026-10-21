@@ -47,6 +47,9 @@ struct VaeWeights {
     const hip_bfloat16* conv_out_b = nullptr;
     // norm_out: [144, 1, 1, 1]
     const hip_bfloat16* norm_out = nullptr;
+    // 1x1 applied to the scaled latent before conv_in. [64, 64, 1, 1] + bias [64].
+    const hip_bfloat16* post_quant = nullptr;
+    const hip_bfloat16* post_quant_b = nullptr;
 };
 
 struct VaeWorkspace {

@@ -92,6 +92,8 @@ def _build_io_recipes() -> tuple[TensorRecipe, ...]:
         TensorRecipe("vae/conv_out", source("decoder.conv_out.weight", (4, 144, 3, 3))),
         TensorRecipe("vae/conv_out_b", source("decoder.conv_out.bias", (4,))),
         TensorRecipe("vae/norm_out", source("decoder.norm_out.gamma", (144, 1, 1, 1))),
+        TensorRecipe("vae/post_quant", source("post_quant_conv.weight", (64, 64, 1, 1))),
+        TensorRecipe("vae/post_quant_b", source("post_quant_conv.bias", (64,))),
     )
 
 

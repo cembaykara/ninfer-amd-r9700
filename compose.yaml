@@ -1,8 +1,10 @@
-name: ninfer-r9700
+# Image targets (encoder / DiT / VAE). Separate compose project from heretic
+# (runtimes/ninfer, name: ninfer-r9700) so swaps do not clobber chat containers.
+name: ninfer-image
 
 services:
   server:
-    image: local/ninfer-r9700:compose
+    image: local/ninfer-r9700:image
     build:
       context: .
       target: runtime
@@ -23,51 +25,45 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # The encoder target reads the Qwen3-VL tokenizer from this absolute host path.
+      - type: bind
+        source: /home/tengri/mergen-api/models/hf
+        target: /home/tengri/mergen-api/models/hf
+        read_only: true
       - type: bind
         source: ${NINFER_DISK_CACHE_DIR:-/ssdpool2nvme/local_llm/cache_r9700}
         target: /cache
         bind:
           create_host_path: false
+      # Persistent engine log (survives compose down removing the container).
+      - type: bind
+        source: /home/tengri/mergen-api/logs
+        target: /logs
     shm_size: 1gb
     mem_limit: 24g
     memswap_limit: 24g
     ulimits:
       memlock: {soft: -1, hard: -1}
     init: true
-    restart: unless-stopped
-    stop_grace_period: 2m
+    # A failed image load must exit and free :8001, not crash-loop holding the port.
+    restart: "no"
+    # ninfer-serve treats SIGTERM as stop-listening and stays up during a GPU
+    # call, so this shell waits on the tee pipeline and down never returns.
+    # KILL the group. 10s stays inside the API down cap if the trap does not run.
+    stop_grace_period: 10s
     command:
-      - ninfer-serve
-      - /models/${NINFER_MODEL:-qwen3.8-27b-r9700-fp8lut4/qwen3.8-27b-r9700-fp8lut4.ninfer}
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8080"
-      - --temperature
-      - "1.5"
-      - --max-context
-      - "${NINFER_MAX_CONTEXT:-32768}"
-      - --max-concurrency
-      - "${NINFER_CONCURRENCY:-1}"
-      - --prefill-chunk
-      - "2048"
-      - --kv-capacity
-      - auto
-      - --kv-ram-capacity
-      - "${NINFER_RAM_CACHE_MIB:-4096}"
-      - --kv-disk-capacity
-      - "${NINFER_DISK_CACHE_MIB:-32768}"
-      - --spec
-      - dflash
-      - --draft-tokens
-      - "${NINFER_DRAFT_TOKENS:-7}"
-      - --adaptive-draft
-      - --lm-head-draft
-      - --preserve-thinking
-      - --pending-timeout-ms
-      - "900000"
-      - --default-max-tokens
-      - "32768"
+      - sh
+      - -c
+      - >-
+        trap "kill -KILL 0" TERM;
+        ninfer-serve /models/${NINFER_MODEL} --host 0.0.0.0 --port 8080
+        --temperature 1.5 --max-context ${NINFER_MAX_CONTEXT:-32768}
+        --max-concurrency ${NINFER_CONCURRENCY:-1} --prefill-chunk 2048
+        --kv-capacity auto --kv-ram-capacity ${NINFER_RAM_CACHE_MIB:-off}
+        --kv-disk-capacity ${NINFER_DISK_CACHE_MIB:-off}
+        --model-id ${SERVED_MODEL_NAME} --pending-timeout-ms 900000
+        --default-max-tokens 32768 ${NINFER_EXTRA_FLAGS:-}
+        2>&1 | tee /logs/ninfer-image.log
     healthcheck:
       test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:8080/health]
       interval: 15s
