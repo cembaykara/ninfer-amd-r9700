@@ -154,8 +154,13 @@ public:
     score_candidates(const CandidateScoreRequest& request,
                      std::function<bool()> is_cancelled = {}) const;
 
+    // Frees the loaded image component and loads `path` in this process.
+    [[nodiscard]] ninfer::LoadSummary load_artifact(const std::filesystem::path& path) {
+        return engine_->load_artifact(path);
+    }
+
     // Image-pipeline component passthrough (VAE: latent -> image). The active target must be the
-    // VAE; the front door swaps to it before calling. Host bytes in/out (BF16).
+    // VAE. Host bytes in/out (BF16).
     [[nodiscard]] std::vector<std::uint8_t>
     image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_count, int H, int W) const {
         return engine_->image_decode(latent_bytes, latent_bytes_count, H, W);
@@ -163,8 +168,10 @@ public:
     // DiT: text_emb -> latent. The active target must be the DiT.
     [[nodiscard]] std::vector<std::uint8_t>
     image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
-                  int image_w) const {
-        return engine_->image_denoise(emb_bytes, emb_bytes_count, M, image_h, image_w);
+                  int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
+                  std::string_view lora_path = {}, float lora_scale = 1.F) const {
+        return engine_->image_denoise(emb_bytes, emb_bytes_count, M, image_h, image_w, noise, seed,
+                                     lora_path, lora_scale);
     }
     // Encoder (T2I): prompt -> hidden. The active target must be the encoder.
     [[nodiscard]] std::vector<std::uint8_t>

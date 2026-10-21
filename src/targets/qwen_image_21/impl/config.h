@@ -27,12 +27,16 @@ struct DitConfig {
     static constexpr int modulation_out = 4 * hidden;         // 16384
 
     // The joint sequence is [text (M), target-image (N)]; only the image rows of the
-    // final proj_out are the velocity. For T2I the block-causal mask reduces to full
-    // bidirectional attention over the joint sequence (text outputs discarded).
+    // final proj_out are the velocity. Text queries are causal, image queries see everything.
     static constexpr int modulation_scale1 = 0;
     static constexpr int modulation_gate1  = hidden;
     static constexpr int modulation_scale2 = 2 * hidden;
     static constexpr int modulation_gate2  = 3 * hidden;
+
+    // model_index.json `sample_sigmas`; the scheduler appends a terminal 0. The scheduler's
+    // shift is 1.0 with dynamic shifting off, so these are used unchanged.
+    static constexpr float sample_sigmas[8] = {1.0F,     0.978453F, 0.95418F,  0.926626F,
+                                               0.89508F, 0.845148F, 0.704534F, 0.414568F};
 };
 
 } // namespace ninfer::targets::qwen_image_21::detail

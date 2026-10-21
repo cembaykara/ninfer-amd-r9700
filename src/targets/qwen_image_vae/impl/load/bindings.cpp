@@ -17,22 +17,30 @@ constexpr int kUpIn[5]  = {1152, 1152, 1152, 576, 288};
 artifact::ObjectHandle req4d(artifact::Binder& b, const std::string& name, int a, int c, int d, int e) {
     const std::array<std::uint64_t, 4> shape{static_cast<std::uint64_t>(a), static_cast<std::uint64_t>(c),
                                              static_cast<std::uint64_t>(d), static_cast<std::uint64_t>(e)};
-    return b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    const auto h_ = b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    b.materialize_on_device(h_);
+    return h_;
 }
 // 1D bias/norm [n]
 artifact::ObjectHandle req1d(artifact::Binder& b, const std::string& name, int n) {
     const std::array<std::uint64_t, 1> shape{static_cast<std::uint64_t>(n)};
-    return b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    const auto h_ = b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    b.materialize_on_device(h_);
+    return h_;
 }
 // 4D norm [c, 1, 1, 1]
 artifact::ObjectHandle reqnorm4(artifact::Binder& b, const std::string& name, int c) {
     const std::array<std::uint64_t, 4> shape{static_cast<std::uint64_t>(c), 1, 1, 1};
-    return b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    const auto h_ = b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    b.materialize_on_device(h_);
+    return h_;
 }
 // 3D norm [c, 1, 1] (attention norm)
 artifact::ObjectHandle reqnorm3(artifact::Binder& b, const std::string& name, int c) {
     const std::array<std::uint64_t, 3> shape{static_cast<std::uint64_t>(c), 1, 1};
-    return b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    const auto h_ = b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    b.materialize_on_device(h_);
+    return h_;
 }
 
 // Require one resnet's tensors (with optional shortcut)
@@ -47,6 +55,7 @@ void req_resnet(artifact::Binder& b, VaeWeightHandles::ResnetH& h, const std::st
     if (shortcut) {
         h.shortcut = req4d(b, p + "shortcut", cout, cin, 1, 1);
         h.shortcut_b = req1d(b, p + "shortcut_b", cout);
+        h.has_shortcut = true;
     }
 }
 
@@ -86,6 +95,8 @@ VaeWeightHandles plan_vae_weights(artifact::Binder& b) {
     h.conv_out = req4d(b, "vae/conv_out", 4, kUpOut[4], 3, 3);
     h.conv_out_b = req1d(b, "vae/conv_out_b", 4);
     h.norm_out = reqnorm4(b, "vae/norm_out", kUpOut[4]);
+    h.post_quant = req4d(b, "vae/post_quant", 64, 64, 1, 1);
+    h.post_quant_b = req1d(b, "vae/post_quant_b", 64);
     return h;
 }
 
@@ -102,7 +113,14 @@ void bind_vae_weights(detail::VaeWeights& w, const VaeWeightHandles& h, const ar
             r.conv1 = pd(rh.conv1); r.conv1_b = pd(rh.conv1_b);
             r.conv2 = pd(rh.conv2); r.conv2_b = pd(rh.conv2_b);
             r.norm1 = pd(rh.norm1); r.norm2 = pd(rh.norm2);
-            r.shortcut = pd(rh.shortcut); r.shortcut_b = pd(rh.shortcut_b);
+            // An unbound handle defaults to index 0, which is a real tensor. Only a block
+            // that actually has a shortcut may read those weights.
+            r.shortcut = nullptr;
+            r.shortcut_b = nullptr;
+            if (rh.has_shortcut) {
+                r.shortcut = pd(rh.shortcut);
+                r.shortcut_b = pd(rh.shortcut_b);
+            }
         }
         w.up_blocks[i].upsampler.resample = pd(h.up_blocks[i].resample);
         w.up_blocks[i].upsampler.resample_b = pd(h.up_blocks[i].resample_b);
@@ -115,6 +133,8 @@ void bind_vae_weights(detail::VaeWeights& w, const VaeWeightHandles& h, const ar
         r.conv1 = pd(rh.conv1); r.conv1_b = pd(rh.conv1_b);
         r.conv2 = pd(rh.conv2); r.conv2_b = pd(rh.conv2_b);
         r.norm1 = pd(rh.norm1); r.norm2 = pd(rh.norm2);
+        r.shortcut = nullptr;
+        r.shortcut_b = nullptr;
     }
     w.mid_attn_to_qkv = pd(h.mid_attn_to_qkv);
     w.mid_attn_to_qkv_b = pd(h.mid_attn_to_qkv_b);
@@ -124,6 +144,8 @@ void bind_vae_weights(detail::VaeWeights& w, const VaeWeightHandles& h, const ar
     w.conv_out = pd(h.conv_out);
     w.conv_out_b = pd(h.conv_out_b);
     w.norm_out = pd(h.norm_out);
+    w.post_quant = pd(h.post_quant);
+    w.post_quant_b = pd(h.post_quant_b);
 }
 
 } // namespace ninfer::targets::qwen_image_vae

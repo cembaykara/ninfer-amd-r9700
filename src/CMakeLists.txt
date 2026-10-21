@@ -221,6 +221,8 @@ add_library(ninfer_r9700_qwen_image_21_runtime STATIC
   targets/qwen_image_21/impl/dit_ops.hip
   targets/qwen_image_21/impl/dit_mha.hip
   targets/qwen_image_21/impl/dit_forward.hip
+  targets/qwen_image_21/impl/lora_safetensors.cpp
+  targets/qwen_image_21/impl/lora_apply.hip
   targets/qwen_image_21/impl/package.cpp)
 ninfer_r9700_internal_includes(ninfer_r9700_qwen_image_21_runtime)
 set_target_properties(ninfer_r9700_qwen_image_21_runtime PROPERTIES

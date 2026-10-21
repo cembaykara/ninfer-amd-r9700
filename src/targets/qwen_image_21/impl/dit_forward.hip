@@ -1,4 +1,5 @@
-// One denoise step of the Qwen-Image-2.1 DiT (wave32 gfx1201).
+// The Qwen-Image-2.1 DiT forward and denoise loop (wave32 gfx1201).
+// Mirrors diffusers QwenImage21Transformer2DModel for text-to-image with causal_condition.
 #include "dit_forward.h"
 
 #include "core/device.h"
@@ -6,11 +7,10 @@
 #include "dit_mha.h"
 #include "dit_ops.h"
 #include "ninfer/ops/gelu.h"
-#include "ninfer/ops/linear.h"
 #include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/silu_mul.h"
 
 #include <hip/hip_bfloat16.h>
-#include <hiprand/hiprand.h>
 
 #include <cmath>
 #include <vector>
@@ -18,172 +18,160 @@
 namespace ninfer::targets::qwen_image_21::detail {
 using namespace ninfer::ops;
 
-void dit_forward_step(const DitWeights& w, const Tensor& latent, const Tensor& text_emb, float timestep,
-                      Tensor& velocity, DitWorkspace& ws, int M, int N, hipStream_t stream) {
+namespace {
+
+constexpr int H = DitConfig::hidden;
+constexpr int I = DitConfig::intermediate;
+constexpr int C = DitConfig::in_channels;
+
+float bf16_round(float v) { return static_cast<float>(hip_bfloat16(v)); }
+
+// [S][64] (cos, sin). Text advances one position on all three axes; the image freezes the frame
+// axis at M and lays its tokens on a height/width grid centred on zero.
+void upload_rope(float* dst, int M, int grid_h, int grid_w, hipStream_t stream) {
+    const int S = M + grid_h * grid_w;
+    std::vector<int> frame(S), height(S), width(S);
+    for (int t = 0; t < M; t++) frame[t] = height[t] = width[t] = t;
+    for (int y = 0; y < grid_h; y++) {
+        for (int x = 0; x < grid_w; x++) {
+            const int t = M + y * grid_w + x;
+            frame[t]  = M;
+            height[t] = y - (grid_h - grid_h / 2);
+            width[t]  = x - (grid_w - grid_w / 2);
+        }
+    }
+    std::vector<float> freqs((std::size_t)S * 128);
+    const int axes[3] = {DitConfig::rope_axes[0], DitConfig::rope_axes[1], DitConfig::rope_axes[2]};
+    const std::vector<int>* index[3] = {&frame, &height, &width};
+    for (int t = 0; t < S; t++) {
+        int slot = 0;
+        for (int a = 0; a < 3; a++) {
+            for (int i = 0; i < axes[a] / 2; i++, slot++) {
+                const float inv = 1.0F / std::pow((float)DitConfig::rope_theta, (float)(2 * i) / axes[a]);
+                const float angle = (float)(*index[a])[t] * inv;
+                freqs[(std::size_t)t * 128 + 2 * slot]     = std::cos(angle);
+                freqs[(std::size_t)t * 128 + 2 * slot + 1] = std::sin(angle);
+            }
+        }
+    }
+    HIP_CHECK(hipMemcpyAsync(dst, freqs.data(), freqs.size() * sizeof(float), hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+}
+
+// Column 0: the sampled timestep; column 1: t=0. The reference rounds sigma*1000 and the /1000
+// back to BF16 before the sinusoid, so the same rounding is applied here.
+void upload_timestep(hip_bfloat16* dst, float sigma, hipStream_t stream) {
+    const float t = bf16_round(bf16_round(sigma * 1000.0F) / 1000.0F) * 1000.0F;
+    std::vector<hip_bfloat16> emb(2 * 256);
+    for (int i = 0; i < 128; i++) {
+        const float freq = std::exp(-std::log(10000.0F) * (float)i / 128.0F);
+        emb[i]             = hip_bfloat16(std::cos(t * freq));
+        emb[128 + i]       = hip_bfloat16(std::sin(t * freq));
+        emb[256 + i]       = hip_bfloat16(1.0F);
+        emb[256 + 128 + i] = hip_bfloat16(0.0F);
+    }
+    HIP_CHECK(hipMemcpyAsync(dst, emb.data(), emb.size() * sizeof(hip_bfloat16), hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+}
+
+void forward(const DitWeights& w, const Tensor& latent, float sigma, int M, int N, DitWorkspace& ws,
+             Tensor& velocity, hipStream_t stream) {
     const int S = M + N;
-    const int H = DitConfig::hidden;
-    const int C = DitConfig::in_channels;
 
-    // 1. img = linear(latent, img_in)  [1, N, H]
-    Tensor img(ws.img, DType::BF16, {1, N, H});
-    linear(latent, w.img_in, img, stream);
-
-    // 2-4. txt = out_layer(gelu(in_layer(rmsnorm(text_emb, text_norm, zero_centered))))
-    Tensor txt(ws.txt, DType::BF16, {1, M, H});
-    rmsnorm(text_emb, w.txt_in_text_norm, DitConfig::eps, true, txt, stream);
-    linear(txt, w.txt_in_in_layer, txt, stream);
-    gelu(txt, GeluMode::Tanh, stream);
-    linear(txt, w.txt_in_out_layer, txt, stream);
-
-    // 5. hs = [txt | img]  [1, S, H]
-    Tensor hs(ws.hs, DType::BF16, {1, S, H});
+    Tensor hs(ws.hs, DType::BF16, {H, S});
     HIP_CHECK(hipMemcpyAsync(ws.hs, ws.txt, (std::size_t)M * H * 2, hipMemcpyDeviceToDevice, stream));
-    HIP_CHECK(hipMemcpyAsync(ws.hs + (std::size_t)M * H, ws.img, (std::size_t)N * H * 2, hipMemcpyDeviceToDevice,
-                   stream));
+    Tensor img(ws.hs + (std::size_t)M * H, DType::BF16, {H, N});
+    dit_linear(latent, w.img_in, img, stream);
 
-    // 6. temb = time_embed(timestep)  [1, H]
-    {
-        hip_bfloat16 sin_emb[256];
-        for (int i = 0; i < 128; i++) {
-            const float freq = std::exp(-std::log(10000.0F) * i / 128.0F);
-            const float arg  = timestep * 1000.0F * freq;
-            sin_emb[i]       = hip_bfloat16(std::cos(arg));
-            sin_emb[128 + i] = hip_bfloat16(std::sin(arg));
-        }
-        HIP_CHECK(hipMemcpyAsync(ws.temb, sin_emb, 256 * sizeof(hip_bfloat16), hipMemcpyHostToDevice, stream));
-        Tensor sin_in(ws.temb, DType::BF16, {1, 256});
-        Tensor mid(ws.temb_mid, DType::BF16, {1, H});
-        Tensor temb(ws.temb, DType::BF16, {1, H});
-        linear(sin_in, w.time_embed_linear_1, mid, stream);
-        dit_silu(mid, mid, stream);
-        linear(mid, w.time_embed_linear_2, temb, stream);
-    }
+    upload_timestep(ws.t_sin, sigma, stream);
+    Tensor t_sin(ws.t_sin, DType::BF16, {256, 2});
+    Tensor t_mid(ws.t_mid, DType::BF16, {H, 2});
+    Tensor temb(ws.temb, DType::BF16, {H, 2});
+    Tensor temb_silu(ws.temb_silu, DType::BF16, {H, 2});
+    Tensor mod(ws.mod, DType::BF16, {4 * H, 2});
+    Tensor out_scale(ws.out_scale, DType::BF16, {H, 2});
+    dit_linear(t_sin, w.time_embed_linear_1, t_mid, stream);
+    dit_silu(t_mid, t_mid, stream);
+    dit_linear(t_mid, w.time_embed_linear_2, temb, stream);
+    dit_silu(temb, temb_silu, stream);
+    dit_linear(temb_silu, w.modulation, mod, stream);
+    dit_linear(temb_silu, w.norm_out_linear, out_scale, stream);
+    const hip_bfloat16* mod_img = ws.mod;
+    const hip_bfloat16* mod_txt = ws.mod + 4 * H;
 
-    // 7. mod = linear(silu(temb), modulation)  [1, 4H]
-    Tensor temb(ws.temb, DType::BF16, {1, H});
-    Tensor mod(ws.mod, DType::BF16, {1, 4 * H});
-    dit_silu(temb, Tensor(ws.temb_mid, DType::BF16, {1, H}), stream);
-    Tensor temb_silu(ws.temb_mid, DType::BF16, {1, H});
-    linear(temb_silu, w.modulation, mod, stream);
-
-    // RoPE freqs (precomputed on host, uploaded once per step; shape-dependent only).
-    {
-        // Build [S, 128] complex freqs (re/im interleaved) for the joint [text, image] sequence.
-        const int Hh = (int)std::round(std::sqrt((double)N));  // image is Hh x Hh tokens
-        std::vector<float> freqs((std::size_t)S * 128, 0.0F);
-        std::vector<int> frame(S), height(S), width(S);
-        for (int t = 0; t < M; t++) { frame[t] = t; height[t] = t; width[t] = t; }
-        int hi = 0;
-        for (int h = 0; h < Hh; h++) {
-            for (int wd = 0; wd < Hh; wd++) {
-                frame[M + hi]  = M;
-                height[M + hi] = -(Hh - Hh / 2) + h;
-                width[M + hi]  = -(Hh - Hh / 2) + wd;
-                hi++;
-            }
-        }
-        auto fill_axis = [&](int base_slot, int dim, const std::vector<int>& idx) {
-            const int half = dim / 2;
-            for (int t = 0; t < S; t++) {
-                const float idxf = (float)idx[t];
-                for (int i = 0; i < half; i++) {
-                    const float angle = idxf * std::pow(10000.0F, -2.0F * i / dim);
-                    freqs[(std::size_t)t * 128 + 2 * (base_slot + i)]     = std::cos(angle);
-                    freqs[(std::size_t)t * 128 + 2 * (base_slot + i) + 1] = std::sin(angle);
-                }
-            }
-        };
-        fill_axis(0, 16, frame);    // 8 complex slots
-        fill_axis(8, 56, height);   // 28 complex slots
-        fill_axis(36, 56, width);   // 28 complex slots
-        HIP_CHECK(hipMemcpyAsync(ws.freqs, freqs.data(), freqs.size() * sizeof(float), hipMemcpyHostToDevice,
-                       stream));
-    }
-
-    // 8. 32 layers
-    Tensor q(ws.q, DType::BF16, {1, S, 32, DitConfig::head_dim});
-    Tensor k(ws.k, DType::BF16, {1, S, 32, DitConfig::head_dim});
-    Tensor v(ws.v, DType::BF16, {1, S, 32, DitConfig::head_dim});
-    Tensor attn(ws.attn, DType::BF16, {1, S, H});
-    Tensor x1(ws.x1, DType::BF16, {1, S, H});
-    Tensor x2(ws.x2, DType::BF16, {1, S, H});
-    Tensor mlp(ws.mlp, DType::BF16, {1, S, H});
-    Tensor hs2(ws.hs2, DType::BF16, {1, S, H});
+    Tensor x1(ws.x1, DType::BF16, {H, S});
+    Tensor x2(ws.x2, DType::BF16, {H, S});
+    Tensor q(ws.q, DType::BF16, {H, S});
+    Tensor k(ws.k, DType::BF16, {H, S});
+    Tensor v(ws.v, DType::BF16, {H, S});
+    Tensor qn(ws.qn, DType::BF16, {DitConfig::head_dim, DitConfig::heads, S});
+    Tensor kn(ws.kn, DType::BF16, {DitConfig::head_dim, DitConfig::heads, S});
+    Tensor attn(ws.attn, DType::BF16, {H, S});
+    Tensor gate(ws.gate, DType::BF16, {I, S});
+    Tensor up(ws.up, DType::BF16, {I, S});
+    Tensor act(ws.act, DType::BF16, {I, S});
 
     for (int l = 0; l < DitConfig::layers; l++) {
-        // attention sub-block
         dit_layer_norm(hs, DitConfig::eps, x1, stream);
-        dit_modulate_scale(x1, Tensor(ws.mod, DType::BF16, {1, H}), x1, stream);  // scale1
-        linear(x1, w.to_q[l], q, stream);
-        linear(x1, w.to_k[l], k, stream);
-        linear(x1, w.to_v[l], v, stream);
-        rmsnorm(q, w.norm_q[l], DitConfig::eps, false, q, stream);
-        rmsnorm(k, w.norm_k[l], DitConfig::eps, false, k, stream);
-        dit_rope(ws.freqs, q, k, stream);
-        dit_mha(q, k, v, attn, stream);
-        linear(attn, w.to_out[l], attn, stream);
-        dit_residual_gate(hs, Tensor(ws.mod + H, DType::BF16, {1, H}), attn, hs2, stream);  // gate1
-        // mlp sub-block
-        dit_layer_norm(hs2, DitConfig::eps, x2, stream);
-        dit_modulate_scale(x2, Tensor(ws.mod + 2 * H, DType::BF16, {1, H}), x2, stream);  // scale2
-        // swiglu: down(silu(gate(x2)) * up(x2))
-        Tensor gate(ws.mlp, DType::BF16, {1, S, DitConfig::intermediate});
-        Tensor up(ws.x1, DType::BF16, {1, S, DitConfig::intermediate});
-        linear(x2, w.mlp_gate[l], gate, stream);
-        linear(x2, w.mlp_up[l], up, stream);
-        dit_silu(gate, gate, stream);
-        // silu_mul(gate, up) -> mlp[1,S,intermediate]
-        dit_silu_mul(gate, up, Tensor(ws.mlp, DType::BF16, {1, S, DitConfig::intermediate}), stream);
-        linear(Tensor(ws.mlp, DType::BF16, {1, S, DitConfig::intermediate}), w.mlp_down[l], mlp, stream);
-        dit_residual_gate(hs2, Tensor(ws.mod + 3 * H, DType::BF16, {1, H}), mlp, hs, stream);  // gate2
+        dit_modulate(x1, mod_img + DitConfig::modulation_scale1, mod_txt + DitConfig::modulation_scale1, M,
+                     stream);
+        dit_linear(x1, w.to_q[l], q, stream);
+        dit_linear(x1, w.to_k[l], k, stream);
+        dit_linear(x1, w.to_v[l], v, stream);
+        rmsnorm(q.view({DitConfig::head_dim, DitConfig::heads, S}), w.norm_q[l], DitConfig::eps, false, qn,
+                stream);
+        rmsnorm(k.view({DitConfig::head_dim, DitConfig::heads, S}), w.norm_k[l], DitConfig::eps, false, kn,
+                stream);
+        dit_rope(ws.freqs, qn, kn, stream);
+        Tensor attn_heads = attn.view({DitConfig::head_dim, DitConfig::heads, S});
+        dit_mha(qn, kn, v.view({DitConfig::head_dim, DitConfig::heads, S}), M, attn_heads, stream);
+        dit_linear(attn, w.to_out[l], x2, stream);
+        dit_residual_gate(hs, mod_img + DitConfig::modulation_gate1, mod_txt + DitConfig::modulation_gate1, M,
+                          x2, stream);
+
+        dit_layer_norm(hs, DitConfig::eps, x1, stream);
+        dit_modulate(x1, mod_img + DitConfig::modulation_scale2, mod_txt + DitConfig::modulation_scale2, M,
+                     stream);
+        dit_linear(x1, w.mlp_gate[l], gate, stream);
+        dit_linear(x1, w.mlp_up[l], up, stream);
+        silu_mul(gate, up, act, stream);
+        dit_linear(act, w.mlp_down[l], x2, stream);
+        dit_residual_gate(hs, mod_img + DitConfig::modulation_gate2, mod_txt + DitConfig::modulation_gate2, M,
+                          x2, stream);
     }
 
-    // 9-10. norm_out: layernorm(hs) * (1 + scale)
-    Tensor scale(ws.temb_mid, DType::BF16, {1, H});
-    dit_silu(temb, Tensor(ws.temb_mid, DType::BF16, {1, H}), stream);
-    linear(Tensor(ws.temb_mid, DType::BF16, {1, H}), w.norm_out_linear, scale, stream);
     dit_layer_norm(hs, DitConfig::eps, x1, stream);
-    dit_modulate_scale(x1, scale, x1, stream);
-
-    // 11. out = linear(x1, proj_out)  [1, S, C]
-    Tensor out(ws.out, DType::BF16, {1, S, C});
-    linear(x1, w.proj_out, out, stream);
-
-    // 12. velocity = out[:, M:]  [1, N, C]
-    HIP_CHECK(hipMemcpyAsync(velocity.data, ws.out + (std::size_t)M * C, (std::size_t)N * C * 2,
-                   hipMemcpyDeviceToDevice, stream));
+    dit_modulate(x1, ws.out_scale, ws.out_scale + H, M, stream);
+    const Tensor x1_img(ws.x1 + (std::size_t)M * H, DType::BF16, {H, N});
+    dit_linear(x1_img, w.proj_out, velocity, stream);
 }
 
+} // namespace
 
-// latent += scale * velocity  (elementwise, [1, N, C])
-__global__ void dit_euler_kernel(hip_bfloat16* __restrict__ latent, const hip_bfloat16* __restrict__ velocity,
-                                 float scale, int total) {
-    const int idx = blockIdx.x * 256 + threadIdx.x;
-    if (idx >= total) return;
-    latent[idx] = hip_bfloat16(latent[idx] + scale * velocity[idx]);
-}
-
-
-void dit_denoise(const DitWeights& w, const Tensor& text_emb, int M, int N, Tensor& latent_out,
+void dit_denoise(const DitWeights& w, const Tensor& text_emb, int grid_h, int grid_w, Tensor& latent,
                  DitWorkspace& ws, hipStream_t stream) {
-    const float sigmas[9] = {1.0F, 0.875F, 0.75F, 0.625F, 0.5F, 0.375F, 0.25F, 0.125F, 0.0F};
-    const int C = DitConfig::in_channels;
-    const int total = N * C;
-    Tensor latent(ws.latent, DType::BF16, {1, N, C});
-    Tensor velocity(ws.velocity, DType::BF16, {1, N, C});
-    // init: deterministic zero for the first validate (the PyTorch reference matches it);
-    // real standard-normal noise (hiprand float -> BF16) is a follow-up for the full pipeline.
-    HIP_CHECK(hipMemsetAsync(ws.latent, 0, (std::size_t)total * 2, stream));
-    for (int i = 0; i < 8; i++) {
-        dit_forward_step(w, latent, text_emb, sigmas[i], velocity, ws, M, N, stream);
-        dim3 grid((total + 255) / 256);
-        dim3 block(256);
-        dit_euler_kernel<<<grid, block, 0, stream>>>((hip_bfloat16*)ws.latent,
-                                                     (const hip_bfloat16*)ws.velocity,
-                                                     sigmas[i + 1] - sigmas[i], total);
+    const int M = (int)text_emb.ne[1];
+    const int N = grid_h * grid_w;
+
+    // The text stream does not depend on the timestep: project it once.
+    Tensor x1(ws.x1, DType::BF16, {H, M});
+    Tensor x2(ws.x2, DType::BF16, {H, M});
+    Tensor txt(ws.txt, DType::BF16, {H, M});
+    rmsnorm(text_emb, w.txt_in_text_norm, DitConfig::eps, true, x1, stream);
+    dit_linear(x1, w.txt_in_in_layer, x2, stream);
+    gelu(x2, GeluMode::Tanh, stream);
+    dit_linear(x2, w.txt_in_out_layer, txt, stream);
+
+    upload_rope(ws.freqs, M, grid_h, grid_w, stream);
+
+    Tensor velocity(ws.velocity, DType::BF16, {C, N});
+    const auto& sigmas = DitConfig::sample_sigmas;
+    constexpr int steps = sizeof(DitConfig::sample_sigmas) / sizeof(float);
+    for (int i = 0; i < steps; i++) {
+        const float next = i + 1 < steps ? sigmas[i + 1] : 0.0F;
+        forward(w, latent, sigmas[i], M, N, ws, velocity, stream);
+        dit_euler(latent, velocity, next - sigmas[i], stream);
     }
-    HIP_CHECK(hipMemcpyAsync(latent_out.data, ws.latent, (std::size_t)total * 2, hipMemcpyDeviceToDevice,
-                   stream));
 }
 
 } // namespace ninfer::targets::qwen_image_21::detail

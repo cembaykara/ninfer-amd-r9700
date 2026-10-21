@@ -12,12 +12,16 @@ using artifact::StorageLayout;
 
 artifact::ObjectHandle req(artifact::Binder& b, const std::string& name, int out, int in) {
     const std::array<std::uint64_t, 2> shape{static_cast<std::uint64_t>(out), static_cast<std::uint64_t>(in)};
-    return b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    const auto h_ = b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    b.materialize_on_device(h_);
+    return h_;
 }
 
 artifact::ObjectHandle req1d(artifact::Binder& b, const std::string& name, int size) {
     const std::array<std::uint64_t, 1> shape{static_cast<std::uint64_t>(size)};
-    return b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    const auto h_ = b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    b.materialize_on_device(h_);
+    return h_;
 }
 
 // 5D tensor (the patch-embed conv weight [1152, 3, 2, 16, 16]).
@@ -28,18 +32,28 @@ artifact::ObjectHandle req5d(artifact::Binder& b, const std::string& name,
                                              static_cast<std::uint64_t>(t),
                                              static_cast<std::uint64_t>(ph),
                                              static_cast<std::uint64_t>(pw)};
-    return b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    const auto h_ = b.require_tensor(name, NumericFormat::BF16, StorageLayout::ContiguousLeV1, shape);
+    b.materialize_on_device(h_);
+    return h_;
 }
 
 Weight make_weight(const void* data, int out, int in) {
+    // Same fields as artifact::contiguous_weight: ops::linear and ops::embedding read qdata
+    // and check the byte counts, layout and padded shape.
     Weight w;
-    w.payload = data;
-    w.qtype   = QType::BF16_CTRL;
-    w.shape[0] = out;
-    w.shape[1] = in;
-    w.ndim     = 2;
-    w.n        = out;
-    w.k        = in;
+    w.payload         = data;
+    w.qdata           = data;
+    w.payload_bytes   = static_cast<std::uint64_t>(out) * in * 2;
+    w.qdata_bytes     = w.payload_bytes;
+    w.qtype           = QType::BF16_CTRL;
+    w.layout          = QuantLayout::Contiguous;
+    w.shape[0]        = out;
+    w.shape[1]        = in;
+    w.padded_shape[0] = out;
+    w.padded_shape[1] = in;
+    w.ndim            = 2;
+    w.n               = out;
+    w.k               = in;
     return w;
 }
 

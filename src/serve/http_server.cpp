@@ -477,6 +477,10 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_encoder_encode(req, res);
                  });
+    server_.Post("/v1/ninfer/load",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_ninfer_load(req, res);
+                 });
     server_.Post("/v1/responses/input_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_input_tokens(req, res);
@@ -591,8 +595,18 @@ void HttpServer::handle_vae_decode(const httplib::Request& req, httplib::Respons
         emit_openai_error(res, error);
         return;
     }
-    std::vector<std::uint8_t> image =
-        service_->image_decode(latent_bytes.data(), latent_bytes.size(), H, W);
+    std::vector<std::uint8_t> image;
+    try {
+        image = service_->image_decode(latent_bytes.data(), latent_bytes.size(), H, W);
+    } catch (const std::logic_error& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "wrong_component";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    }
     nlohmann::json response;
     response["image"]  = b64_encode(image.data(), image.size());
     response["height"] = H;
@@ -636,8 +650,64 @@ void HttpServer::handle_dit_denoise(const httplib::Request& req, httplib::Respon
         emit_openai_error(res, error);
         return;
     }
-    std::vector<std::uint8_t> latent =
-        service_->image_denoise(emb_bytes.data(), emb_bytes.size(), M, image_h, image_w);
+    const std::vector<std::uint8_t> noise = b64_decode(body.value("noise", ""));
+    const std::uint64_t seed = body.value("seed", std::uint64_t{0});
+    std::string lora_path;
+    if (body.contains("lora") && !body["lora"].is_null()) {
+        if (!body["lora"].is_string()) {
+            ApiError error;
+            error.status  = 400;
+            error.type    = "invalid_request_error";
+            error.code    = "invalid_lora";
+            error.message = "lora must be a safetensors path";
+            emit_openai_error(res, error);
+            return;
+        }
+        lora_path = body["lora"].get<std::string>();
+    }
+    float lora_scale = 1.F;
+    if (body.contains("scale") && !body["scale"].is_null()) {
+        if (!body["scale"].is_number()) {
+            ApiError error;
+            error.status  = 400;
+            error.type    = "invalid_request_error";
+            error.code    = "invalid_lora";
+            error.message = "scale must be a number";
+            emit_openai_error(res, error);
+            return;
+        }
+        lora_scale = body["scale"].get<float>();
+    }
+    std::vector<std::uint8_t> latent;
+    try {
+        latent = service_->image_denoise(emb_bytes.data(), emb_bytes.size(), M, image_h, image_w, noise,
+                                         seed, lora_path, lora_scale);
+    } catch (const std::invalid_argument& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        const std::string message = e.what();
+        error.code    = message.find("lora") != std::string::npos ? "invalid_lora" : "invalid_noise";
+        error.message = message;
+        emit_openai_error(res, error);
+        return;
+    } catch (const std::logic_error& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "wrong_component";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    } catch (const std::exception& e) {
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.code    = "denoise_failed";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    }
     nlohmann::json response;
     response["latent"]  = b64_encode(latent.data(), latent.size());
     response["image_h"] = image_h;
@@ -668,11 +738,74 @@ void HttpServer::handle_encoder_encode(const httplib::Request& req, httplib::Res
         emit_openai_error(res, error);
         return;
     }
-    std::vector<std::uint8_t> hidden = service_->image_encode(prompt);
+    std::vector<std::uint8_t> hidden;
+    try {
+        hidden = service_->image_encode(prompt);
+    } catch (const std::logic_error& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "wrong_component";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    }
     const int seq = static_cast<int>(hidden.size() / (4096 * 2));  // [1,seq,4096] BF16
     nlohmann::json response;
     response["hidden"] = b64_encode(hidden.data(), hidden.size());
     response["seq"]    = seq;
+    res.set_content(response.dump(), "application/json");
+}
+
+void HttpServer::handle_ninfer_load(const httplib::Request& req, httplib::Response& res) {
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(req.body);
+    } catch (const std::exception& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_json";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    }
+    std::string path;
+    if (body.contains("path") && body["path"].is_string()) { path = body["path"].get<std::string>(); }
+    if (path.empty()) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_path";
+        error.message = "path must be a .ninfer file";
+        emit_openai_error(res, error);
+        return;
+    }
+    ninfer::LoadSummary summary;
+    try {
+        summary = service_->load_artifact(path);
+    } catch (const std::invalid_argument& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_path";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    } catch (const std::exception& e) {
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.code    = "load_failed";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    }
+    nlohmann::json response;
+    response["path"]       = path;
+    response["model_id"]   = summary.model_id;
+    response["weights_id"] = summary.weights_id;
+    response["target"]     = summary.target;
     res.set_content(response.dump(), "application/json");
 }
 

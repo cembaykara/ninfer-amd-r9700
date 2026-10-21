@@ -1,6 +1,6 @@
 #pragma once
 
-// Bind the 132 VAE decoder tensors from the .ninfer artifact to the runtime VaeWeights struct.
+// Bind the 134 VAE decoder tensors from the .ninfer artifact to the runtime VaeWeights struct.
 #include "../vae_forward.h"
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
@@ -11,6 +11,7 @@ struct VaeWeightHandles {
     artifact::ObjectHandle conv_in, conv_in_b;
     struct ResnetH {
         artifact::ObjectHandle conv1, conv1_b, conv2, conv2_b, norm1, norm2, shortcut, shortcut_b;
+        bool has_shortcut = false;
     };
     struct UpBlockH {
         ResnetH resnets[3];
@@ -20,6 +21,7 @@ struct VaeWeightHandles {
     ResnetH mid_resnets[2];
     artifact::ObjectHandle mid_attn_to_qkv, mid_attn_to_qkv_b, mid_attn_proj, mid_attn_proj_b, mid_attn_norm;
     artifact::ObjectHandle conv_out, conv_out_b, norm_out;
+    artifact::ObjectHandle post_quant, post_quant_b;
 };
 
 VaeWeightHandles plan_vae_weights(artifact::Binder& binder);

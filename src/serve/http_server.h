@@ -59,6 +59,8 @@ private:
     void handle_dit_denoise(const httplib::Request& req, httplib::Response& res);
     // Encoder component route (T2I): ids (base64) -> hidden (base64).
     void handle_encoder_encode(const httplib::Request& req, httplib::Response& res);
+    // Replace the loaded .ninfer file. The listen socket stays open.
+    void handle_ninfer_load(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 

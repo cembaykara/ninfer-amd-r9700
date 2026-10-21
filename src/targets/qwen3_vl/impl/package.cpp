@@ -14,6 +14,8 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <type_traits>
+#include <vector>
 
 namespace ninfer::targets::qwen3_vl {
 namespace detail {
@@ -25,6 +27,8 @@ struct LoadPlan::Impl {
 };
 
 struct LoadedModel::Impl {
+    // Owns the device allocations that weights / vision_weights point into.
+    artifact::MaterializedArtifact backing;
     EncoderWeights weights;
     VisionWeights vision_weights;
     // The Qwen3-VL tokenizer (loaded from the Turbo checkpoint's processor/ dir on disk).
@@ -53,6 +57,10 @@ void load_vl_tokenizer(LoadedModel::Impl& impl, const std::string& processor_dir
     impl.tokenizer = std::make_unique<qwen3::frontend_internal::Tokenizer>(resources);
 }
 
+void release_device(void* p) noexcept {
+    if (p != nullptr) { (void)hipFree(p); }
+}
+
 struct EncoderProgram::Impl {
     const LoadedModel* model = nullptr;
     DeviceContext* device    = nullptr;
@@ -63,6 +71,36 @@ struct EncoderProgram::Impl {
     hip_bfloat16* visual_out = nullptr;   // [4096, V]
     hip_bfloat16* deepstack_out = nullptr; // [3][4096, V]
     int vision_p = 0;
+
+    ~Impl() {
+        release_device(workspace.x);
+        release_device(workspace.xn);
+        release_device(workspace.q);
+        release_device(workspace.k);
+        release_device(workspace.v);
+        release_device(workspace.qn);
+        release_device(workspace.kn);
+        release_device(workspace.attn);
+        release_device(workspace.gate);
+        release_device(workspace.up);
+        release_device(workspace.mlp);
+        release_device(workspace.positions);
+        release_device(vision_ws.x);
+        release_device(vision_ws.h);
+        release_device(vision_ws.qkv);
+        release_device(vision_ws.attended);
+        release_device(vision_ws.projected);
+        release_device(vision_ws.up);
+        release_device(vision_ws.down);
+        release_device(vision_ws.merged);
+        release_device(vision_ws.mhidden);
+        release_device(vision_ws.position_ids);
+        release_device(vision_ws.cu_seqlens);
+        release_device(vision_ws.pos_indices);
+        release_device(vision_ws.pos_weights);
+        release_device(visual_out);
+        release_device(deepstack_out);
+    }
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -81,36 +119,43 @@ EncoderProgram::EncoderProgram(std::unique_ptr<Impl> impl) noexcept : impl_(std:
 EncoderProgram::~EncoderProgram() = default;
 
 void EncoderProgram::embed(const Tensor& ids, Tensor& out_hidden, hipStream_t stream) const {
-    const int seq = ids.ne[1];
-    if (!impl_->workspace_ready) {
-        auto& ws = impl_->workspace;
-        const int H = EncoderConfig::hidden;
-        const int heads = EncoderConfig::heads;
+    const int seq = ids.ne[0];
+    auto& ws      = impl_->workspace;
+    if (ws.capacity < seq) {
+        const int H        = EncoderConfig::hidden;
+        const int heads    = EncoderConfig::heads;
         const int kv_heads = EncoderConfig::kv_heads;
         const int head_dim = EncoderConfig::head_dim;
-        const int inter = EncoderConfig::intermediate;
-        auto alloc = [&](std::size_t bytes) {
-            void* p = nullptr;
-            HIP_CHECK(hipMalloc(&p, bytes));
-            return p;
+        const int inter    = EncoderConfig::intermediate;
+        auto grow = [&](auto*& p, std::size_t bytes) {
+            if (p != nullptr) {
+                HIP_CHECK(hipFree(p));
+                p = nullptr;
+            }
+            void* raw = nullptr;
+            HIP_CHECK(hipMalloc(&raw, bytes));
+            p = static_cast<std::remove_reference_t<decltype(p)>>(raw);
         };
-        ws.x    = (hip_bfloat16*)alloc((std::size_t)seq * H * 2);
-        ws.xn   = (hip_bfloat16*)alloc((std::size_t)seq * H * 2);
-        ws.q    = (hip_bfloat16*)alloc((std::size_t)seq * heads * head_dim * 2);
-        ws.k    = (hip_bfloat16*)alloc((std::size_t)seq * kv_heads * head_dim * 2);
-        ws.v    = (hip_bfloat16*)alloc((std::size_t)seq * kv_heads * head_dim * 2);
-        ws.attn = (hip_bfloat16*)alloc((std::size_t)seq * heads * head_dim * 2);
-        ws.gate = (hip_bfloat16*)alloc((std::size_t)seq * inter * 2);
-        ws.up   = (hip_bfloat16*)alloc((std::size_t)seq * inter * 2);
-        ws.mlp  = (hip_bfloat16*)alloc((std::size_t)seq * inter * 2);
-        ws.positions = (int*)alloc((std::size_t)seq * 4);
-        int* hpos = new int[seq];
-        for (int i = 0; i < seq; i++) hpos[i] = i;
-        HIP_CHECK(hipMemcpy(ws.positions, hpos, (std::size_t)seq * 4, hipMemcpyHostToDevice));
-        delete[] hpos;
+        const std::size_t n = (std::size_t)seq * 2;
+        grow(ws.x, n * H);
+        grow(ws.xn, n * H);
+        grow(ws.q, n * heads * head_dim);
+        grow(ws.k, n * kv_heads * head_dim);
+        grow(ws.v, n * kv_heads * head_dim);
+        grow(ws.qn, n * heads * head_dim);
+        grow(ws.kn, n * kv_heads * head_dim);
+        grow(ws.attn, n * heads * head_dim);
+        grow(ws.gate, n * inter);
+        grow(ws.up, n * inter);
+        grow(ws.mlp, n * inter);
+        grow(ws.positions, (std::size_t)seq * 4);
+        std::vector<int> hpos(seq);
+        for (int i = 0; i < seq; i++) { hpos[i] = i; }
+        HIP_CHECK(hipMemcpy(ws.positions, hpos.data(), (std::size_t)seq * 4, hipMemcpyHostToDevice));
+        ws.capacity            = seq;
         impl_->workspace_ready = true;
     }
-    encoder_forward(impl_->model->weights(), ids, out_hidden, impl_->workspace, seq, stream);
+    encoder_forward(impl_->model->weights(), ids, out_hidden, ws, seq, stream);
 }
 
 void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patches_count,
@@ -223,6 +268,7 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     detail::bind_vision_weights(impl->vision_weights, plan.impl_->vision_handles, materialized);
     // The Qwen3-VL tokenizer lives in the Turbo checkpoint's processor/ dir (on disk).
     detail::load_vl_tokenizer(*impl, "/home/tengri/mergen-api/models/hf/Qwen/Qwen-Image-2.1-Turbo/processor");
+    impl->backing = std::move(materialized);
     return std::unique_ptr<detail::LoadedModel>(new detail::LoadedModel(std::move(impl)));
 }
 

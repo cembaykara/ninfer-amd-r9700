@@ -3,11 +3,14 @@
 // For a single frame the temporal dim stays 1 (no temporal upsampling).
 #include "vae_forward.h"
 
+#include "core/device.h"
 #include "ninfer/ops/conv2d_3x3.h"
 #include "ninfer/ops/upsample2d_nearest.h"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
+
+#include <stdexcept>
 
 namespace ninfer::targets::qwen_image_vae {
 namespace detail {
@@ -106,12 +109,28 @@ void conv1x1(const hip_bfloat16* in, const hip_bfloat16* w, const hip_bfloat16* 
     conv1x1_kernel<<<grd, blk, 0, s>>>(in, w, b, cin, cout, hw, out);
 }
 
+__global__ void copy_kernel(const hip_bfloat16* __restrict__ in, std::int64_t n, hip_bfloat16* __restrict__ out) {
+    const std::int64_t i = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = in[i];
+}
+void copy_bf16(const hip_bfloat16* in, std::int64_t n, hip_bfloat16* out, hipStream_t s) {
+    copy_kernel<<<(n + 255) / 256, 256, 0, s>>>(in, n, out);
+}
+
 // Residual block
 void resnet(const VaeWeights::Resnet& r, const hip_bfloat16* in, int cin, int cout, int h, int w,
             hip_bfloat16* out, VaeWorkspace& ws, hipStream_t s) {
     const std::int64_t n_in = (std::int64_t)cin * h * w, n_out = (std::int64_t)cout * h * w;
     const int hw = h * w;
-    if (r.shortcut) conv1x1(in, r.shortcut, r.shortcut_b, cin, cout, hw, ws.a, s);
+    // The conv temps reuse ws.b..ws.g, so the residual has to live in ws.a.
+    const hip_bfloat16* skip = in;
+    if (r.shortcut) {
+        conv1x1(in, r.shortcut, r.shortcut_b, cin, cout, hw, ws.a, s);
+        skip = ws.a;
+    } else if (in != ws.a) {
+        copy_bf16(in, n_in, ws.a, s);
+        skip = ws.a;
+    }
     rms_channels(in, r.norm1, cin, h, w, ws.b, s);
     silu(ws.b, n_in, ws.c, s);
     Tensor in_t = t3(ws.c, cin, h, w), w1 = t4(reinterpret_cast<void*>(const_cast<hip_bfloat16*>(r.conv1)), cout, cin, 3, 3),
@@ -122,8 +141,7 @@ void resnet(const VaeWeights::Resnet& r, const hip_bfloat16* in, int cin, int co
     Tensor in2 = t3(ws.f, cout, h, w), w2 = t4(reinterpret_cast<void*>(const_cast<hip_bfloat16*>(r.conv2)), cout, cout, 3, 3),
            b2 = t1(reinterpret_cast<void*>(const_cast<hip_bfloat16*>(r.conv2_b)), cout), out2 = t3(ws.g, cout, h, w);
     ops::conv2d_3x3(in2, w2, b2, out2, s);
-    if (r.shortcut) add(ws.g, ws.a, n_out, out, s);
-    else add(ws.g, in, n_out, out, s);
+    add(ws.g, skip, n_out, out, s);
 }
 
 // Upsampler (single image): nearest 2x spatial + resample conv 3x3
@@ -178,47 +196,141 @@ __global__ void attn_out_kernel(const hip_bfloat16* __restrict__ attn, const hip
 }
 void mid_attention(const VaeWeights& wts, const hip_bfloat16* in, int dim, int h, int w,
                    hip_bfloat16* out, VaeWorkspace& ws, hipStream_t s) {
+    // Single-head attention over spatial positions, plus the input residual.
+    // `in` must not alias ws.a/ws.e/ws.f/ws.g. qkv is [3*dim, hw] in ws.e.
     const int hw = h * w;
+    const std::int64_t n = (std::int64_t)dim * hw;
     rms_channels(in, wts.mid_attn_norm, dim, h, w, ws.a, s);
-    conv1x1(ws.a, wts.mid_attn_to_qkv, wts.mid_attn_to_qkv_b, dim, 3 * dim, hw, ws.b, s);
-    // q = ws.b[0:dim], k = ws.b[dim:2dim], v = ws.b[2dim:3dim]
-    const hip_bfloat16* q = ws.b;
-    const hip_bfloat16* k = ws.b + (std::int64_t)dim * hw;
-    const hip_bfloat16* v = ws.b + (std::int64_t)2 * dim * hw;
+    conv1x1(ws.a, wts.mid_attn_to_qkv, wts.mid_attn_to_qkv_b, dim, 3 * dim, hw, ws.e, s);
+    const hip_bfloat16* q = ws.e;
+    const hip_bfloat16* k = ws.e + n;
+    const hip_bfloat16* v = ws.e + 2 * n;
     dim3 blk(256);
-    attn_row_kernel<<<hw, blk, 0, s>>>(q, k, dim, hw, ws.c);
-    dim3 grd((std::int64_t)dim * hw / 256 + 1);
-    attn_out_kernel<<<grd, blk, 0, s>>>(ws.c, v, dim, hw, ws.d);
-    // proj: [dim, hw] -> [dim, hw]
-    conv1x1(ws.d, wts.mid_attn_proj, wts.mid_attn_proj_b, dim, dim, hw, out, s);
+    attn_row_kernel<<<hw, blk, 0, s>>>(q, k, dim, hw, ws.f);
+    dim3 grd((n + 255) / 256);
+    attn_out_kernel<<<grd, blk, 0, s>>>(ws.f, v, dim, hw, ws.g);
+    conv1x1(ws.g, wts.mid_attn_proj, wts.mid_attn_proj_b, dim, dim, hw, ws.a, s);
+    add(ws.a, in, n, out, s);
+}
+
+// First-frame DupUp3D. Repeats channels, then unfolds them into a 2x spatial
+// (and temporal) grid. The first temporal copy is dropped, which is what
+// first_chunk=True does for a single image.
+__global__ void dup_up_kernel(const hip_bfloat16* __restrict__ in, int cout, int h, int w,
+                              int factor_t, int factor_s, int repeats, hip_bfloat16* __restrict__ out) {
+    const int xx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int yy = blockIdx.y * blockDim.y + threadIdx.y;
+    const int oc = blockIdx.z;
+    const int oh = h * factor_s;
+    const int ow = w * factor_s;
+    if (xx >= ow || yy >= oh || oc >= cout) return;
+    const int hs = yy / factor_s;
+    const int fs1 = yy - hs * factor_s;
+    const int ws = xx / factor_s;
+    const int fs2 = xx - ws * factor_s;
+    const int ft = factor_t - 1;
+    const int ch_rep = ((oc * factor_t + ft) * factor_s + fs1) * factor_s + fs2;
+    const int src = ch_rep / repeats;
+    out[(std::int64_t)oc * oh * ow + (std::int64_t)yy * ow + xx] =
+        in[(std::int64_t)src * h * w + (std::int64_t)hs * w + ws];
+}
+void dup_up(const hip_bfloat16* in, int cin, int cout, int h, int w, int factor_t, int factor_s,
+            hip_bfloat16* out, hipStream_t s) {
+    const int factor = factor_t * factor_s * factor_s;
+    const int repeats = cout * factor / cin;
+    dim3 block(8, 8, 1);
+    dim3 grid((w * factor_s + 7) / 8, (h * factor_s + 7) / 8, cout);
+    dup_up_kernel<<<grid, block, 0, s>>>(in, cout, h, w, factor_t, factor_s, repeats, out);
 }
 
 } // namespace detail
 
 namespace detail {
 
+// Packed DiT latent [H*W, 64] -> NCHW [64, H, W], then z * std + mean.
+// The tables live in the host function below. A file-scope array in this .hip
+// file is a device symbol, and copying it with hipMemcpyHostToDevice uploads zeros.
+__global__ void scale_latent_kernel(const hip_bfloat16* __restrict__ packed, int h, int w,
+                                    const float* __restrict__ mean, const float* __restrict__ stdv,
+                                    hip_bfloat16* __restrict__ nchw) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int c = blockIdx.z;
+    if (x >= w || y >= h || c >= 64) return;
+    const float z = float(packed[((std::int64_t)y * w + x) * 64 + c]);
+    const float v = z * stdv[c] + mean[c];
+    nchw[(std::int64_t)c * h * w + (std::int64_t)y * w + x] = hip_bfloat16(v);
+}
+
+// Reference `_decode` clamps to [-1, 1]. A non-finite sample stays out of that
+// range and used to crash the PNG writer; map it to 0.
+__global__ void clamp_image_kernel(hip_bfloat16* x, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = float(x[i]);
+    if (!(v == v)) v = 0.0f;
+    else if (v < -1.0f) v = -1.0f;
+    else if (v > 1.0f) v = 1.0f;
+    x[i] = hip_bfloat16(v);
+}
+
 void vae_decode(const VaeWeights& w, const Tensor& latent, Tensor& out_image,
                 VaeWorkspace& ws, hipStream_t s) {
     const int h0 = latent.ne[2], w0 = latent.ne[3];
 
-    Tensor lat = t3(latent.data, kLatentCh, h0, w0),
+    static float* d_mean = nullptr;
+    static float* d_std = nullptr;
+    if (d_mean == nullptr) {
+        // Function-local, so hipcc keeps these in host memory.
+        const float mean_host[64] = {0.51260000f, 0.77210000f, -0.06310000f, 1.35060000f, -0.78550000f, -2.10250000f, -0.34580000f, 1.37220000f, 1.88730000f, -1.71770000f, -0.65100000f, 0.27320000f, 0.75620000f, -0.61630000f, -1.02770000f, 3.83630000f, 2.02100000f, 0.04720000f, 0.93200000f, 2.00870000f, 2.49540000f, -0.13910000f, -1.42490000f, 1.84640000f, -0.52360000f, 1.28260000f, 3.70460000f, -1.30350000f, 2.72860000f, -1.45180000f, -1.90360000f, -1.99550000f, -0.03420000f, -1.02650000f, -0.76360000f, 3.05550000f, 0.07460000f, -3.07510000f, -0.10760000f, 1.73760000f, -1.09140000f, -1.94350000f, -0.27840000f, -1.36800000f, 0.48090000f, -0.44330000f, 0.37640000f, 0.57290000f, -2.05950000f, 1.09600000f, -1.32600000f, -2.02110000f, -5.01790000f, 0.52750000f, 4.01620000f, 1.85050000f, 0.30260000f, 1.93730000f, 1.49370000f, 0.26320000f, 0.55470000f, -1.71210000f, -0.15620000f, 0.03040000f};
+        const float std_host[64] = {3.20010000f, 3.29360000f, 3.43210000f, 3.00910000f, 3.10610000f, 4.03790000f, 4.07050000f, 3.79100000f, 3.07850000f, 3.65000000f, 3.93080000f, 3.09040000f, 2.87780000f, 3.76750000f, 3.73200000f, 5.07560000f, 3.28640000f, 4.03970000f, 3.13170000f, 4.04430000f, 2.92490000f, 3.94540000f, 3.09880000f, 4.24890000f, 3.48960000f, 3.85130000f, 3.93230000f, 3.47190000f, 3.74980000f, 4.28300000f, 3.56940000f, 4.24670000f, 3.90370000f, 3.29470000f, 5.07700000f, 3.50750000f, 3.27000000f, 3.47670000f, 2.80630000f, 5.11250000f, 3.53270000f, 4.78330000f, 3.12860000f, 4.18190000f, 3.85270000f, 3.83120000f, 3.56050000f, 4.38750000f, 3.96240000f, 4.01680000f, 3.56430000f, 4.05500000f, 5.56140000f, 4.29630000f, 4.40800000f, 3.49590000f, 3.87470000f, 3.76080000f, 3.57350000f, 3.14900000f, 3.76620000f, 3.67460000f, 3.45630000f, 3.81610000f};
+        float* mean = nullptr;
+        float* stdv = nullptr;
+        HIP_CHECK(hipMalloc(&mean, sizeof(mean_host)));
+        HIP_CHECK(hipMalloc(&stdv, sizeof(std_host)));
+        HIP_CHECK(hipMemcpyAsync(mean, mean_host, sizeof(mean_host), hipMemcpyHostToDevice, s));
+        HIP_CHECK(hipMemcpyAsync(stdv, std_host, sizeof(std_host), hipMemcpyHostToDevice, s));
+        float uploaded = 0.0f;
+        HIP_CHECK(hipMemcpyAsync(&uploaded, stdv, sizeof(float), hipMemcpyDeviceToHost, s));
+        HIP_CHECK(hipStreamSynchronize(s));
+        // A zero table decodes every latent as the VAE's average color.
+        if (!(uploaded > 1.0f)) {
+            throw std::runtime_error("vae latent scale was not uploaded");
+        }
+        d_mean = mean;
+        d_std = stdv;
+    }
+    scale_latent_kernel<<<dim3((w0 + 7) / 8, (h0 + 7) / 8, 64), dim3(8, 8, 1), 0, s>>>(
+        reinterpret_cast<const hip_bfloat16*>(latent.data), h0, w0, d_mean, d_std, ws.b);
+    conv1x1(ws.b, w.post_quant, w.post_quant_b, kLatentCh, kLatentCh, h0 * w0, ws.c, s);
+
+    Tensor lat = t3(ws.c, kLatentCh, h0, w0),
            win = t4(reinterpret_cast<void*>(const_cast<hip_bfloat16*>(w.conv_in)), kMidDim, kLatentCh, 3, 3),
            bin = t1(reinterpret_cast<void*>(const_cast<hip_bfloat16*>(w.conv_in_b)), kMidDim),
            a0 = t3(ws.a, kMidDim, h0, w0);
     ops::conv2d_3x3(lat, win, bin, a0, s);
 
+    // Mid block is resnet, attention, resnet. Attention adds its own residual.
     resnet(w.mid_resnets[0], ws.a, kMidDim, kMidDim, h0, w0, ws.b, ws, s);
-    resnet(w.mid_resnets[1], ws.b, kMidDim, kMidDim, h0, w0, ws.c, ws, s);
-    mid_attention(w, ws.c, kMidDim, h0, w0, ws.d, ws, s);
+    mid_attention(w, ws.b, kMidDim, h0, w0, ws.c, ws, s);
+    resnet(w.mid_resnets[1], ws.c, kMidDim, kMidDim, h0, w0, ws.d, ws, s);
 
     hip_bfloat16* cur = ws.d; int ch = kMidDim; int hh = h0, ww = w0;
     for (int i = 0; i < 5; ++i) {
-        resnet(w.up_blocks[i].resnets[0], cur, kUpIn[i], kUpOut[i], hh, ww, ws.a, ws, s);
-        resnet(w.up_blocks[i].resnets[1], ws.a, kUpOut[i], kUpOut[i], hh, ww, ws.b, ws, s);
-        resnet(w.up_blocks[i].resnets[2], ws.b, kUpOut[i], kUpOut[i], hh, ww, ws.c, ws, s);
-        cur = ws.c; ch = kUpOut[i];
+        const int cin = kUpIn[i];
+        const int cout = kUpOut[i];
+        // Blocks 0..3 add a duplicate-upsample of their input after the conv upsample.
+        // factor_t is 2 on the 3d blocks (0..2) and 1 on the 2d block (3).
+        if (i < 4) copy_bf16(cur, (std::int64_t)cin * hh * ww, ws.h, s);
+        resnet(w.up_blocks[i].resnets[0], cur, cin, cout, hh, ww, ws.a, ws, s);
+        resnet(w.up_blocks[i].resnets[1], ws.a, cout, cout, hh, ww, ws.b, ws, s);
+        resnet(w.up_blocks[i].resnets[2], ws.b, cout, cout, hh, ww, ws.c, ws, s);
+        cur = ws.c; ch = cout;
         if (i < 4) {
+            const int factor_t = (i < 3) ? 2 : 1;
             upsample(w.up_blocks[i].upsampler, cur, ch, hh, ww, ws.e, ws, s);
+            dup_up(ws.h, cin, cout, hh, ww, factor_t, 2, ws.f, s);
+            add(ws.e, ws.f, (std::int64_t)cout * (2 * hh) * (2 * ww), ws.e, s);
             cur = ws.e; hh *= 2; ww *= 2;
         }
     }
@@ -230,6 +342,9 @@ void vae_decode(const VaeWeights& w, const Tensor& latent, Tensor& out_image,
            bout = t1(reinterpret_cast<void*>(const_cast<hip_bfloat16*>(w.conv_out_b)), kImageCh),
            img = t3(out_image.data, kImageCh, hh, ww);
     ops::conv2d_3x3(gin, wout, bout, img, s);
+    const int nimg = kImageCh * hh * ww;
+    clamp_image_kernel<<<(nimg + 255) / 256, 256, 0, s>>>(
+        reinterpret_cast<hip_bfloat16*>(out_image.data), nimg);
 }
 
 } // namespace detail

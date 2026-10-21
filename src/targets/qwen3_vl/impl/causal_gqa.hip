@@ -1,103 +1,93 @@
-// Causal GQA for the Qwen3-VL text encoder (wave32 gfx1201). One block per (token, head, batch).
+// Causal GQA for the Qwen3-VL text encoder (wave32 gfx1201). One block per (token, head).
+// q/out are {head_dim, heads, tokens}; k/v are {head_dim, kv_heads, tokens}.
 #include "causal_gqa.h"
 
 #include <hip/hip_bfloat16.h>
 
 #include <cfloat>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::targets::qwen3_vl::detail {
 namespace {
 
+constexpr int kThreads = 256;
+constexpr int kWarps   = kThreads / 32;
+
+template <bool IsMax>
+__device__ float block_reduce(float value, float* scratch) {
+    for (int off = 16; off > 0; off >>= 1) {
+        const float other = __shfl_down_sync(0xffffffffull, value, off);
+        value             = IsMax ? fmaxf(value, other) : value + other;
+    }
+    if ((threadIdx.x & 31) == 0) { scratch[threadIdx.x / 32] = value; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float r = scratch[0];
+        for (int w = 1; w < kWarps; w++) { r = IsMax ? fmaxf(r, scratch[w]) : r + scratch[w]; }
+        scratch[0] = r;
+    }
+    __syncthreads();
+    const float r = scratch[0];
+    __syncthreads();
+    return r;
+}
+
 template <int HeadDim, int GqaGroup>
 __global__ void causal_gqa_kernel(const hip_bfloat16* __restrict__ q, const hip_bfloat16* __restrict__ k,
                                   const hip_bfloat16* __restrict__ v, hip_bfloat16* __restrict__ out,
-                                  int tokens, int heads, int kv_heads, float scale) {
+                                  int heads, int kv_heads, float scale) {
     const int token = blockIdx.x;
     const int head  = blockIdx.y;
-    const int batch = blockIdx.z;
-    const int kvh   = head / GqaGroup;  // GQA: query head -> KV head
+    const int kvh   = head / GqaGroup;
     const std::int64_t qstride = (std::int64_t)heads * HeadDim;
     const std::int64_t kstride = (std::int64_t)kv_heads * HeadDim;
-    const std::int64_t qbase = (std::int64_t)batch * tokens * qstride +
-                               (std::int64_t)token * qstride + (std::int64_t)head * HeadDim;
-    const hip_bfloat16* kbase = k + (std::int64_t)batch * tokens * kstride + (std::int64_t)kvh * HeadDim;
-    const hip_bfloat16* vbase = v + (std::int64_t)batch * tokens * kstride + (std::int64_t)kvh * HeadDim;
-    const hip_bfloat16* qrow = q + qbase;
-    hip_bfloat16* orow = out + qbase;
+    const hip_bfloat16* qrow  = q + (std::int64_t)token * qstride + (std::int64_t)head * HeadDim;
+    const hip_bfloat16* kbase = k + (std::int64_t)kvh * HeadDim;
+    const hip_bfloat16* vbase = v + (std::int64_t)kvh * HeadDim;
+    hip_bfloat16* orow        = out + (std::int64_t)token * qstride + (std::int64_t)head * HeadDim;
 
     __shared__ float qs[HeadDim];
-    for (int i = threadIdx.x; i < HeadDim; i += 256) qs[i] = qrow[i];
+    __shared__ float scratch[kWarps];
+    for (int i = threadIdx.x; i < HeadDim; i += kThreads) { qs[i] = (float)qrow[i]; }
     __syncthreads();
 
-    // Pass 1: max and sum-exp over keys j <= token (causal triangle).
-    float m = -FLT_MAX, l = 0.0F;
-    for (int j = threadIdx.x; j <= token; j += 256) {
+    auto score = [&](int j) {
         float dot = 0.0F;
-        for (int d = 0; d < HeadDim; d++) {
-            dot += qs[d] * kbase[(std::int64_t)j * kstride + d];
-        }
-        dot *= scale;
-        const float nm = fmaxf(m, dot);
-        l = l * __expf(m - nm) + __expf(dot - nm);
-        m = nm;
-    }
-    __shared__ float red[2][256 / 32];
-    for (int off = 16; off > 0; off >>= 1) {
-        m = fmaxf(m, __shfl_down_sync(0xffffffffull, m, off));
-        l += __shfl_down_sync(0xffffffffull, l, off);
-    }
-    if ((threadIdx.x & 31) == 0) {
-        red[0][threadIdx.x / 32] = m;
-        red[1][threadIdx.x / 32] = l;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float mm = -FLT_MAX, ll = 0.0F;
-        for (int w = 0; w < 256 / 32; w++) {
-            mm = fmaxf(mm, red[0][w]);
-            ll += red[1][w];
-        }
-        red[0][0] = mm;
-        red[1][0] = ll;
-    }
-    __syncthreads();
-    const float inv_l = 1.0F / red[1][0];
+        for (int d = 0; d < HeadDim; d++) { dot += qs[d] * (float)kbase[(std::int64_t)j * kstride + d]; }
+        return dot * scale;
+    };
 
-    // Pass 2: weighted sum of values over keys j <= token (causal triangle).
-    float acc[(HeadDim + 255) / 256];
-    for (int d = threadIdx.x; d < HeadDim; d += 256) acc[d / 256] = 0.0F;
-    for (int j = 0; j <= token; j++) {
-        float dot = 0.0F;
-        for (int d = 0; d < HeadDim; d++) {
-            dot += qs[d] * kbase[(std::int64_t)j * kstride + d];
+    // Softmax over keys j <= token: the block-wide max first, then the sum against that max.
+    float m = -FLT_MAX;
+    for (int j = threadIdx.x; j <= token; j += kThreads) { m = fmaxf(m, score(j)); }
+    m = block_reduce<true>(m, scratch);
+    float l = 0.0F;
+    for (int j = threadIdx.x; j <= token; j += kThreads) { l += __expf(score(j) - m); }
+    l                 = block_reduce<false>(l, scratch);
+    const float inv_l = 1.0F / l;
+
+    for (int d = threadIdx.x; d < HeadDim; d += kThreads) {
+        float acc = 0.0F;
+        for (int j = 0; j <= token; j++) {
+            acc += __expf(score(j) - m) * inv_l * (float)vbase[(std::int64_t)j * kstride + d];
         }
-        const float w = __expf(dot * scale - red[0][0]) * inv_l;
-        for (int d = threadIdx.x; d < HeadDim; d += 256) {
-            acc[d / 256] += w * vbase[(std::int64_t)j * kstride + d];
-        }
-    }
-    for (int d = threadIdx.x; d < HeadDim; d += 256) {
-        orow[d] = hip_bfloat16(acc[d / 256]);
+        orow[d] = hip_bfloat16(acc);
     }
 }
 
 } // namespace
 
 void causal_gqa(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out, hipStream_t stream) {
-    const int tokens   = q.ne[1];
-    const int heads    = q.ne[2];
-    const int batch    = q.ne[0];
-    const int head_dim = q.ne[3];
-    const int kv_heads = k.ne[2];
+    const int head_dim = q.ne[0];
+    const int heads    = q.ne[1];
+    const int tokens   = q.ne[2];
+    const int kv_heads = k.ne[1];
     const float scale  = 1.0F / sqrtf((float)head_dim);
-    dim3 grid(tokens, heads, batch);
-    dim3 block(256);
-    if (head_dim == 128 && heads == 32 && kv_heads == 8) {
-        causal_gqa_kernel<128, 4><<<grid, block, 0, stream>>>((const hip_bfloat16*)q.data,
-                                                              (const hip_bfloat16*)k.data,
-                                                              (const hip_bfloat16*)v.data,
-                                                              (hip_bfloat16*)out.data, tokens, heads, kv_heads, scale);
+    if (head_dim == 128 && heads == 32 && kv_heads == 8 && k.ne[2] == tokens && v.ne[2] == tokens) {
+        causal_gqa_kernel<128, 4><<<dim3(tokens, heads), dim3(kThreads), 0, stream>>>(
+            (const hip_bfloat16*)q.data, (const hip_bfloat16*)k.data, (const hip_bfloat16*)v.data,
+            (hip_bfloat16*)out.data, heads, kv_heads, scale);
     } else {
         throw std::runtime_error("causal_gqa: unsupported shape");
     }

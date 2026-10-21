@@ -27,21 +27,24 @@ struct EncoderWeights {
     Tensor final_norm;                         // [4096]
 };
 
-// Pre-allocated activation workspace for one prefill (sized for the given seq).
+// Pre-allocated activation workspace for one prefill (sized for `capacity` tokens).
 struct EncoderWorkspace {
-    hip_bfloat16* x    = nullptr;  // [1, seq, 4096] residual stream
-    hip_bfloat16* xn   = nullptr;  // [1, seq, 4096] normalized
-    hip_bfloat16* q    = nullptr;  // [1, seq, 32, 128]
-    hip_bfloat16* k    = nullptr;  // [1, seq, 8, 128]
-    hip_bfloat16* v    = nullptr;  // [1, seq, 8, 128]
-    hip_bfloat16* attn = nullptr;  // [1, seq, 32, 128]
-    hip_bfloat16* gate = nullptr;  // [1, seq, 12288]
-    hip_bfloat16* up   = nullptr;  // [1, seq, 12288]
-    hip_bfloat16* mlp  = nullptr;  // [1, seq, 12288]
-    int* positions     = nullptr;  // [seq]
+    hip_bfloat16* x    = nullptr;  // {4096, seq} residual stream
+    hip_bfloat16* xn   = nullptr;  // {4096, seq} normalized
+    hip_bfloat16* q    = nullptr;  // {32*128, seq}
+    hip_bfloat16* k    = nullptr;  // {8*128, seq}
+    hip_bfloat16* v    = nullptr;  // {8*128, seq}
+    hip_bfloat16* qn   = nullptr;  // {128, 32, seq} QK-normed + rotated q
+    hip_bfloat16* kn   = nullptr;  // {128, 8, seq} QK-normed + rotated k
+    hip_bfloat16* attn = nullptr;  // {128, 32, seq}
+    hip_bfloat16* gate = nullptr;  // {12288, seq}
+    hip_bfloat16* up   = nullptr;  // {12288, seq}
+    hip_bfloat16* mlp  = nullptr;  // {12288, seq}
+    int* positions     = nullptr;  // {seq}
+    int capacity       = 0;
 };
 
-// Run the one-shot prefill: ids [1, seq] I32 -> hidden [1, seq, 4096] BF16.
+// Run the one-shot prefill: ids {seq} I32 -> hidden {4096, seq} BF16 (pre-final-norm).
 void encoder_forward(const EncoderWeights& w, const Tensor& ids, Tensor& hidden,
                      EncoderWorkspace& ws, int seq, hipStream_t stream);
 

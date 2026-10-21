@@ -88,7 +88,7 @@ private:
 } // namespace detail
 
 struct Package {
-    static constexpr std::string_view model_id   = "qwen-image-2.1-vae";
+    static constexpr std::string_view model_id   = "qwen-image-21-vae-decoder";
     static constexpr std::string_view target_key = "qwen_image_vae_r9700";
 
     using WeightsProfile = detail::WeightsProfile;

@@ -1,7 +1,10 @@
 #pragma once
 
-// One denoise step of the Qwen-Image-2.1 DiT: the 32-layer single-stream forward over the
-// joint [text, image] sequence, producing the flow-matching velocity for the image tokens.
+// The Qwen-Image-2.1 DiT: the 32-layer single-stream forward over the joint [text, image]
+// sequence and the flow-matching denoise loop around it.
+//
+// Tensors use the ninfer convention: ne[0] is the innermost extent, so S tokens of H features
+// are {H, S} and per-head tensors are {head_dim, heads, S}.
 #include "config.h"
 #include "core/tensor.h"
 
@@ -10,13 +13,12 @@
 
 namespace ninfer::targets::qwen_image_21::detail {
 
-// The DiT weights, bound from the .ninfer artifact. Matrices are Weight (direct BF16 for now);
-// the small per-head/text norms are plain tensors.
+// The DiT weights, bound from the .ninfer artifact.
 struct DitWeights {
     Weight img_in;                 // [4096, 64]
     Weight txt_in_in_layer;        // [4096, 4096]
     Weight txt_in_out_layer;       // [4096, 4096]
-    Tensor txt_in_text_norm;       // [4096]
+    Tensor txt_in_text_norm;       // [4096], zero-centred
     Weight time_embed_linear_1;    // [4096, 256]
     Weight time_embed_linear_2;    // [4096, 4096]
     Weight modulation;             // [16384, 4096]
@@ -33,33 +35,36 @@ struct DitWeights {
     Weight proj_out;               // [64, 4096]
 };
 
-// Pre-allocated activation workspace for one step (sized for the given M, N).
+// Activation workspace. Sequence buffers hold `capacity` tokens; the conditioning buffers have
+// two columns: 0 = the real timestep (image tokens), 1 = t=0 (text tokens).
 struct DitWorkspace {
-    hip_bfloat16* img  = nullptr;  // [1, N, 4096]
-    hip_bfloat16* txt  = nullptr;  // [1, M, 4096]
-    hip_bfloat16* hs   = nullptr;  // [1, M+N, 4096]
-    hip_bfloat16* hs2  = nullptr;  // [1, M+N, 4096]
-    hip_bfloat16* temb = nullptr;  // [1, 4096]
-    hip_bfloat16* temb_mid = nullptr;  // [1, 4096] timestep-embed intermediate
-    hip_bfloat16* mod  = nullptr;  // [1, 16384]
-    hip_bfloat16* q    = nullptr;  // [1, M+N, 4096]
-    hip_bfloat16* k    = nullptr;  // [1, M+N, 4096]
-    hip_bfloat16* v    = nullptr;  // [1, M+N, 4096]
-    hip_bfloat16* attn = nullptr;  // [1, M+N, 4096]
-    hip_bfloat16* x1   = nullptr;  // [1, M+N, 4096]
-    hip_bfloat16* x2   = nullptr;  // [1, M+N, 4096]
-    hip_bfloat16* mlp  = nullptr;  // [1, M+N, 4096]
-    hip_bfloat16* out  = nullptr;  // [1, M+N, 64]
-    float* freqs       = nullptr;  // [M+N, 128] RoPE freqs (re/im interleaved)
-    hip_bfloat16* latent   = nullptr;  // [1, N, 64] current noisy latent
-    hip_bfloat16* velocity = nullptr;  // [1, N, 64] model velocity
+    int capacity = 0;
+    hip_bfloat16* hs   = nullptr;  // {H, S}
+    hip_bfloat16* x1   = nullptr;  // {H, S}
+    hip_bfloat16* x2   = nullptr;  // {H, S}
+    hip_bfloat16* q    = nullptr;  // {H, S}
+    hip_bfloat16* k    = nullptr;  // {H, S}
+    hip_bfloat16* v    = nullptr;  // {H, S}
+    hip_bfloat16* qn   = nullptr;  // {H, S}
+    hip_bfloat16* kn   = nullptr;  // {H, S}
+    hip_bfloat16* attn = nullptr;  // {H, S}
+    hip_bfloat16* gate = nullptr;  // {I, S}
+    hip_bfloat16* up   = nullptr;  // {I, S}
+    hip_bfloat16* act  = nullptr;  // {I, S}
+    hip_bfloat16* txt  = nullptr;  // {H, S} projected text, computed once per request
+    float* freqs       = nullptr;  // [S][64] (cos, sin)
+    hip_bfloat16* velocity = nullptr;  // {64, S}
+    hip_bfloat16* t_sin     = nullptr;  // {256, 2}
+    hip_bfloat16* t_mid     = nullptr;  // {H, 2}
+    hip_bfloat16* temb      = nullptr;  // {H, 2}
+    hip_bfloat16* temb_silu = nullptr;  // {H, 2}
+    hip_bfloat16* mod       = nullptr;  // {4H, 2}: scale1, gate1, scale2, gate2
+    hip_bfloat16* out_scale = nullptr;  // {H, 2}
 };
 
-void dit_forward_step(const DitWeights& w, const Tensor& latent, const Tensor& text_emb, float timestep,
-                      Tensor& velocity, DitWorkspace& ws, int M, int N, hipStream_t stream);
-
-// Run the full 8-step flow-matching denoise: init noise, 8 Euler steps, return the latent.
-void dit_denoise(const DitWeights& w, const Tensor& text_emb, int M, int N, Tensor& latent_out,
-                     DitWorkspace& ws, hipStream_t stream);
+// Denoise `latent` {64, N} in place. text_emb is {4096, M}; the image is grid_h x grid_w tokens
+// (N = grid_h * grid_w). `latent` holds the initial noise on entry.
+void dit_denoise(const DitWeights& w, const Tensor& text_emb, int grid_h, int grid_w, Tensor& latent,
+                 DitWorkspace& ws, hipStream_t stream);
 
 } // namespace ninfer::targets::qwen_image_21::detail

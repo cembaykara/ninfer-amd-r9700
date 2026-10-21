@@ -93,6 +93,8 @@ def _build_io_specs() -> tuple[TensorSpec, ...]:
         _tensor("vae/conv_out", (IMAGE_CH, UP_OUT[-1], 3, 3), BF16),
         _tensor("vae/conv_out_b", (IMAGE_CH,), BF16),
         _tensor("vae/norm_out", (UP_OUT[-1], 1, 1, 1), BF16),
+        _tensor("vae/post_quant", (LATENT, LATENT, 1, 1), BF16),
+        _tensor("vae/post_quant_b", (LATENT,), BF16),
     )
 
 
@@ -105,9 +107,9 @@ FORMAT_COUNTS = {fmt: sum(s.format == fmt for s in TENSOR_SPECS) for fmt in FORM
 
 
 def validate_inventory() -> None:
-    if len(TENSOR_SPECS) != 132:
-        raise ValueError(f"VAE decoder inventory count is not 132, got {len(TENSOR_SPECS)}")
-    if FORMAT_COUNTS.get(BF16) != 132:
+    if len(TENSOR_SPECS) != 134:
+        raise ValueError(f"VAE decoder inventory count is not 134, got {len(TENSOR_SPECS)}")
+    if FORMAT_COUNTS.get(BF16) != 134:
         raise ValueError(f"VAE decoder inventory must be all-BF16, got {FORMAT_COUNTS}")
 
 
