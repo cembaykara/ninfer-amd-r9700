@@ -169,9 +169,9 @@ public:
     [[nodiscard]] std::vector<std::uint8_t>
     image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                   int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
-                  std::string_view lora_path = {}, float lora_scale = 1.F) const {
+                  const std::vector<ninfer::LoraRef>& loras = {}) const {
         return engine_->image_denoise(emb_bytes, emb_bytes_count, M, image_h, image_w, noise, seed,
-                                     lora_path, lora_scale);
+                                     loras);
     }
     // Encoder (T2I): prompt -> hidden. The active target must be the encoder.
     [[nodiscard]] std::vector<std::uint8_t>

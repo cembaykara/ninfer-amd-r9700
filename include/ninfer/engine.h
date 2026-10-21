@@ -55,6 +55,14 @@ private:
     friend class Engine;
 };
 
+// One LoRA applied to the loaded DiT for a single image_denoise call: a safetensors path and its
+// scale. Entries stack in list order (weight + scale * (B @ A) per entry); the base weights are
+// restored after the call.
+struct LoraRef {
+    std::string path;
+    float scale = 1.F;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -114,12 +122,12 @@ public:
     // DiT: text_emb (host bytes, [1,M,4096] BF16) -> latent (host bytes, [1,N,64] BF16), where
     // image_h x image_w are pixels and N = (image_h/16)*(image_w/16). `noise` is the initial
     // latent in the same layout; when empty it is drawn from `seed`.
-    // `lora_path` empty leaves the loaded DiT weights as they are. A safetensors path adds
-    // `lora_scale` * (B @ A) for this call (omitted scale is 1) and restores the weights after.
+    // `loras` empty leaves the loaded DiT weights as they are. Each entry adds
+    // `scale` * (B @ A) for this call (omitted scale is 1) and the weights are restored after.
     [[nodiscard]] std::vector<std::uint8_t>
     image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                   int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
-                  std::string_view lora_path = {}, float lora_scale = 1.F) const;
+                  const std::vector<LoraRef>& loras = {}) const;
     // Encoder (T2I): prompt text -> hidden (host bytes, [1,seq,4096] BF16).
     // The engine tokenizes the prompt using the Qwen3-VL tokenizer.
     [[nodiscard]] std::vector<std::uint8_t>

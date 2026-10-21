@@ -68,45 +68,48 @@ void restore_weights(const std::filesystem::path& artifact, const std::vector<To
 } // namespace
 
 void denoise_with_lora(const DitWeights& weights, const std::filesystem::path& artifact,
-                       const std::filesystem::path& lora, float scale, hipStream_t stream,
+                       const std::vector<LoraRef>& loras, hipStream_t stream,
                        const std::function<void()>& denoise) {
-    if (!std::isfinite(scale)) { throw std::invalid_argument("image_denoise: lora scale must be finite"); }
     if (artifact.empty()) { throw std::runtime_error("image_denoise: loaded artifact path is empty"); }
-    const std::vector<LoraPatch> patches = read_lora_patches(lora);
 
     std::vector<Touched> touched;
-    touched.reserve(patches.size());
     std::vector<void*> temps;
     const auto free_temps = [&]() {
         for (void* ptr : temps) { (void)hipFree(ptr); }
         temps.clear();
     };
     try {
-        for (const LoraPatch& patch : patches) {
-            const Weight& weight = weight_for(weights, patch);
-            const auto bytes = static_cast<std::uint64_t>(patch.rows) * static_cast<std::uint64_t>(patch.cols) * 2;
-            if (weight.payload == nullptr || weight.n != patch.rows || weight.k != patch.cols ||
-                weight.payload_bytes != bytes) {
-                throw std::runtime_error("image_denoise: loaded DiT tensor does not match " + patch.tensor_name);
+        for (const LoraRef& lora : loras) {
+            if (!std::isfinite(lora.scale)) {
+                throw std::invalid_argument("image_denoise: lora scale must be finite");
             }
-            void* a_dev = nullptr;
-            void* b_dev = nullptr;
-            HIP_CHECK(hipMalloc(&a_dev, patch.a.size() * sizeof(std::uint16_t)));
-            temps.push_back(a_dev);
-            HIP_CHECK(hipMalloc(&b_dev, patch.b.size() * sizeof(std::uint16_t)));
-            temps.push_back(b_dev);
-            HIP_CHECK(hipMemcpyAsync(a_dev, patch.a.data(), patch.a.size() * sizeof(std::uint16_t),
-                                     hipMemcpyHostToDevice, stream));
-            HIP_CHECK(hipMemcpyAsync(b_dev, patch.b.data(), patch.b.size() * sizeof(std::uint16_t),
-                                     hipMemcpyHostToDevice, stream));
-            const int n       = patch.rows * patch.cols;
-            const int threads = 256;
-            const int blocks  = (n + threads - 1) / threads;
-            auto* device_weight = static_cast<std::uint16_t*>(const_cast<void*>(weight.payload));
-            add_lora_kernel<<<blocks, threads, 0, stream>>>(device_weight, patch.rows, patch.cols, patch.rank,
-                                                            static_cast<const std::uint16_t*>(b_dev),
-                                                            static_cast<const std::uint16_t*>(a_dev), scale);
-            touched.push_back(Touched{device_weight, patch.tensor_name, bytes});
+            const std::vector<LoraPatch> patches = read_lora_patches(lora.path);
+            for (const LoraPatch& patch : patches) {
+                const Weight& weight = weight_for(weights, patch);
+                const auto bytes = static_cast<std::uint64_t>(patch.rows) * static_cast<std::uint64_t>(patch.cols) * 2;
+                if (weight.payload == nullptr || weight.n != patch.rows || weight.k != patch.cols ||
+                    weight.payload_bytes != bytes) {
+                    throw std::invalid_argument("image_denoise: lora tensor does not match " + patch.tensor_name);
+                }
+                void* a_dev = nullptr;
+                void* b_dev = nullptr;
+                HIP_CHECK(hipMalloc(&a_dev, patch.a.size() * sizeof(std::uint16_t)));
+                temps.push_back(a_dev);
+                HIP_CHECK(hipMalloc(&b_dev, patch.b.size() * sizeof(std::uint16_t)));
+                temps.push_back(b_dev);
+                HIP_CHECK(hipMemcpyAsync(a_dev, patch.a.data(), patch.a.size() * sizeof(std::uint16_t),
+                                         hipMemcpyHostToDevice, stream));
+                HIP_CHECK(hipMemcpyAsync(b_dev, patch.b.data(), patch.b.size() * sizeof(std::uint16_t),
+                                         hipMemcpyHostToDevice, stream));
+                const int n       = patch.rows * patch.cols;
+                const int threads = 256;
+                const int blocks  = (n + threads - 1) / threads;
+                auto* device_weight = static_cast<std::uint16_t*>(const_cast<void*>(weight.payload));
+                add_lora_kernel<<<blocks, threads, 0, stream>>>(device_weight, patch.rows, patch.cols, patch.rank,
+                                                                static_cast<const std::uint16_t*>(b_dev),
+                                                                static_cast<const std::uint16_t*>(a_dev), lora.scale);
+                touched.push_back(Touched{device_weight, patch.tensor_name, bytes});
+            }
         }
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(stream));

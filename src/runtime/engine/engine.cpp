@@ -12,7 +12,6 @@
 
 #include <hip/hip_bfloat16.h>
 
-#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -494,7 +493,7 @@ Engine::image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_
 std::vector<std::uint8_t>
 Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                       int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
-                      std::string_view lora_path, float lora_scale) const {
+                      const std::vector<LoraRef>& loras) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     std::lock_guard<std::mutex> lock(impl_->model_mu);
     const auto& target = dit_target(impl_->active);
@@ -522,9 +521,6 @@ Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count
     } else if (latent_host.size() != latent_bytes) {
         throw std::invalid_argument("image_denoise: noise byte count does not match the image size");
     }
-    if (!std::isfinite(lora_scale)) {
-        throw std::invalid_argument("image_denoise: lora scale must be finite");
-    }
     struct DeviceBuf {
         void* p = nullptr;
         ~DeviceBuf() {
@@ -539,17 +535,22 @@ Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count
     HIP_CHECK(hipMalloc(&d_latent.p, latent_bytes));
     HIP_CHECK(hipMemcpy(d_latent.p, latent_host.data(), latent_bytes, hipMemcpyHostToDevice));
     Tensor out_latent(d_latent.p, DType::BF16, {64, grid_h * grid_w});
-    // No LoRA name: the weights loaded from the DiT file stay as they are. A name adds
-    // lora_scale * (B @ A) for this call (scale defaults to 1) and restores those weights after.
+    // No LoRA: the weights loaded from the DiT file stay as they are. Each LoRA adds
+    // scale * (B @ A) for this call (scale defaults to 1) and the weights are restored after.
     const auto run_denoise = [&]() {
         target.loaded->program->denoise(emb, grid_h, grid_w, out_latent, impl_->device.stream);
     };
-    if (lora_path.empty()) {
+    if (loras.empty()) {
         run_denoise();
     } else {
+        std::vector<targets::qwen_image_21::detail::LoraRef> refs;
+        refs.reserve(loras.size());
+        for (const LoraRef& ref : loras) {
+            refs.push_back({std::filesystem::path(ref.path), ref.scale});
+        }
         targets::qwen_image_21::detail::denoise_with_lora(
-            target.loaded->model->weights(), impl_->options.artifact_path, std::filesystem::path(lora_path),
-            lora_scale, impl_->device.stream, run_denoise);
+            target.loaded->model->weights(), impl_->options.artifact_path, refs,
+            impl_->device.stream, run_denoise);
     }
     impl_->device.synchronize();
     HIP_CHECK(hipMemcpy(latent_host.data(), d_latent.p, latent_bytes, hipMemcpyDeviceToHost));

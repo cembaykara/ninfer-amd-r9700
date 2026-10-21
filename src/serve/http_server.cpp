@@ -652,8 +652,46 @@ void HttpServer::handle_dit_denoise(const httplib::Request& req, httplib::Respon
     }
     const std::vector<std::uint8_t> noise = b64_decode(body.value("noise", ""));
     const std::uint64_t seed = body.value("seed", std::uint64_t{0});
-    std::string lora_path;
-    if (body.contains("lora") && !body["lora"].is_null()) {
+    std::vector<ninfer::LoraRef> loras;
+    if (body.contains("loras") && !body["loras"].is_null()) {
+        if (!body["loras"].is_array()) {
+            ApiError error;
+            error.status  = 400;
+            error.type    = "invalid_request_error";
+            error.code    = "invalid_lora";
+            error.message = "loras must be an array of {path, scale} objects";
+            emit_openai_error(res, error);
+            return;
+        }
+        for (std::size_t i = 0; i < body["loras"].size(); i++) {
+            const auto& entry = body["loras"][i];
+            if (!entry.is_object() || !entry.contains("path") || !entry["path"].is_string()) {
+                ApiError error;
+                error.status  = 400;
+                error.type    = "invalid_request_error";
+                error.code    = "invalid_lora";
+                error.message = "loras entries must be objects with a path string";
+                emit_openai_error(res, error);
+                return;
+            }
+            ninfer::LoraRef ref;
+            ref.path  = entry["path"].get<std::string>();
+            ref.scale = 1.F;
+            if (entry.contains("scale") && !entry["scale"].is_null()) {
+                if (!entry["scale"].is_number()) {
+                    ApiError error;
+                    error.status  = 400;
+                    error.type    = "invalid_request_error";
+                    error.code    = "invalid_lora";
+                    error.message = "loras scale must be a number";
+                    emit_openai_error(res, error);
+                    return;
+                }
+                ref.scale = entry["scale"].get<float>();
+            }
+            loras.push_back(std::move(ref));
+        }
+    } else if (body.contains("lora") && !body["lora"].is_null()) {
         if (!body["lora"].is_string()) {
             ApiError error;
             error.status  = 400;
@@ -663,25 +701,27 @@ void HttpServer::handle_dit_denoise(const httplib::Request& req, httplib::Respon
             emit_openai_error(res, error);
             return;
         }
-        lora_path = body["lora"].get<std::string>();
-    }
-    float lora_scale = 1.F;
-    if (body.contains("scale") && !body["scale"].is_null()) {
-        if (!body["scale"].is_number()) {
-            ApiError error;
-            error.status  = 400;
-            error.type    = "invalid_request_error";
-            error.code    = "invalid_lora";
-            error.message = "scale must be a number";
-            emit_openai_error(res, error);
-            return;
+        ninfer::LoraRef ref;
+        ref.path  = body["lora"].get<std::string>();
+        ref.scale = 1.F;
+        if (body.contains("scale") && !body["scale"].is_null()) {
+            if (!body["scale"].is_number()) {
+                ApiError error;
+                error.status  = 400;
+                error.type    = "invalid_request_error";
+                error.code    = "invalid_lora";
+                error.message = "scale must be a number";
+                emit_openai_error(res, error);
+                return;
+            }
+            ref.scale = body["scale"].get<float>();
         }
-        lora_scale = body["scale"].get<float>();
+        loras.push_back(std::move(ref));
     }
     std::vector<std::uint8_t> latent;
     try {
         latent = service_->image_denoise(emb_bytes.data(), emb_bytes.size(), M, image_h, image_w, noise,
-                                         seed, lora_path, lora_scale);
+                                         seed, loras);
     } catch (const std::invalid_argument& e) {
         ApiError error;
         error.status  = 400;
