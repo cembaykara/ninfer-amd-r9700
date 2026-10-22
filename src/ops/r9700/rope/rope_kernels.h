@@ -87,8 +87,12 @@ __device__ __forceinline__ void coefficient(const std::int32_t* positions, int t
         int axis        = 0;
         float frequency = 0.0F;
         if constexpr (P == Profile::Vision2D) {
+            // Vision2D positions are token-major [T, 2]: (h, w) per token.
             axis      = pair / 18;
             frequency = kVisionFrequency[pair % 18];
+            const float angle = static_cast<float>(positions[token * 2 + axis]) * frequency;
+            sincosf(angle, sine, cosine);
+            return;
         } else {
             if constexpr (P == Profile::TextMrope) { axis = pair % 3; }
             frequency = kTextFrequency[pair];
