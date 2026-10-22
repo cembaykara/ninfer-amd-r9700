@@ -257,7 +257,6 @@ V2VImagePrep preprocess_v2v_image(const std::uint8_t* bytes, std::size_t byte_co
                 }
             }
         }
-    }
     return out;
 }
 
