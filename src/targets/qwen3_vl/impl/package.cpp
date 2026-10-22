@@ -11,6 +11,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -248,6 +250,18 @@ void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patc
     vision_forward(impl_->model->vision_weights(), patches, P, 1,
                    position_ids, cu_seqlens, pos_indices, pos_weights,
                    impl_->visual_out, impl_->deepstack_out, impl_->vision_ws, stream);
+
+    // Debug: dump the ViT outputs for numerical comparison (NINFER_V2V_DUMP=path).
+    // Layout: int32 V, then merged [4096, V] bf16, then deepstack [4096, 3V] bf16.
+    if (const char* dump = std::getenv("NINFER_V2V_DUMP")) {
+        std::vector<char> buf((std::size_t)(4 + 4 * V * H * 2));
+        std::memcpy(buf.data(), &V, 4);
+        std::memcpy(buf.data() + 4, impl_->visual_out, (std::size_t)V * H * 2);
+        std::memcpy(buf.data() + 4 + (std::size_t)V * H * 2, impl_->deepstack_out,
+                    (std::size_t)3 * V * H * 2);
+        std::ofstream f(dump, std::ios::binary);
+        f.write(buf.data(), (std::streamsize)buf.size());
+    }
 
     // 2. text stack with deepstack injection
     const hip_bfloat16* ds[3] = {
