@@ -58,6 +58,12 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
         linear(xn, w.q_proj[l], q, stream);
         linear(xn, w.k_proj[l], k, stream);
         linear(xn, w.v_proj[l], v, stream);
+        if (l == 1 && std::getenv("NINFER_V2V_V_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream vf(std::getenv("NINFER_V2V_V_DUMP"), std::ios::binary);
+            vf.write(reinterpret_cast<const char*>(v.data),
+                     (std::streamsize)(std::size_t)(kv_heads * head_dim) * seq * 2);
+        }
 
         Tensor qn(ws.qn, DType::BF16, {head_dim, heads, seq});
         Tensor kn(ws.kn, DType::BF16, {head_dim, kv_heads, seq});
