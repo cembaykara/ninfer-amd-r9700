@@ -46,6 +46,9 @@ services:
       - type: bind
         source: /home/tengri/mergen-api/logs
         target: /logs
+    environment:
+      # Temporary: ViT numerical check (writes /logs/eng_vit.bin on each v2v encode).
+      NINFER_V2V_DUMP: /logs/eng_vit.bin
     shm_size: 1gb
     mem_limit: 24g
     memswap_limit: 24g

@@ -12,6 +12,11 @@
 #include "ninfer/ops/vision_attention.h"
 #include "ninfer/ops/vision_pos_embed.h"
 
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <vector>
+
 #include <hip/hip_bfloat16.h>
 
 namespace ninfer::targets::qwen3_vl::detail {
@@ -37,6 +42,16 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
     HIP_CHECK(hipMemcpyAsync(ws.pos_weights, pos_weights_host, sizeof(float) * 4 * P,
                              hipMemcpyHostToDevice, stream));
 
+    // Debug: staged dumps of the residual stream (NINFER_VIT_STAGES=path).
+    std::vector<char> stages_buf;
+    auto dump_stage = [&]() {
+        if (std::getenv("NINFER_VIT_STAGES") == nullptr) return;
+        std::size_t off = stages_buf.size();
+        stages_buf.resize(off + (std::size_t)P * H * 2);
+        HIP_CHECK(hipMemcpy(stages_buf.data() + off, ws.x, (std::size_t)P * H * 2,
+                            hipMemcpyDeviceToHost));
+    };
+
     // 1. patches FP32 [1536, P] (feature-major) -> BF16, then patch embed
     // (linear [1152,1536] + bias). The input is wider than the hidden, so it gets its
     // own buffer (the linear op rejects an in-place output).
@@ -46,12 +61,14 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
     Tensor x(ws.x, DType::BF16, {H, P});
     linear(x_in, w.patch_embed, x, stream);
     add_bias(w.patch_embed_bias, x, stream);
+    dump_stage();  // after patch_embed + bias
 
     // 2. position embed (4-corner interpolation). table is [1152, 2304] (zero-copy view).
     Tensor pos_table(w.pos_embed.data, DType::BF16, {H, VisionConfig::pos_embed});
     Tensor pos_idx(ws.pos_indices, DType::I32, {4, P});
     Tensor pos_wt(ws.pos_weights, DType::FP32, {4, P});
     vision_pos_embed_add(pos_table, pos_idx, pos_wt, x, stream);
+    dump_stage();  // after pos_embed
 
     // 3. the 27 blocks.
     Tensor qkv_t(ws.qkv, DType::BF16, {3 * H, P});
@@ -93,6 +110,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
         linear(up_t, w.fc2[l], down_t, stream);
         add_bias(w.fc2_bias[l], down_t, stream);
         residual_add(down_t, x, stream);
+        if (l == 0) { dump_stage(); }  // after block 0
 
         // deepstack capture at layers 8/16/24
         for (int d = 0; d < VisionConfig::deepstack_layers; d++) {
@@ -113,6 +131,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
         }
     }
 
+    dump_stage();  // pre-merger (after block 26)
     // 4. main merger: norm [1152,P] -> view [4608,V] -> fc1 -> gelu -> fc2 -> [4096,V]
     Tensor normed(ws.h, DType::BF16, {H, P});
     layer_norm(x, w.merger_norm_w, w.merger_norm_b, eps, normed, stream);
@@ -124,6 +143,11 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
     Tensor out(merged_out, DType::BF16, {VisionConfig::out_hidden, V});
     linear(mhidden, w.merger_fc2, out, stream);
     add_bias(w.merger_fc2_bias, out, stream);
+    if (std::getenv("NINFER_VIT_STAGES") != nullptr) {
+        std::ofstream f(std::getenv("NINFER_VIT_STAGES"), std::ios::binary);
+        f.write(reinterpret_cast<const char*>(&P), 4);
+        f.write(stages_buf.data(), (std::streamsize)stages_buf.size());
+    }
 }
 
 } // namespace ninfer::targets::qwen3_vl::detail
