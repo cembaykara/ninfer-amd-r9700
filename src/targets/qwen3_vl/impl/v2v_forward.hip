@@ -52,6 +52,15 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
 
         rope_mrope(qn, ws.positions, seq, (float)EncoderConfig::rope_theta, stream);
         rope_mrope(kn, ws.positions, seq, (float)EncoderConfig::rope_theta, stream);
+        if (l == 0 && std::getenv("NINFER_V2V_QK_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream qf(std::getenv("NINFER_V2V_QK_DUMP"), std::ios::binary);
+            // qn [128, 32, seq] -> dump full; kn [128, 8, seq]
+            qf.write(reinterpret_cast<const char*>(qn.data),
+                     (std::streamsize)(std::size_t)head_dim * heads * seq * 2);
+            qf.write(reinterpret_cast<const char*>(kn.data),
+                     (std::streamsize)(std::size_t)head_dim * kv_heads * seq * 2);
+        }
 
         Tensor attn(ws.attn, DType::BF16, {head_dim, heads, seq});
         causal_gqa(qn, kn, v.view({head_dim, kv_heads, seq}), attn, stream);
