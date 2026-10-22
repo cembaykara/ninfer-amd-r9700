@@ -39,6 +39,12 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
     // 3. The 36-layer stack (with deepstack injection at layers 0/1/2).
     for (int l = 0; l < EncoderConfig::layers; l++) {
         rmsnorm(x, w.input_layernorm[l], eps, false, xn, stream);
+        if (l == 0 && std::getenv("NINFER_V2V_XN_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream xf(std::getenv("NINFER_V2V_XN_DUMP"), std::ios::binary);
+            xf.write(reinterpret_cast<const char*>(xn.data),
+                     (std::streamsize)(std::size_t)H * seq * 2);
+        }
 
         Tensor q(ws.q, DType::BF16, {heads * head_dim, seq});
         Tensor k(ws.k, DType::BF16, {kv_heads * head_dim, seq});
