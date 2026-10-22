@@ -9,6 +9,8 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/silu_mul.h"
 
+#include <fstream>
+
 #include <hip/hip_bfloat16.h>
 
 namespace ninfer::targets::qwen3_vl::detail {
