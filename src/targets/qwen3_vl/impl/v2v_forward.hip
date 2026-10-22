@@ -62,7 +62,7 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
             HIP_CHECK(hipStreamSynchronize(stream));
             std::ofstream qf(std::getenv("NINFER_V2V_QK_DUMP"), std::ios::binary);
             // before M-RoPE: qn [128,32,seq], kn [128,8,seq]
-            qf.write(reinterpret_cast<const const char*>(qn.data),
+            qf.write(reinterpret_cast<const char*>(qn.data),
                      (std::streamsize)(std::size_t)head_dim * heads * seq * 2);
             qf.write(reinterpret_cast<const char*>(kn.data),
                      (std::streamsize)(std::size_t)head_dim * kv_heads * seq * 2);
