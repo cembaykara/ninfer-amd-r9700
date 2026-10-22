@@ -51,6 +51,7 @@ services:
       NINFER_V2V_DUMP: /logs/eng_vit.bin
       NINFER_VIT_STAGES: /logs/eng_vit_stages.bin
       NINFER_V2V_HIDDEN_DUMP: /logs/eng_hidden.bin
+      NINFER_V2V_QK_DUMP: /logs/eng_qk.bin
     shm_size: 1gb
     mem_limit: 24g
     memswap_limit: 24g
