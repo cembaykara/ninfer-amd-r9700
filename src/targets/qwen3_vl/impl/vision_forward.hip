@@ -180,12 +180,12 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
                             hipMemcpyDeviceToHost));
         f.write(ibuf.data(), (std::streamsize)ibuf.size());
         // patch_embed weight [1152, 1536] bf16, then its bias [1152]
-        std::vector<char> wbuf((std::size_t)H * 1536 * 2 + H * 2);
-        HIP_CHECK(hipMemcpy(wbuf.data(), w.patch_embed.qdata, (std::size_t)H * 1536 * 2,
+        std::vector<char> wbuf2((std::size_t)H * 1536 * 2 + H * 2);
+        HIP_CHECK(hipMemcpy(wbuf2.data(), w.patch_embed.qdata, (std::size_t)H * 1536 * 2,
                             hipMemcpyDeviceToHost));
-        HIP_CHECK(hipMemcpy(wbuf.data() + (std::size_t)H * 1536 * 2, w.patch_embed_bias.data,
+        HIP_CHECK(hipMemcpy(wbuf2.data() + (std::size_t)H * 1536 * 2, w.patch_embed_bias.data,
                             (std::size_t)H * 2, hipMemcpyDeviceToHost));
-        f.write(wbuf.data(), (std::streamsize)wbuf.size());
+        f.write(wbuf2.data(), (std::streamsize)wbuf2.size());
     }
 }
 
