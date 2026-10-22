@@ -45,6 +45,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
     // Debug: staged dumps of the residual stream (NINFER_VIT_STAGES=path).
     std::vector<char> stages_buf;
     std::vector<char> qkv_buf;  // block 0 qkv [3456, P] bf16
+    std::vector<char> att_buf;  // block 0 attention out [1152, P] bf16
     auto dump_stage = [&]() {
         if (std::getenv("NINFER_VIT_STAGES") == nullptr) return;
         HIP_CHECK(hipStreamSynchronize(stream));
@@ -89,8 +90,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
             std::vector<char> hbuf((std::size_t)H * P * 2);
             HIP_CHECK(hipMemcpy(hbuf.data(), h_t.data, (std::size_t)H * P * 2,
                                 hipMemcpyDeviceToHost));
-            std::ofstream hf(std::getenv("NINFER_VIT_STAGES"), std::ios::binary | std::ios::app);
-            hf.write(hbuf.data(), (std::streamsize)hbuf.size());
+            (void)hbuf;  // kept for layout; written in the main dump below
         }
         linear(h_t, w.qkv[l], qkv_t, stream);
         add_bias(w.qkv_bias[l], qkv_t, stream);
@@ -114,6 +114,12 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
                               {VisionConfig::head_dim, VisionConfig::heads, P});
         // single image: fixed segment length P, no workspace needed
         vision_attention(q, k, v, P, attended_heads, stream);
+        if (l == 0 && std::getenv("NINFER_VIT_STAGES") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            att_buf.resize((std::size_t)H * P * 2);
+            HIP_CHECK(hipMemcpy(att_buf.data(), attended_t.data, (std::size_t)H * P * 2,
+                                hipMemcpyDeviceToHost));
+        }
         linear(attended_t, w.proj[l], projected_t, stream);
         add_bias(w.proj_bias[l], projected_t, stream);
         residual_add(projected_t, x, stream);
@@ -171,6 +177,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
                             (std::size_t)P * 4 * sizeof(float), hipMemcpyDeviceToHost));
         f.write(cbuf.data(), (std::streamsize)cbuf.size());
         f.write(qkv_buf.data(), (std::streamsize)qkv_buf.size());
+        f.write(att_buf.data(), (std::streamsize)att_buf.size());
         // block 0 qkv weight [3456, 1152] bf16
         std::vector<char> wbuf((std::size_t)3 * H * H * 2);
         HIP_CHECK(hipMemcpy(wbuf.data(), w.qkv[0].qdata, (std::size_t)3 * H * H * 2,
