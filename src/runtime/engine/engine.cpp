@@ -666,6 +666,11 @@ Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_by
     HIP_CHECK(hipFree(d_ids));
     HIP_CHECK(hipFree(d_patches));
     HIP_CHECK(hipFree(d_hidden));
+    if (const char* hd = std::getenv("NINFER_V2V_HIDDEN_DUMP")) {
+        std::ofstream hf(hd, std::ios::binary);
+        hf.write(reinterpret_cast<const char*>(hidden_host.data()),
+                 (std::streamsize)hidden_host.size());
+    }
     return hidden_host;
 }
 
