@@ -5309,8 +5309,9 @@ hipError_t w8g32_linear(const W8G32LinearArgs& args, hipStream_t stream) noexcep
 }
 
 hipError_t bf16_linear_prefill(const Bf16LinearArgs& args, hipStream_t stream) noexcept {
-    // DEBUG: force the baseline to bisect the wmma16 shape bug.
-    return bf16_linear_baseline(args, stream);
+    // Fixed prefill dispatch selected only after gfx1201 qualification. The
+    // wave32 BF16xBF16->FP32 WMMA route retains represented BF16 operands.
+    return bf16_linear_wmma16(args, stream);
 }
 
 hipError_t w8g32_linear_prefill(const W8G32LinearArgs& args, hipStream_t stream) noexcept {
