@@ -54,6 +54,7 @@ services:
       NINFER_V2V_QK_DUMP: /logs/eng_qk.bin
       NINFER_V2V_XN_DUMP: /logs/eng_xn.bin
       NINFER_V2V_EMB_DUMP: /logs/eng_emb.bin
+      NINFER_V2V_L0OUT_DUMP: /logs/eng_l0out.bin
     shm_size: 1gb
     mem_limit: 24g
     memswap_limit: 24g
