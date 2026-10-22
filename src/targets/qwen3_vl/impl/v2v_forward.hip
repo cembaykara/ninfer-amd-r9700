@@ -90,6 +90,12 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
 
         Tensor attn_flat = attn.view({heads * head_dim, seq});
         linear(attn_flat, w.o_proj[l], xn, stream);
+        if (l == 1 && std::getenv("NINFER_V2V_ATTN_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream af(std::getenv("NINFER_V2V_ATTN_DUMP"), std::ios::binary);
+            af.write(reinterpret_cast<const char*>(xn.data),
+                     (std::streamsize)(std::size_t)H * seq * 2);
+        }
         residual_add(xn, x, stream);
 
         rmsnorm(x, w.post_attention_layernorm[l], eps, false, xn, stream);
@@ -101,6 +107,12 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
         linear(xn, w.up_proj[l], up, stream);
         silu_mul(gate, up, mlp, stream);
         linear(mlp, w.down_proj[l], xn, stream);
+        if (l == 1 && std::getenv("NINFER_V2V_MLP_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream mf(std::getenv("NINFER_V2V_MLP_DUMP"), std::ios::binary);
+            mf.write(reinterpret_cast<const char*>(xn.data),
+                     (std::streamsize)(std::size_t)H * seq * 2);
+        }
         residual_add(xn, x, stream);
         if (std::getenv("NINFER_V2V_LAYER_DUMP") != nullptr &&
             (l == 0 || l == 1 || l == 2 || l == 5 || l == 10 || l == 20 || l == 35)) {
