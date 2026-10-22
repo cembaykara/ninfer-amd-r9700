@@ -179,7 +179,9 @@ void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patc
     // M-RoPE position table [3][seq] (axis-major): text tokens (i,i,i); visual tokens
     // (start, start+h_m, start+w_m) over the merged grid (grid_h/2 x grid_w/2), row-major.
     {
-        const int V    = P / VisionConfig::merge_unit;
+        if (grid_h % 2 != 0 || grid_w % 2 != 0 || (grid_h / 2) * (grid_w / 2) != V) {
+            throw std::runtime_error("v2v: merged grid does not match the patch count");
+        }
         const int gw_m = grid_w / 2;
         std::vector<int> hpos((std::size_t)seq * 3);
         for (int i = 0; i < seq; i++) {
