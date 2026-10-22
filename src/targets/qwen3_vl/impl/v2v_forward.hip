@@ -102,6 +102,12 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
         silu_mul(gate, up, mlp, stream);
         linear(mlp, w.down_proj[l], xn, stream);
         residual_add(xn, x, stream);
+        if (l == 0 && std::getenv("NINFER_V2V_L0OUT_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream lf(std::getenv("NINFER_V2V_L0OUT_DUMP"), std::ios::binary);
+            lf.write(reinterpret_cast<const char*>(x.data),
+                     (std::streamsize)(std::size_t)H * seq * 2);
+        }
 
         // deepstack injection at text layers 0/1/2
         if (l < 3 && deepstack != nullptr) {
