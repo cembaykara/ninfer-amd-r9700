@@ -58,6 +58,7 @@ services:
       NINFER_V2V_ATTN_DUMP: /logs/eng_attn1.bin
       NINFER_V2V_MLP_DUMP: /logs/eng_mlp1.bin
       NINFER_V2V_V_DUMP: /logs/eng_v1.bin
+      NINFER_V2V_XN1_DUMP: /logs/eng_xn1.bin
     shm_size: 1gb
     mem_limit: 24g
     memswap_limit: 24g
