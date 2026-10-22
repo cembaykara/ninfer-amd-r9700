@@ -638,21 +638,13 @@ Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_by
     HIP_CHECK(hipMemcpy(d_ids, ids.data(), ids_bytes, hipMemcpyHostToDevice));
     Tensor ids_tensor(d_ids, DType::I32, {seq});
 
-    // ViT patches are computed on the host patch-major [P][1536]; the ViT reads them
-    // feature-major [1536, P] (the linear op stores dim zero fastest), so transpose
-    // before the copy.
+    // ViT patches are computed on the host patch-major [P][1536]; the linear op stores
+    // dim zero (features) fastest, which is exactly this layout, so copy as-is.
     constexpr int kPatchFeatures = 1536;  // 3 channels * 2 temporal * 16 * 16
     const std::size_t patches_bytes = (std::size_t)P * kPatchFeatures * sizeof(float);
-    std::vector<float> patches_fm(patches_bytes / sizeof(float));
-    for (int i = 0; i < P; ++i) {
-        for (int k = 0; k < kPatchFeatures; ++k) {
-            patches_fm[static_cast<std::size_t>(k) * P + i] =
-                prep.patches[static_cast<std::size_t>(i) * kPatchFeatures + k];
-        }
-    }
     void* d_patches = nullptr;
     HIP_CHECK(hipMalloc(&d_patches, patches_bytes));
-    HIP_CHECK(hipMemcpy(d_patches, patches_fm.data(), patches_bytes, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_patches, prep.patches.data(), patches_bytes, hipMemcpyHostToDevice));
 
     const std::size_t row_bytes    = (std::size_t)4096 * 2;
     const std::size_t hidden_bytes = (std::size_t)seq * row_bytes;
