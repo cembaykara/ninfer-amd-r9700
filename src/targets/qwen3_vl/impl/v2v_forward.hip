@@ -50,8 +50,8 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
         rmsnorm(q.view({head_dim, heads, seq}), w.q_norm[l], eps, false, qn, stream);
         rmsnorm(k.view({head_dim, kv_heads, seq}), w.k_norm[l], eps, false, kn, stream);
 
-        rope_neox(qn, ws.positions, (float)EncoderConfig::rope_theta, stream);
-        rope_neox(kn, ws.positions, (float)EncoderConfig::rope_theta, stream);
+        rope_mrope(qn, ws.positions, seq, (float)EncoderConfig::rope_theta, stream);
+        rope_mrope(kn, ws.positions, seq, (float)EncoderConfig::rope_theta, stream);
 
         Tensor attn(ws.attn, DType::BF16, {head_dim, heads, seq});
         causal_gqa(qn, kn, v.view({head_dim, kv_heads, seq}), attn, stream);

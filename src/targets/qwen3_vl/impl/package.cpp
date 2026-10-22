@@ -147,10 +147,13 @@ void ensure_text_workspace(EncoderWorkspace& ws, int seq) {
     grow(ws.gate, n * inter);
     grow(ws.up, n * inter);
     grow(ws.mlp, n * inter);
-    grow(ws.positions, (std::size_t)seq * 4);
-    std::vector<int> hpos(seq);
-    for (int i = 0; i < seq; i++) { hpos[i] = i; }
-    HIP_CHECK(hipMemcpy(ws.positions, hpos.data(), (std::size_t)seq * 4, hipMemcpyHostToDevice));
+    grow(ws.positions, (std::size_t)seq * 3 * 4);
+    std::vector<int> hpos((std::size_t)seq * 3);
+    for (int axis = 0; axis < 3; axis++) {
+        for (int i = 0; i < seq; i++) { hpos[static_cast<std::size_t>(axis) * seq + i] = i; }
+    }
+    HIP_CHECK(hipMemcpy(ws.positions, hpos.data(), (std::size_t)seq * 3 * 4,
+                        hipMemcpyHostToDevice));
     ws.capacity = seq;
 }
 
@@ -161,9 +164,9 @@ void EncoderProgram::embed(const Tensor& ids, Tensor& out_hidden, hipStream_t st
 }
 
 void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patches_count,
-                               const int* position_ids, const int* pos_indices,
-                               const float* pos_weights, int visual_start, Tensor& out_hidden,
-                               hipStream_t stream) const {
+                               int grid_h, int grid_w, const int* position_ids,
+                               const int* pos_indices, const float* pos_weights,
+                               int visual_start, Tensor& out_hidden, hipStream_t stream) const {
     const int seq = ids.ne[0];
     const int P = patches_count;
     const int V = P / VisionConfig::merge_unit;
@@ -172,6 +175,28 @@ void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patc
 
     // text stack workspace (shared with embed; grown to fit the longer of the two)
     ensure_text_workspace(impl_->workspace, seq);
+
+    // M-RoPE position table [3][seq] (axis-major): text tokens (i,i,i); visual tokens
+    // (start, start+h_m, start+w_m) over the merged grid (grid_h/2 x grid_w/2), row-major.
+    {
+        const int V    = P / VisionConfig::merge_unit;
+        const int gw_m = grid_w / 2;
+        std::vector<int> hpos((std::size_t)seq * 3);
+        for (int i = 0; i < seq; i++) {
+            int t = i, h = i, w = i;
+            if (i >= visual_start && i < visual_start + V) {
+                const int v  = i - visual_start;
+                t = visual_start;  // still image: one frame
+                h = visual_start + v / gw_m;
+                w = visual_start + v % gw_m;
+            }
+            hpos[static_cast<std::size_t>(0) * seq + i] = t;
+            hpos[static_cast<std::size_t>(1) * seq + i] = h;
+            hpos[static_cast<std::size_t>(2) * seq + i] = w;
+        }
+        HIP_CHECK(hipMemcpy(impl_->workspace.positions, hpos.data(), (std::size_t)seq * 3 * 4,
+                            hipMemcpyHostToDevice));
+    }
 
     // ViT workspace (sized for P patches; freed before regrowing so mixed sizes do not leak)
     if (impl_->vision_p != P) {

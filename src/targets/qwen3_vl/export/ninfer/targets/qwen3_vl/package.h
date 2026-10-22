@@ -88,8 +88,9 @@ public:
     // pos_indices I32 [4,P] + pos_weights FP32 [4,P] (4-corner pos-embed interpolation).
     // Writes the combined text+vision hidden states [1, seq, 4096] to out_hidden.
     void embed_v2v(const Tensor& ids, const float* patches, int patches_count,
-                   const int* position_ids, const int* pos_indices, const float* pos_weights,
-                   int visual_start, Tensor& out_hidden, hipStream_t stream) const;
+                   int grid_h, int grid_w, const int* position_ids, const int* pos_indices,
+                   const float* pos_weights, int visual_start, Tensor& out_hidden,
+                   hipStream_t stream) const;
 
 private:
     class Impl;

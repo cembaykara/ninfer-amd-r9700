@@ -40,7 +40,7 @@ struct EncoderWorkspace {
     hip_bfloat16* gate = nullptr;  // {12288, seq}
     hip_bfloat16* up   = nullptr;  // {12288, seq}
     hip_bfloat16* mlp  = nullptr;  // {12288, seq}
-    int* positions     = nullptr;  // {seq}
+    int* positions     = nullptr;  // {3*seq} axis-major [3][seq] (T/H/W)
     int capacity       = 0;
 };
 
@@ -51,5 +51,11 @@ void encoder_forward(const EncoderWeights& w, const Tensor& ids, Tensor& hidden,
 // Rotate-half RoPE over the full head_dim, in place. The shared ops::rope only accepts the
 // Qwen3.8 geometry (theta 1e7); Qwen3-VL uses theta 5e6, so the text stack keeps a local kernel.
 void rope_neox(Tensor& x, const int* positions, float theta, hipStream_t stream);
+
+// M-RoPE over the full head_dim, in place. The Qwen3-VL text config (mrope_section
+// [24,20,20], interleaved) assigns pair i < 60 to axis i%3 (0=T, 1=H, 2=W) and pairs
+// 60..63 to T, each with the 1-D frequency theta^(-2i/head_dim). positions is
+// axis-major [3][seq] I32. Text tokens carry (p,p,p) and rotate exactly as rope_neox.
+void rope_mrope(Tensor& x, const int* positions, int seq, float theta, hipStream_t stream);
 
 } // namespace ninfer::targets::qwen3_vl::detail

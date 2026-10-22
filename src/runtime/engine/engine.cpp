@@ -661,9 +661,9 @@ Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_by
     Tensor out_hidden(d_hidden, DType::BF16, {4096, seq});
 
     target.loaded->program->embed_v2v(ids_tensor, static_cast<const float*>(d_patches), P,
-                                      prep.position_ids.data(), prep.pos_indices.data(),
-                                      prep.pos_weights.data(), visual_start, out_hidden,
-                                      impl_->device.stream);
+                                      prep.grid_h, prep.grid_w, prep.position_ids.data(),
+                                      prep.pos_indices.data(), prep.pos_weights.data(),
+                                      visual_start, out_hidden, impl_->device.stream);
     impl_->device.synchronize();
 
     const std::size_t kept_bytes = (std::size_t)(seq - kDropTokens) * row_bytes;
