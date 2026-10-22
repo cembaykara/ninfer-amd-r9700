@@ -12,7 +12,7 @@
 namespace ninfer::targets::qwen3_vl::detail {
 
 struct V2VImagePrep {
-    std::vector<float> patches;    // [1152, P] patch-major: 3 * 2 * 16 * 16 floats per patch
+    std::vector<float> patches;    // patch-major: 1536 (3 * 2 * 16 * 16) floats per patch
     std::vector<int> position_ids; // [P, 2]: (y, x) patch grid coordinates
     std::vector<int> pos_indices;  // [P][4]: corner indices into the 48x48 pos-embed table
     std::vector<float> pos_weights;// [P][4]: corner weights (sum to 1 per patch)

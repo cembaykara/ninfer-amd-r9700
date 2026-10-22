@@ -144,8 +144,9 @@ VisionWeightHandles plan_vision_weights(artifact::Binder& b) {
 void bind_vision_weights(VisionWeights& w, const VisionWeightHandles& h,
                          const artifact::MaterializedArtifact& m) {
     // patch_embed is stored 5D [1152,3,2,16,16]; the conv with kernel==stride is a plain
-    // [1152,1152] linear over the flattened patch, so bind it as a 2D weight (same payload).
-    w.patch_embed = make_weight(m.device_data(h.patch_embed), 1152, 1152);
+    // [1152,1536] linear over the flattened patch (3*2*16*16 features), so bind it as a
+    // 2D weight (same payload, column order matches the preprocessing).
+    w.patch_embed = make_weight(m.device_data(h.patch_embed), 1152, 1536);
     w.patch_embed_bias = make_tensor(m.device_data(h.patch_embed_bias), 1152);
     w.pos_embed = Tensor(static_cast<void*>(const_cast<void*>(m.device_data(h.pos_embed))),
                          DType::BF16, {2304, 1152});

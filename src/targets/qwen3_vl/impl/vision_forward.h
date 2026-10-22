@@ -33,7 +33,7 @@ struct VisionConfig {
 
 // The ViT weights, bound from the .ninfer artifact.
 struct VisionWeights {
-    Weight patch_embed;                        // [1152, 1152] (flattened conv)
+    Weight patch_embed;                        // [1152, 1536] (flattened conv: 3*2*16*16 patch features)
     Tensor patch_embed_bias;                   // [1152]
     Tensor pos_embed;                          // [2304, 1152]
     Tensor norm1_w[VisionConfig::layers];      // [1152]
@@ -66,6 +66,7 @@ struct VisionWeights {
 
 // Pre-allocated activation workspace for one image encode (sized for P patches, V=P/4 tokens).
 struct VisionWorkspace {
+    hip_bfloat16* patch_in = nullptr;  // [1536, P] patch-embed input (feature-major)
     hip_bfloat16* x        = nullptr;  // [1152, P] residual stream
     hip_bfloat16* h        = nullptr;  // [1152, P] normalized
     hip_bfloat16* qkv      = nullptr;  // [3456, P]

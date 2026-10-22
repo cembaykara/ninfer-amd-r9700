@@ -37,11 +37,14 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
     HIP_CHECK(hipMemcpyAsync(ws.pos_weights, pos_weights_host, sizeof(float) * 4 * P,
                              hipMemcpyHostToDevice, stream));
 
-    // 1. patches FP32 [1152, P] -> BF16, then patch embed (linear [1152,1152] + bias).
-    Tensor patch_f32(const_cast<float*>(patches), DType::FP32, {H, P});
+    // 1. patches FP32 [1536, P] (feature-major) -> BF16, then patch embed
+    // (linear [1152,1536] + bias). The input is wider than the hidden, so it gets its
+    // own buffer (the linear op rejects an in-place output).
+    Tensor patch_f32(const_cast<float*>(patches), DType::FP32, {1536, P});
+    Tensor x_in(ws.patch_in, DType::BF16, {1536, P});
+    cast_fp32_to_bf16(patch_f32, x_in, stream);
     Tensor x(ws.x, DType::BF16, {H, P});
-    cast_fp32_to_bf16(patch_f32, x, stream);
-    linear(x, w.patch_embed, x, stream);
+    linear(x_in, w.patch_embed, x, stream);
     add_bias(w.patch_embed_bias, x, stream);
 
     // 2. position embed (4-corner interpolation). table is [1152, 2304] (zero-copy view).

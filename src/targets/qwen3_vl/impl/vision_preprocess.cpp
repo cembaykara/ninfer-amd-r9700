@@ -16,7 +16,7 @@ constexpr int kPatch        = 16;
 constexpr int kTemporal     = 2;
 constexpr int kMerge        = 2;
 constexpr int kFactor       = kPatch * kMerge;
-constexpr int kPatchFeatures = 3 * kTemporal * kPatch * kPatch;  // 1152
+constexpr int kPatchFeatures = 3 * kTemporal * kPatch * kPatch;  // 1536
 constexpr int kPositionSide = 48;  // the pos-embed table is 48x48 (2304 rows)
 
 // The Turbo checkpoint's processor_config.json image_processor.size: shortest_edge /
@@ -169,7 +169,7 @@ float normalized(const media::decode::Image& image, int y, int x, int channel) {
            1.0f;
 }
 
-// One 1152-float patch: channel-major, then the two (duplicated) temporal frames, then the
+// One 1536-float patch: channel-major, then the two (duplicated) temporal frames, then the
 // 16x16 pixel block. Same order as the chat path's append_patch.
 void append_patch(const media::decode::Image& frame, int grid_y, int grid_x,
                   std::vector<float>& out) {

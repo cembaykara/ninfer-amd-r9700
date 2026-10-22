@@ -182,6 +182,7 @@ void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patc
         };
         auto& ws = impl_->vision_ws;
         release_device(ws.x);
+        release_device(ws.patch_in);
         release_device(ws.h);
         release_device(ws.qkv);
         release_device(ws.attended);
@@ -196,6 +197,7 @@ void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patc
         release_device(ws.pos_weights);
         release_device(impl_->visual_out);
         release_device(impl_->deepstack_out);
+        ws.patch_in  = (hip_bfloat16*)alloc((std::size_t)P * 1536 * 2);
         ws.x         = (hip_bfloat16*)alloc((std::size_t)P * VH * 2);
         ws.h         = (hip_bfloat16*)alloc((std::size_t)P * VH * 2);
         ws.qkv       = (hip_bfloat16*)alloc((std::size_t)P * 3 * VH * 2);

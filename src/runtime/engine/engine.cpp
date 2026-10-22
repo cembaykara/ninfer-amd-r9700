@@ -619,9 +619,9 @@ Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_by
     const int image_pad_id = tokenizer.encode("<|image_pad|>")[0];
     std::string text =
         "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
-        "<|im_start|>user\n<|vision_start|>";
+        "<|im_start|>user\n<image1><|vision_start|>";
     for (int i = 0; i < V; ++i) { text += "<|image_pad|>"; }
-    text += "<|vision_end|>\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    text += "<|vision_end|>" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
     std::vector<int> ids = tokenizer.encode(text);
     const int seq = static_cast<int>(ids.size());
     if (seq <= kDropTokens) { throw std::runtime_error("v2v prompt tokenized to too few tokens"); }
@@ -638,13 +638,29 @@ Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_by
     HIP_CHECK(hipMemcpy(d_ids, ids.data(), ids_bytes, hipMemcpyHostToDevice));
     Tensor ids_tensor(d_ids, DType::I32, {seq});
 
+    // ViT patches are computed on the host patch-major [P][1536]; the ViT reads them
+    // feature-major [1536, P] (the linear op stores dim zero fastest), so transpose
+    // before the copy.
+    constexpr int kPatchFeatures = 1536;  // 3 channels * 2 temporal * 16 * 16
+    const std::size_t patches_bytes = (std::size_t)P * kPatchFeatures * sizeof(float);
+    std::vector<float> patches_fm(patches_bytes / sizeof(float));
+    for (int i = 0; i < P; ++i) {
+        for (int k = 0; k < kPatchFeatures; ++k) {
+            patches_fm[static_cast<std::size_t>(k) * P + i] =
+                prep.patches[static_cast<std::size_t>(i) * kPatchFeatures + k];
+        }
+    }
+    void* d_patches = nullptr;
+    HIP_CHECK(hipMalloc(&d_patches, patches_bytes));
+    HIP_CHECK(hipMemcpy(d_patches, patches_fm.data(), patches_bytes, hipMemcpyHostToDevice));
+
     const std::size_t row_bytes    = (std::size_t)4096 * 2;
     const std::size_t hidden_bytes = (std::size_t)seq * row_bytes;
     void* d_hidden = nullptr;
     HIP_CHECK(hipMalloc(&d_hidden, hidden_bytes));
     Tensor out_hidden(d_hidden, DType::BF16, {4096, seq});
 
-    target.loaded->program->embed_v2v(ids_tensor, prep.patches.data(), P,
+    target.loaded->program->embed_v2v(ids_tensor, static_cast<const float*>(d_patches), P,
                                       prep.position_ids.data(), prep.pos_indices.data(),
                                       prep.pos_weights.data(), visual_start, out_hidden,
                                       impl_->device.stream);
@@ -656,6 +672,7 @@ Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_by
                         static_cast<const std::uint8_t*>(d_hidden) + kDropTokens * row_bytes,
                         kept_bytes, hipMemcpyDeviceToHost));
     HIP_CHECK(hipFree(d_ids));
+    HIP_CHECK(hipFree(d_patches));
     HIP_CHECK(hipFree(d_hidden));
     return hidden_host;
 }

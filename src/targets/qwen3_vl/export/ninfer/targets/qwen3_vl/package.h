@@ -84,7 +84,7 @@ public:
     void embed(const Tensor& ids, Tensor& out_hidden, hipStream_t stream) const;
 
     // v2v: ids [1,seq] I32 (with the contiguous <image> block at visual_start), patches FP32
-    // [1152, P] (the preprocessed image patches), position_ids I32 [P,2] (h/w coords),
+    // [1536, P] feature-major (the preprocessed image patches), position_ids I32 [P,2] (h/w coords),
     // pos_indices I32 [4,P] + pos_weights FP32 [4,P] (4-corner pos-embed interpolation).
     // Writes the combined text+vision hidden states [1, seq, 4096] to out_hidden.
     void embed_v2v(const Tensor& ids, const float* patches, int patches_count,
