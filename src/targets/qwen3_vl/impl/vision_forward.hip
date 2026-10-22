@@ -46,6 +46,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
     std::vector<char> stages_buf;
     std::vector<char> qkv_buf;  // block 0 qkv [3456, P] bf16
     std::vector<char> att_buf;  // block 0 attention out [1152, P] bf16
+    std::vector<char> qk_buf;   // block 0 q,k after rope [1152, P] x2 bf16
     auto dump_stage = [&]() {
         if (std::getenv("NINFER_VIT_STAGES") == nullptr) return;
         HIP_CHECK(hipStreamSynchronize(stream));
@@ -110,6 +111,14 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
                  {VisionConfig::head_dim, VisionConfig::heads, P});
         (void)plane_bytes;
         rope(pos_ids, VisionConfig::rotary_dim, VisionConfig::rope_theta, q, k, stream);
+        if (l == 0 && std::getenv("NINFER_VIT_STAGES") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            qk_buf.resize((std::size_t)2 * H * P * 2);
+            HIP_CHECK(hipMemcpy(qk_buf.data(), q.data, (std::size_t)H * P * 2,
+                                hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(qk_buf.data() + (std::size_t)H * P * 2, k.data,
+                                (std::size_t)H * P * 2, hipMemcpyDeviceToHost));
+        }
         Tensor attended_heads(attended_t.data, DType::BF16,
                               {VisionConfig::head_dim, VisionConfig::heads, P});
         // single image: fixed segment length P, no workspace needed
@@ -178,6 +187,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
         f.write(cbuf.data(), (std::streamsize)cbuf.size());
         f.write(qkv_buf.data(), (std::streamsize)qkv_buf.size());
         f.write(att_buf.data(), (std::streamsize)att_buf.size());
+        f.write(qk_buf.data(), (std::streamsize)qk_buf.size());
         // block 0 qkv weight [3456, 1152] bf16
         std::vector<char> wbuf((std::size_t)3 * H * H * 2);
         HIP_CHECK(hipMemcpy(wbuf.data(), w.qkv[0].qdata, (std::size_t)3 * H * H * 2,
