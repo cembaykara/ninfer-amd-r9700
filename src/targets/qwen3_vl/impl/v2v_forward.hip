@@ -45,6 +45,12 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
                      (std::streamsize)(std::size_t)H * seq * 2);
         }
         rmsnorm(x, w.input_layernorm[l], eps, false, xn, stream);
+        if (l == 1 && std::getenv("NINFER_V2V_XN1_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream xf(std::getenv("NINFER_V2V_XN1_DUMP"), std::ios::binary);
+            xf.write(reinterpret_cast<const char*>(xn.data),
+                     (std::streamsize)(std::size_t)H * seq * 2);
+        }
         if (l == 0 && std::getenv("NINFER_V2V_XN_DUMP") != nullptr) {
             HIP_CHECK(hipStreamSynchronize(stream));
             std::ofstream xf(std::getenv("NINFER_V2V_XN_DUMP"), std::ios::binary);
