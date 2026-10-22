@@ -102,9 +102,12 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
         silu_mul(gate, up, mlp, stream);
         linear(mlp, w.down_proj[l], xn, stream);
         residual_add(xn, x, stream);
-        if (l == 0 && std::getenv("NINFER_V2V_L0OUT_DUMP") != nullptr) {
+        if (std::getenv("NINFER_V2V_LAYER_DUMP") != nullptr &&
+            (l == 0 || l == 1 || l == 2 || l == 5 || l == 10 || l == 20 || l == 35)) {
             HIP_CHECK(hipStreamSynchronize(stream));
-            std::ofstream lf(std::getenv("NINFER_V2V_L0OUT_DUMP"), std::ios::binary);
+            char path[512];
+            snprintf(path, sizeof(path), "%s_%d.bin", std::getenv("NINFER_V2V_LAYER_DUMP"), l);
+            std::ofstream lf(path, std::ios::binary);
             lf.write(reinterpret_cast<const char*>(x.data),
                      (std::streamsize)(std::size_t)H * seq * 2);
         }
