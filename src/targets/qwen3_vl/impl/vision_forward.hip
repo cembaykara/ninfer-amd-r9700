@@ -147,6 +147,13 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
         std::ofstream f(std::getenv("NINFER_VIT_STAGES"), std::ios::binary);
         f.write(reinterpret_cast<const char*>(&P), 4);
         f.write(stages_buf.data(), (std::streamsize)stages_buf.size());
+        // patch_embed weight [1152, 1536] bf16, then its bias [1152]
+        std::vector<char> wbuf((std::size_t)H * 1536 * 2 + H * 2);
+        HIP_CHECK(hipMemcpy(wbuf.data(), w.patch_embed.data, (std::size_t)H * 1536 * 2,
+                            hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(wbuf.data() + (std::size_t)H * 1536 * 2, w.patch_embed_bias.data,
+                            (std::size_t)H * 2, hipMemcpyDeviceToHost));
+        f.write(wbuf.data(), (std::streamsize)wbuf.size());
     }
 }
 
