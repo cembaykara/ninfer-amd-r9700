@@ -229,8 +229,14 @@ V2VImagePrep preprocess_v2v_image(const std::uint8_t* bytes, std::size_t byte_co
     out.position_ids.reserve(static_cast<std::size_t>(P) * 2);
     out.pos_indices.reserve(static_cast<std::size_t>(P) * 4);
     out.pos_weights.reserve(static_cast<std::size_t>(P) * 4);
-    for (int y = 0; y < gh; ++y) {
-        for (int x = 0; x < gw; ++x) {
+    // Same merge-block order as the patches above (the ViT consumes patches and
+    // position controls in one sequence).
+    for (int block_y = 0; block_y < gh / kMerge; ++block_y) {
+        for (int block_x = 0; block_x < gw / kMerge; ++block_x) {
+            for (int merge_y = 0; merge_y < kMerge; ++merge_y) {
+                for (int merge_x = 0; merge_x < kMerge; ++merge_x) {
+                    const int y = block_y * kMerge + merge_y;
+                    const int x = block_x * kMerge + merge_x;
             out.position_ids.push_back(y);
             out.position_ids.push_back(x);
             const float yf = coordinate(y, gh);
@@ -247,6 +253,9 @@ V2VImagePrep preprocess_v2v_image(const std::uint8_t* bytes, std::size_t byte_co
             out.pos_weights.insert(out.pos_weights.end(),
                                    {(1.0F - wy) * (1.0F - wx), (1.0F - wy) * wx,
                                     wy * (1.0F - wx), wy * wx});
+                    }
+                }
+            }
         }
     }
     return out;
