@@ -101,15 +101,20 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
             HIP_CHECK(hipMemcpy(qkv_buf.data(), qkv_t.data, (std::size_t)3 * H * P * 2,
                                 hipMemcpyDeviceToHost));
         }
-        // split qkv [3456, P] into q/k/v planes [72, 16, P]
-        const std::size_t plane_bytes = static_cast<std::size_t>(H) * sizeof(hip_bfloat16);
+        // split qkv [3*H, P] into q/k/v planes [72, 16, P]. qkv_t is feature-major, so each
+        // token row of 3*H features is contiguous: the plane base is the section offset
+        // (0/H/2*H) and the token stride is the full row (3*H), not the plane width (H).
         Tensor q(reinterpret_cast<hip_bfloat16*>(qkv_t.data), DType::BF16,
                  {VisionConfig::head_dim, VisionConfig::heads, P});
-        Tensor k(reinterpret_cast<hip_bfloat16*>(qkv_t.data) + H * P, DType::BF16,
+        Tensor k(reinterpret_cast<hip_bfloat16*>(qkv_t.data) + H, DType::BF16,
                  {VisionConfig::head_dim, VisionConfig::heads, P});
-        Tensor v(reinterpret_cast<hip_bfloat16*>(qkv_t.data) + 2 * H * P, DType::BF16,
+        Tensor v(reinterpret_cast<hip_bfloat16*>(qkv_t.data) + 2 * H, DType::BF16,
                  {VisionConfig::head_dim, VisionConfig::heads, P});
-        (void)plane_bytes;
+        const std::int64_t qkv_token_stride =
+            static_cast<std::int64_t>(3 * H) * static_cast<std::int64_t>(sizeof(hip_bfloat16));
+        q.nb[2] = qkv_token_stride;
+        k.nb[2] = qkv_token_stride;
+        v.nb[2] = qkv_token_stride;
         rope(pos_ids, VisionConfig::rotary_dim, VisionConfig::rope_theta, q, k, stream);
         if (l == 0 && std::getenv("NINFER_VIT_STAGES") != nullptr) {
             HIP_CHECK(hipStreamSynchronize(stream));
