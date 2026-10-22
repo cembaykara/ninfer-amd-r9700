@@ -46,6 +46,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
     std::vector<char> stages_buf;
     auto dump_stage = [&]() {
         if (std::getenv("NINFER_VIT_STAGES") == nullptr) return;
+        HIP_CHECK(hipStreamSynchronize(stream));
         std::size_t off = stages_buf.size();
         stages_buf.resize(off + (std::size_t)P * H * 2);
         HIP_CHECK(hipMemcpy(stages_buf.data() + off, ws.x, (std::size_t)P * H * 2,
