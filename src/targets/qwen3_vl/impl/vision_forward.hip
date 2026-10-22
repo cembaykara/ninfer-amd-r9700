@@ -44,6 +44,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
 
     // Debug: staged dumps of the residual stream (NINFER_VIT_STAGES=path).
     std::vector<char> stages_buf;
+    std::vector<char> qkv_buf;  // block 0 qkv [3456, P] bf16
     auto dump_stage = [&]() {
         if (std::getenv("NINFER_VIT_STAGES") == nullptr) return;
         HIP_CHECK(hipStreamSynchronize(stream));
@@ -85,6 +86,11 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
         layer_norm(x, w.norm1_w[l], w.norm1_b[l], eps, h_t, stream);
         linear(h_t, w.qkv[l], qkv_t, stream);
         add_bias(w.qkv_bias[l], qkv_t, stream);
+        if (l == 0 && std::getenv("NINFER_VIT_STAGES") != nullptr) {
+            qkv_buf.resize((std::size_t)3 * H * P * 2);
+            HIP_CHECK(hipMemcpy(qkv_buf.data(), qkv_t.data, (std::size_t)3 * H * P * 2,
+                                hipMemcpyDeviceToHost));
+        }
         // split qkv [3456, P] into q/k/v planes [72, 16, P]
         const std::size_t plane_bytes = static_cast<std::size_t>(H) * sizeof(hip_bfloat16);
         Tensor q(reinterpret_cast<hip_bfloat16*>(qkv_t.data), DType::BF16,
@@ -155,6 +161,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
         HIP_CHECK(hipMemcpy(cbuf.data() + (std::size_t)P * 4 * sizeof(int), ws.pos_weights,
                             (std::size_t)P * 4 * sizeof(float), hipMemcpyDeviceToHost));
         f.write(cbuf.data(), (std::streamsize)cbuf.size());
+        f.write(qkv_buf.data(), (std::streamsize)qkv_buf.size());
         // patch_in [1536, P] bf16 (the device input), then patch_embed weight [1152, 1536] and bias [1152]
         std::vector<char> ibuf((std::size_t)1536 * P * 2);
         HIP_CHECK(hipMemcpy(ibuf.data(), ws.patch_in, (std::size_t)1536 * P * 2,
