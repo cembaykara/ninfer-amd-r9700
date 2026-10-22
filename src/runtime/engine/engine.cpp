@@ -570,7 +570,7 @@ Engine::image_encode(const std::string& prompt) const {
     constexpr int kDropTokens = 14;
     const std::string text =
         "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
-        "<|im_start|>user" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+        "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
     std::vector<int> ids = tokenizer.encode(text);
     const int seq = static_cast<int>(ids.size());
     if (seq <= kDropTokens) { throw std::runtime_error("prompt tokenized to too few tokens"); }
@@ -587,6 +587,67 @@ Engine::image_encode(const std::string& prompt) const {
     Tensor out_hidden(d_hidden, DType::BF16, {4096, seq});
 
     target.loaded->program->embed(ids_tensor, out_hidden, impl_->device.stream);
+    impl_->device.synchronize();
+
+    const std::size_t kept_bytes = (std::size_t)(seq - kDropTokens) * row_bytes;
+    std::vector<std::uint8_t> hidden_host(kept_bytes);
+    HIP_CHECK(hipMemcpy(hidden_host.data(),
+                        static_cast<const std::uint8_t*>(d_hidden) + kDropTokens * row_bytes,
+                        kept_bytes, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipFree(d_ids));
+    HIP_CHECK(hipFree(d_hidden));
+    return hidden_host;
+}
+
+// v2v: encode a prompt + a condition image. Preprocesses the image to ViT patches,
+// builds the ids with the contiguous <|image_pad|> block at visual_start, runs embed_v2v
+// (ViT + text stack with deepstack injection), drops the 14 system tokens, and returns
+// the hidden states.
+std::vector<std::uint8_t>
+Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_bytes,
+                         std::size_t image_bytes_count) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
+    const auto& target = encoder_target(impl_->active);
+    const auto& tokenizer = target.loaded->model->tokenizer();
+    constexpr int kDropTokens = 14;
+
+    const auto prep = targets::qwen3_vl::detail::preprocess_v2v_image(image_bytes, image_bytes_count);
+    const int P = prep.patches_count;
+    const int V = prep.tokens;  // P / 4 (2x2 spatial merge)
+
+    const int image_pad_id = tokenizer.encode("<|image_pad|>")[0];
+    std::string text =
+        "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
+        "<|im_start|>user\n<|vision_start|>";
+    for (int i = 0; i < V; ++i) { text += "<|image_pad|>"; }
+    text += "<|vision_end|>\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    std::vector<int> ids = tokenizer.encode(text);
+    const int seq = static_cast<int>(ids.size());
+    if (seq <= kDropTokens) { throw std::runtime_error("v2v prompt tokenized to too few tokens"); }
+
+    int visual_start = -1;
+    for (int i = 0; i < seq; ++i) {
+        if (ids[static_cast<std::size_t>(i)] == image_pad_id) { visual_start = i; break; }
+    }
+    if (visual_start < 0) { throw std::runtime_error("v2v: <|image_pad|> token not found in ids"); }
+
+    const std::size_t ids_bytes = (std::size_t)seq * 4;
+    void* d_ids = nullptr;
+    HIP_CHECK(hipMalloc(&d_ids, ids_bytes));
+    HIP_CHECK(hipMemcpy(d_ids, ids.data(), ids_bytes, hipMemcpyHostToDevice));
+    Tensor ids_tensor(d_ids, DType::I32, {seq});
+
+    const std::size_t row_bytes    = (std::size_t)4096 * 2;
+    const std::size_t hidden_bytes = (std::size_t)seq * row_bytes;
+    void* d_hidden = nullptr;
+    HIP_CHECK(hipMalloc(&d_hidden, hidden_bytes));
+    Tensor out_hidden(d_hidden, DType::BF16, {4096, seq});
+
+    target.loaded->program->embed_v2v(ids_tensor, prep.patches.data(), P,
+                                      prep.position_ids.data(), prep.pos_indices.data(),
+                                      prep.pos_weights.data(), visual_start, out_hidden,
+                                      impl_->device.stream);
     impl_->device.synchronize();
 
     const std::size_t kept_bytes = (std::size_t)(seq - kDropTokens) * row_bytes;

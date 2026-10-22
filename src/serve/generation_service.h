@@ -179,6 +179,13 @@ public:
         return engine_->image_encode(prompt);
     }
 
+    // Encoder (v2v): prompt + condition image -> hidden. The active target must be the encoder.
+    [[nodiscard]] std::vector<std::uint8_t>
+    image_encode_v2v(const std::string& prompt, const std::uint8_t* image_bytes,
+                     std::size_t image_bytes_count) const {
+        return engine_->image_encode_v2v(prompt, image_bytes, image_bytes_count);
+    }
+
     void warmup();
 
 private:

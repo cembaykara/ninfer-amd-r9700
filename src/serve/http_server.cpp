@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -778,14 +779,78 @@ void HttpServer::handle_encoder_encode(const httplib::Request& req, httplib::Res
         emit_openai_error(res, error);
         return;
     }
+    // Optional condition image (v2v): a base64 data URI ("data:<media>;base64,<data>") or a
+    // file path readable inside the container. Omitted -> text-only (unchanged behavior).
+    std::string image_field;
+    if (body.contains("image") && body["image"].is_string()) {
+        image_field = body["image"].get<std::string>();
+    }
+    std::vector<std::uint8_t> image_bytes;
+    if (!image_field.empty()) {
+        if (image_field.rfind("data:", 0) == 0) {
+            const std::size_t pos = image_field.find("base64,");
+            if (pos == std::string::npos) {
+                ApiError error;
+                error.status  = 400;
+                error.type    = "invalid_request_error";
+                error.code    = "invalid_image";
+                error.message = "image data URI must be base64 (data:<media>;base64,<data>)";
+                emit_openai_error(res, error);
+                return;
+            }
+            image_bytes = b64_decode(image_field.substr(pos + 7));
+        } else {
+            std::ifstream stream(image_field, std::ios::binary | std::ios::ate);
+            if (!stream) {
+                ApiError error;
+                error.status  = 400;
+                error.type    = "invalid_request_error";
+                error.code    = "invalid_image";
+                error.message = "image path is not readable: " + image_field;
+                emit_openai_error(res, error);
+                return;
+            }
+            const std::streamsize size = stream.tellg();
+            stream.seekg(0, std::ios::beg);
+            image_bytes.resize(static_cast<std::size_t>(size));
+            stream.read(reinterpret_cast<char*>(image_bytes.data()), size);
+        }
+        if (image_bytes.empty()) {
+            ApiError error;
+            error.status  = 400;
+            error.type    = "invalid_request_error";
+            error.code    = "invalid_image";
+            error.message = "image decoded to zero bytes";
+            emit_openai_error(res, error);
+            return;
+        }
+    }
     std::vector<std::uint8_t> hidden;
     try {
-        hidden = service_->image_encode(prompt);
+        hidden = image_bytes.empty()
+                     ? service_->image_encode(prompt)
+                     : service_->image_encode_v2v(prompt, image_bytes.data(), image_bytes.size());
+    } catch (const std::invalid_argument& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_image";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
     } catch (const std::logic_error& e) {
         ApiError error;
         error.status  = 400;
         error.type    = "invalid_request_error";
         error.code    = "wrong_component";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    } catch (const std::runtime_error& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_image";
         error.message = e.what();
         emit_openai_error(res, error);
         return;
