@@ -50,6 +50,7 @@ services:
       # Temporary: ViT numerical check (writes /logs/eng_vit.bin on each v2v encode).
       NINFER_V2V_DUMP: /logs/eng_vit.bin
       NINFER_VIT_STAGES: /logs/eng_vit_stages.bin
+      NINFER_V2V_HIDDEN_DUMP: /logs/eng_hidden.bin
     shm_size: 1gb
     mem_limit: 24g
     memswap_limit: 24g
