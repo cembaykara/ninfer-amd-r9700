@@ -52,12 +52,21 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
         rmsnorm(q.view({head_dim, heads, seq}), w.q_norm[l], eps, false, qn, stream);
         rmsnorm(k.view({head_dim, kv_heads, seq}), w.k_norm[l], eps, false, kn, stream);
 
+        if (l == 0 && std::getenv("NINFER_V2V_QK_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream qf(std::getenv("NINFER_V2V_QK_DUMP"), std::ios::binary);
+            // before M-RoPE: qn [128,32,seq], kn [128,8,seq]
+            qf.write(reinterpret_cast<const const char*>(qn.data),
+                     (std::streamsize)(std::size_t)head_dim * heads * seq * 2);
+            qf.write(reinterpret_cast<const char*>(kn.data),
+                     (std::streamsize)(std::size_t)head_dim * kv_heads * seq * 2);
+        }
         rope_mrope(qn, ws.positions, seq, (float)EncoderConfig::rope_theta, stream);
         rope_mrope(kn, ws.positions, seq, (float)EncoderConfig::rope_theta, stream);
         if (l == 0 && std::getenv("NINFER_V2V_QK_DUMP") != nullptr) {
             HIP_CHECK(hipStreamSynchronize(stream));
-            std::ofstream qf(std::getenv("NINFER_V2V_QK_DUMP"), std::ios::binary);
-            // qn [128, 32, seq] -> dump full; kn [128, 8, seq]
+            std::ofstream qf(std::getenv("NINFER_V2V_QK_DUMP"), std::ios::app | std::ios::binary);
+            // after M-RoPE
             qf.write(reinterpret_cast<const char*>(qn.data),
                      (std::streamsize)(std::size_t)head_dim * heads * seq * 2);
             qf.write(reinterpret_cast<const char*>(kn.data),
