@@ -85,6 +85,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
         // attention sub-block
         layer_norm(x, w.norm1_w[l], w.norm1_b[l], eps, h_t, stream);
         if (l == 0 && std::getenv("NINFER_VIT_STAGES") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
             std::vector<char> hbuf((std::size_t)H * P * 2);
             HIP_CHECK(hipMemcpy(hbuf.data(), h_t.data, (std::size_t)H * P * 2,
                                 hipMemcpyDeviceToHost));
@@ -94,6 +95,7 @@ void vision_forward(const VisionWeights& w, const float* patches, int patches_co
         linear(h_t, w.qkv[l], qkv_t, stream);
         add_bias(w.qkv_bias[l], qkv_t, stream);
         if (l == 0 && std::getenv("NINFER_VIT_STAGES") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
             qkv_buf.resize((std::size_t)3 * H * P * 2);
             HIP_CHECK(hipMemcpy(qkv_buf.data(), qkv_t.data, (std::size_t)3 * H * P * 2,
                                 hipMemcpyDeviceToHost));
