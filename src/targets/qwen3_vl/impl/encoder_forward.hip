@@ -39,6 +39,8 @@ __global__ void rope_neox_kernel(hip_bfloat16* __restrict__ x, const int* __rest
     row[i + half]        = hip_bfloat16(x2 * c + x1 * s);
 }
 
+} // namespace
+
 void rope_neox(Tensor& x, const int* positions, float theta, hipStream_t stream) {
     const int head_dim = x.ne[0];
     const int heads    = x.ne[1];
@@ -48,8 +50,6 @@ void rope_neox(Tensor& x, const int* positions, float theta, hipStream_t stream)
         static_cast<hip_bfloat16*>(x.data), positions, heads, head_dim, theta);
     HIP_CHECK(hipGetLastError());
 }
-
-} // namespace
 
 void encoder_forward(const EncoderWeights& w, const Tensor& ids, Tensor& hidden,
                      EncoderWorkspace& ws, int seq, hipStream_t stream) {

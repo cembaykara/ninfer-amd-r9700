@@ -132,6 +132,9 @@ public:
     // The engine tokenizes the prompt using the Qwen3-VL tokenizer.
     [[nodiscard]] std::vector<std::uint8_t>
     image_encode(const std::string& prompt) const;
+    std::vector<std::uint8_t>
+    image_encode_v2v(const std::string& prompt, const std::uint8_t* image_bytes,
+                     std::size_t image_bytes_count) const;
 
     // Frees the active target, including its GPU weights, then loads `path`. Encode, denoise,
     // and decode afterwards use that file, and only when it is the matching component. A path

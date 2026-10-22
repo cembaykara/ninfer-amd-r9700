@@ -48,4 +48,8 @@ struct EncoderWorkspace {
 void encoder_forward(const EncoderWeights& w, const Tensor& ids, Tensor& hidden,
                      EncoderWorkspace& ws, int seq, hipStream_t stream);
 
+// Rotate-half RoPE over the full head_dim, in place. The shared ops::rope only accepts the
+// Qwen3.8 geometry (theta 1e7); Qwen3-VL uses theta 5e6, so the text stack keeps a local kernel.
+void rope_neox(Tensor& x, const int* positions, float theta, hipStream_t stream);
+
 } // namespace ninfer::targets::qwen3_vl::detail

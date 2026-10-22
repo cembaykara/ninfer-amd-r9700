@@ -6,6 +6,7 @@
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/qwen3/impl/frontend/encoded_history_cache.h"
 #include "targets/qwen_image_21/impl/lora_apply.h"
+#include "targets/qwen3_vl/impl/vision_preprocess.h"
 #include "targets/registry.h"
 
 #include <ninfer/targets/qwen3/prepared_prompt.h>
@@ -569,22 +570,25 @@ Engine::image_encode(const std::string& prompt) const {
     constexpr int kDropTokens = 14;
     const std::string text =
         "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
-        "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+        "<|im_start|>user" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
     std::vector<int> ids = tokenizer.encode(text);
     const int seq = static_cast<int>(ids.size());
     if (seq <= kDropTokens) { throw std::runtime_error("prompt tokenized to too few tokens"); }
-    const std::size_t ids_bytes = (std::size_t)seq * 4;  // {seq} I32
+    const std::size_t ids_bytes = (std::size_t)seq * 4;
     void* d_ids = nullptr;
     HIP_CHECK(hipMalloc(&d_ids, ids_bytes));
     HIP_CHECK(hipMemcpy(d_ids, ids.data(), ids_bytes, hipMemcpyHostToDevice));
     Tensor ids_tensor(d_ids, DType::I32, {seq});
-    const std::size_t row_bytes    = (std::size_t)4096 * 2;  // one token, BF16
-    const std::size_t hidden_bytes = (std::size_t)seq * row_bytes;  // {4096, seq} BF16
+
+    const std::size_t row_bytes    = (std::size_t)4096 * 2;
+    const std::size_t hidden_bytes = (std::size_t)seq * row_bytes;
     void* d_hidden = nullptr;
     HIP_CHECK(hipMalloc(&d_hidden, hidden_bytes));
     Tensor out_hidden(d_hidden, DType::BF16, {4096, seq});
+
     target.loaded->program->embed(ids_tensor, out_hidden, impl_->device.stream);
     impl_->device.synchronize();
+
     const std::size_t kept_bytes = (std::size_t)(seq - kDropTokens) * row_bytes;
     std::vector<std::uint8_t> hidden_host(kept_bytes);
     HIP_CHECK(hipMemcpy(hidden_host.data(),

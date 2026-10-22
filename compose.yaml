@@ -25,6 +25,13 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # LoRA safetensors, read by the engine as /loras/<name>.
+      - type: bind
+        source: ${NINFER_LORAS_DIR:-../models/loras}
+        target: /loras
+        read_only: true
+        bind:
+          create_host_path: false
       # The encoder target reads the Qwen3-VL tokenizer from this absolute host path.
       - type: bind
         source: /home/tengri/mergen-api/models/hf

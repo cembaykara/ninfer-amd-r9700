@@ -7,7 +7,6 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rope.h"
 #include "ninfer/ops/silu_mul.h"
 
 #include <hip/hip_bfloat16.h>
@@ -27,49 +26,50 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
     const float eps    = EncoderConfig::eps;
 
     // 1. Embed the prompt into xn (text embeddings).
-    Tensor xn(ws.xn, DType::BF16, {1, seq, H});
+    Tensor xn(ws.xn, DType::BF16, {H, seq});
     embedding(ids, w.embed_tokens, xn, stream);
 
     // 2. Interleave the visual tokens into x (the residual stream).
-    Tensor x(ws.x, DType::BF16, {1, seq, H});
-    visual_merge(reinterpret_cast<const hip_bfloat16*>(xn.data), visual_embeds,
-                 visual_start, visual_count, seq, H,
-                 reinterpret_cast<hip_bfloat16*>(x.data), stream);
+    Tensor x(ws.x, DType::BF16, {H, seq});
+    visual_merge(static_cast<const hip_bfloat16*>(xn.data), visual_embeds, visual_start,
+                 visual_count, seq, H, static_cast<hip_bfloat16*>(x.data), stream);
 
     // 3. The 36-layer stack (with deepstack injection at layers 0/1/2).
     for (int l = 0; l < EncoderConfig::layers; l++) {
-        Tensor xn_t(ws.xn, DType::BF16, {1, seq, H});
-        rmsnorm(x, w.input_layernorm[l], eps, false, xn_t, stream);
+        rmsnorm(x, w.input_layernorm[l], eps, false, xn, stream);
 
-        Tensor q(ws.q, DType::BF16, {1, seq, heads, head_dim});
-        Tensor k(ws.k, DType::BF16, {1, seq, kv_heads, head_dim});
-        Tensor v(ws.v, DType::BF16, {1, seq, kv_heads, head_dim});
-        linear(xn_t, w.q_proj[l], q, stream);
-        linear(xn_t, w.k_proj[l], k, stream);
-        linear(xn_t, w.v_proj[l], v, stream);
+        Tensor q(ws.q, DType::BF16, {heads * head_dim, seq});
+        Tensor k(ws.k, DType::BF16, {kv_heads * head_dim, seq});
+        Tensor v(ws.v, DType::BF16, {kv_heads * head_dim, seq});
+        linear(xn, w.q_proj[l], q, stream);
+        linear(xn, w.k_proj[l], k, stream);
+        linear(xn, w.v_proj[l], v, stream);
 
-        rmsnorm(q, w.q_norm[l], eps, false, q, stream);
-        rmsnorm(k, w.k_norm[l], eps, false, k, stream);
+        Tensor qn(ws.qn, DType::BF16, {head_dim, heads, seq});
+        Tensor kn(ws.kn, DType::BF16, {head_dim, kv_heads, seq});
+        rmsnorm(q.view({head_dim, heads, seq}), w.q_norm[l], eps, false, qn, stream);
+        rmsnorm(k.view({head_dim, kv_heads, seq}), w.k_norm[l], eps, false, kn, stream);
 
-        rope(Tensor(ws.positions, DType::I32, {seq}), head_dim,
-             (float)EncoderConfig::rope_theta, q, k, stream);
+        rope_neox(qn, ws.positions, (float)EncoderConfig::rope_theta, stream);
+        rope_neox(kn, ws.positions, (float)EncoderConfig::rope_theta, stream);
 
-        Tensor attn(ws.attn, DType::BF16, {1, seq, heads, head_dim});
-        causal_gqa(q, k, v, attn, stream);
+        Tensor attn(ws.attn, DType::BF16, {head_dim, heads, seq});
+        causal_gqa(qn, kn, v.view({head_dim, kv_heads, seq}), attn, stream);
 
-        linear(attn, w.o_proj[l], xn_t, stream);
-        residual_add(xn_t, x, stream);
+        Tensor attn_flat = attn.view({heads * head_dim, seq});
+        linear(attn_flat, w.o_proj[l], xn, stream);
+        residual_add(xn, x, stream);
 
-        rmsnorm(x, w.post_attention_layernorm[l], eps, false, xn_t, stream);
+        rmsnorm(x, w.post_attention_layernorm[l], eps, false, xn, stream);
 
-        Tensor gate(ws.gate, DType::BF16, {1, seq, inter});
-        Tensor up(ws.up, DType::BF16, {1, seq, inter});
-        Tensor mlp(ws.mlp, DType::BF16, {1, seq, inter});
-        linear(xn_t, w.gate_proj[l], gate, stream);
-        linear(xn_t, w.up_proj[l], up, stream);
+        Tensor gate(ws.gate, DType::BF16, {inter, seq});
+        Tensor up(ws.up, DType::BF16, {inter, seq});
+        Tensor mlp(ws.mlp, DType::BF16, {inter, seq});
+        linear(xn, w.gate_proj[l], gate, stream);
+        linear(xn, w.up_proj[l], up, stream);
         silu_mul(gate, up, mlp, stream);
-        linear(mlp, w.down_proj[l], xn_t, stream);
-        residual_add(xn_t, x, stream);
+        linear(mlp, w.down_proj[l], xn, stream);
+        residual_add(xn, x, stream);
 
         // deepstack injection at text layers 0/1/2
         if (l < 3 && deepstack != nullptr) {
@@ -78,8 +78,11 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
         }
     }
 
-    // 4. Final RMSNorm -> hidden [1, seq, H].
-    rmsnorm(x, w.final_norm, eps, false, hidden, stream);
+    // 4. The DiT consumes the last layer's output before the final RMSNorm (diffusers hooks
+    // the norm out for both T2I and image-conditioned prompts), so w.final_norm is bound
+    // but not applied, as in encoder_forward.
+    HIP_CHECK(hipMemcpyAsync(hidden.data, x.data, (std::size_t)seq * H * sizeof(hip_bfloat16),
+                             hipMemcpyDeviceToDevice, stream));
 }
 
 } // namespace ninfer::targets::qwen3_vl::detail
