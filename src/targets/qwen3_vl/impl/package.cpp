@@ -270,7 +270,7 @@ void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patc
         impl_->deepstack_out + (std::size_t)2 * V * H,
     };
     encoder_forward_v2v(impl_->model->weights(), ids, out_hidden, impl_->workspace, seq,
-                        impl_->visual_out, visual_start, V, ds, stream);
+                        impl_->visual_out, visual_start, V, nullptr, stream);
 }
 
 } // namespace detail
