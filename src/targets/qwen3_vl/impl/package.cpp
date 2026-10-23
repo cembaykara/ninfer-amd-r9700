@@ -264,11 +264,7 @@ void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patc
     }
 
     // 2. text stack with deepstack injection
-    const hip_bfloat16* ds[3] = {
-        impl_->deepstack_out,
-        impl_->deepstack_out + (std::size_t)V * H,
-        impl_->deepstack_out + (std::size_t)2 * V * H,
-    };
+    (void)impl_->deepstack_out; // disabled for testing
     encoder_forward_v2v(impl_->model->weights(), ids, out_hidden, impl_->workspace, seq,
                         impl_->visual_out, visual_start, V, nullptr, stream);
 }
