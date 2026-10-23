@@ -78,7 +78,7 @@ public:
     // text_emb: {4096, M} (from the text encoder); the image is grid_h x grid_w latent tokens.
     // latent {64, grid_h*grid_w} holds the initial noise and is denoised in place.
     void denoise(const Tensor& text_emb, int grid_h, int grid_w, Tensor& latent,
-                 hipStream_t stream) const;
+                 hipStream_t stream, float strength = 1.0f) const;
 
 private:
     class Impl;

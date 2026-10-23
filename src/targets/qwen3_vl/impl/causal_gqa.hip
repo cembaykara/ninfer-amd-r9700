@@ -63,14 +63,14 @@ __global__ void causal_gqa_kernel(const hip_bfloat16* __restrict__ q, const hip_
     for (int j = threadIdx.x; j <= token; j += kThreads) { m = fmaxf(m, score(j)); }
     m = block_reduce<true>(m, scratch);
     float l = 0.0F;
-    for (int j = threadIdx.x; j <= token; j += kThreads) { l += __expf(score(j) - m); }
+    for (int j = threadIdx.x; j <= token; j += kThreads) { l += expf(score(j) - m); }
     l                 = block_reduce<false>(l, scratch);
     const float inv_l = 1.0F / l;
 
     for (int d = threadIdx.x; d < HeadDim; d += kThreads) {
         float acc = 0.0F;
         for (int j = 0; j <= token; j++) {
-            acc += __expf(score(j) - m) * inv_l * (float)vbase[(std::int64_t)j * kstride + d];
+            acc += expf(score(j) - m) * inv_l * (float)vbase[(std::int64_t)j * kstride + d];
         }
         orow[d] = hip_bfloat16(acc);
     }

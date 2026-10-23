@@ -33,7 +33,7 @@ __global__ void deepstack_inject_kernel(hip_bfloat16* __restrict__ hidden,
     hip_bfloat16* dst = hidden + pos * hidden_dim;
     const hip_bfloat16* src = feature + (pos - visual_start) * hidden_dim;
     const int tid = static_cast<int>(threadIdx.x);
-    for (int i = tid * kPerThread; i < (tid + 1) * kPerThread; i += kPerThread) {
+    for (int i = tid * kPerThread; i < (tid + 1) * kPerThread; i++) {
         dst[i] = __hadd(dst[i], src[i]);
     }
 }

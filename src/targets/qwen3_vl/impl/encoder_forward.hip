@@ -39,6 +39,30 @@ __global__ void rope_neox_kernel(hip_bfloat16* __restrict__ x, const int* __rest
     row[i + half]        = hip_bfloat16(x2 * c + x1 * s);
 }
 
+// M-RoPE over the full head_dim, in place. Pair i < 60 takes axis i%3 (0=T, 1=H, 2=W),
+// pairs 60..63 take T (mrope_section [24,20,20], interleaved); the frequency is the 1-D
+// theta^(-2i/head_dim). positions is axis-major [3][seq] I32.
+__global__ void rope_mrope_kernel(hip_bfloat16* __restrict__ x, const int* __restrict__ positions,
+                                  int heads, int head_dim, int seq, float theta) {
+    const int token = blockIdx.x;
+    const int head  = blockIdx.y;
+    const int half  = head_dim / 2;
+    const int i     = threadIdx.x;
+    if (i >= half) { return; }
+    hip_bfloat16* row   = x + ((std::int64_t)token * heads + head) * head_dim;
+    const int axis      = (i < 60) ? (i % 3) : 0;
+    const float inv_freq = powf(theta, -2.0F * (float)i / (float)head_dim);
+    const float angle    = (float)positions[axis * seq + token] * inv_freq;
+    const float c        = cosf(angle);
+    const float s        = sinf(angle);
+    const float x1       = (float)row[i];
+    const float x2       = (float)row[i + half];
+    row[i]               = hip_bfloat16(x1 * c - x2 * s);
+    row[i + half]        = hip_bfloat16(x2 * c + x1 * s);
+}
+
+} // namespace
+
 void rope_neox(Tensor& x, const int* positions, float theta, hipStream_t stream) {
     const int head_dim = x.ne[0];
     const int heads    = x.ne[1];
@@ -49,7 +73,14 @@ void rope_neox(Tensor& x, const int* positions, float theta, hipStream_t stream)
     HIP_CHECK(hipGetLastError());
 }
 
-} // namespace
+void rope_mrope(Tensor& x, const int* positions, int seq, float theta, hipStream_t stream) {
+    const int head_dim = x.ne[0];
+    const int heads    = x.ne[1];
+    dim3 grid(seq, heads);
+    rope_mrope_kernel<<<grid, dim3(head_dim / 2), 0, stream>>>(
+        static_cast<hip_bfloat16*>(x.data), positions, heads, head_dim, seq, theta);
+    HIP_CHECK(hipGetLastError());
+}
 
 void encoder_forward(const EncoderWeights& w, const Tensor& ids, Tensor& hidden,
                      EncoderWorkspace& ws, int seq, hipStream_t stream) {

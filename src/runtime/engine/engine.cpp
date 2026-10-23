@@ -6,6 +6,7 @@
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/qwen3/impl/frontend/encoded_history_cache.h"
 #include "targets/qwen_image_21/impl/lora_apply.h"
+#include "targets/qwen3_vl/impl/vision_preprocess.h"
 #include "targets/registry.h"
 
 #include <ninfer/targets/qwen3/prepared_prompt.h>
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -491,9 +493,31 @@ Engine::image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_
 }
 
 std::vector<std::uint8_t>
+Engine::image_vae_encode(const std::uint8_t* image_bytes, std::size_t image_bytes_count, int H, int W) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
+    const auto& target = vae_target(impl_->active);
+    void* d_image = nullptr;
+    HIP_CHECK(hipMalloc(&d_image, image_bytes_count));
+    HIP_CHECK(hipMemcpy(d_image, image_bytes, image_bytes_count, hipMemcpyHostToDevice));
+    Tensor image(d_image, DType::BF16, {1, 4, H, W});
+    const std::size_t out_bytes = (std::size_t)64 * (H / 16) * (W / 16) * 2;  // [1,64,H/16,W/16] BF16
+    void* d_out = nullptr;
+    HIP_CHECK(hipMalloc(&d_out, out_bytes));
+    Tensor out(d_out, DType::BF16, {1, 64, H / 16, W / 16});
+    target.loaded->program->encode(image, out, impl_->device.stream);
+    impl_->device.synchronize();
+    std::vector<std::uint8_t> out_host(out_bytes);
+    HIP_CHECK(hipMemcpy(out_host.data(), d_out, out_bytes, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipFree(d_image));
+    HIP_CHECK(hipFree(d_out));
+    return out_host;
+}
+
+std::vector<std::uint8_t>
 Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                       int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
-                      const std::vector<LoraRef>& loras) const {
+                      const std::vector<LoraRef>& loras, float strength) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     std::lock_guard<std::mutex> lock(impl_->model_mu);
     const auto& target = dit_target(impl_->active);
@@ -538,7 +562,7 @@ Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count
     // No LoRA: the weights loaded from the DiT file stay as they are. Each LoRA adds
     // scale * (B @ A) for this call (scale defaults to 1) and the weights are restored after.
     const auto run_denoise = [&]() {
-        target.loaded->program->denoise(emb, grid_h, grid_w, out_latent, impl_->device.stream);
+        target.loaded->program->denoise(emb, grid_h, grid_w, out_latent, impl_->device.stream, strength);
     };
     if (loras.empty()) {
         run_denoise();
@@ -573,18 +597,21 @@ Engine::image_encode(const std::string& prompt) const {
     std::vector<int> ids = tokenizer.encode(text);
     const int seq = static_cast<int>(ids.size());
     if (seq <= kDropTokens) { throw std::runtime_error("prompt tokenized to too few tokens"); }
-    const std::size_t ids_bytes = (std::size_t)seq * 4;  // {seq} I32
+    const std::size_t ids_bytes = (std::size_t)seq * 4;
     void* d_ids = nullptr;
     HIP_CHECK(hipMalloc(&d_ids, ids_bytes));
     HIP_CHECK(hipMemcpy(d_ids, ids.data(), ids_bytes, hipMemcpyHostToDevice));
     Tensor ids_tensor(d_ids, DType::I32, {seq});
-    const std::size_t row_bytes    = (std::size_t)4096 * 2;  // one token, BF16
-    const std::size_t hidden_bytes = (std::size_t)seq * row_bytes;  // {4096, seq} BF16
+
+    const std::size_t row_bytes    = (std::size_t)4096 * 2;
+    const std::size_t hidden_bytes = (std::size_t)seq * row_bytes;
     void* d_hidden = nullptr;
     HIP_CHECK(hipMalloc(&d_hidden, hidden_bytes));
     Tensor out_hidden(d_hidden, DType::BF16, {4096, seq});
+
     target.loaded->program->embed(ids_tensor, out_hidden, impl_->device.stream);
     impl_->device.synchronize();
+
     const std::size_t kept_bytes = (std::size_t)(seq - kDropTokens) * row_bytes;
     std::vector<std::uint8_t> hidden_host(kept_bytes);
     HIP_CHECK(hipMemcpy(hidden_host.data(),
@@ -592,6 +619,81 @@ Engine::image_encode(const std::string& prompt) const {
                         kept_bytes, hipMemcpyDeviceToHost));
     HIP_CHECK(hipFree(d_ids));
     HIP_CHECK(hipFree(d_hidden));
+    return hidden_host;
+}
+
+// v2v: encode a prompt + a condition image. Preprocesses the image to ViT patches,
+// builds the ids with the contiguous <|image_pad|> block at visual_start, runs embed_v2v
+// (ViT + text stack with deepstack injection), drops the 14 system tokens, and returns
+// the hidden states.
+std::vector<std::uint8_t>
+Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_bytes,
+                         std::size_t image_bytes_count) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
+    const auto& target = encoder_target(impl_->active);
+    const auto& tokenizer = target.loaded->model->tokenizer();
+    constexpr int kDropTokens = 14;
+
+    const auto prep = targets::qwen3_vl::detail::preprocess_v2v_image(image_bytes, image_bytes_count);
+    const int P = prep.patches_count;
+    const int V = prep.tokens;  // P / 4 (2x2 spatial merge)
+
+    const int image_pad_id = tokenizer.encode("<|image_pad|>")[0];
+    std::string text =
+        "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
+        "<|im_start|>user\n<image1><|vision_start|>";
+    for (int i = 0; i < V; ++i) { text += "<|image_pad|>"; }
+    text += "<|vision_end|>" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    std::vector<int> ids = tokenizer.encode(text);
+    const int seq = static_cast<int>(ids.size());
+    if (seq <= kDropTokens) { throw std::runtime_error("v2v prompt tokenized to too few tokens"); }
+
+    int visual_start = -1;
+    for (int i = 0; i < seq; ++i) {
+        if (ids[static_cast<std::size_t>(i)] == image_pad_id) { visual_start = i; break; }
+    }
+    if (visual_start < 0) { throw std::runtime_error("v2v: <|image_pad|> token not found in ids"); }
+
+    const std::size_t ids_bytes = (std::size_t)seq * 4;
+    void* d_ids = nullptr;
+    HIP_CHECK(hipMalloc(&d_ids, ids_bytes));
+    HIP_CHECK(hipMemcpy(d_ids, ids.data(), ids_bytes, hipMemcpyHostToDevice));
+    Tensor ids_tensor(d_ids, DType::I32, {seq});
+
+    // ViT patches are computed on the host patch-major [P][1536]; the linear op stores
+    // dim zero (features) fastest, which is exactly this layout, so copy as-is.
+    constexpr int kPatchFeatures = 1536;  // 3 channels * 2 temporal * 16 * 16
+    const std::size_t patches_bytes = (std::size_t)P * kPatchFeatures * sizeof(float);
+    void* d_patches = nullptr;
+    HIP_CHECK(hipMalloc(&d_patches, patches_bytes));
+    HIP_CHECK(hipMemcpy(d_patches, prep.patches.data(), patches_bytes, hipMemcpyHostToDevice));
+
+    const std::size_t row_bytes    = (std::size_t)4096 * 2;
+    const std::size_t hidden_bytes = (std::size_t)seq * row_bytes;
+    void* d_hidden = nullptr;
+    HIP_CHECK(hipMalloc(&d_hidden, hidden_bytes));
+    Tensor out_hidden(d_hidden, DType::BF16, {4096, seq});
+
+    target.loaded->program->embed_v2v(ids_tensor, static_cast<const float*>(d_patches), P,
+                                      prep.grid_h, prep.grid_w, prep.position_ids.data(),
+                                      prep.pos_indices.data(), prep.pos_weights.data(),
+                                      visual_start, out_hidden, impl_->device.stream);
+    impl_->device.synchronize();
+
+    const std::size_t kept_bytes = (std::size_t)(seq - kDropTokens) * row_bytes;
+    std::vector<std::uint8_t> hidden_host(kept_bytes);
+    HIP_CHECK(hipMemcpy(hidden_host.data(),
+                        static_cast<const std::uint8_t*>(d_hidden) + kDropTokens * row_bytes,
+                        kept_bytes, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipFree(d_ids));
+    HIP_CHECK(hipFree(d_patches));
+    HIP_CHECK(hipFree(d_hidden));
+    if (const char* hd = std::getenv("NINFER_V2V_HIDDEN_DUMP")) {
+        std::ofstream hf(hd, std::ios::binary);
+        hf.write(reinterpret_cast<const char*>(hidden_host.data()),
+                 (std::streamsize)hidden_host.size());
+    }
     return hidden_host;
 }
 

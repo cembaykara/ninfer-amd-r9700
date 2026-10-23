@@ -25,6 +25,13 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # LoRA safetensors, read by the engine as /loras/<name>.
+      - type: bind
+        source: ${NINFER_LORAS_DIR:-../models/loras}
+        target: /loras
+        read_only: true
+        bind:
+          create_host_path: false
       # The encoder target reads the Qwen3-VL tokenizer from this absolute host path.
       - type: bind
         source: /home/tengri/mergen-api/models/hf
@@ -39,6 +46,19 @@ services:
       - type: bind
         source: /home/tengri/mergen-api/logs
         target: /logs
+    environment:
+      # Temporary: ViT numerical check (writes /logs/eng_vit.bin on each v2v encode).
+      NINFER_V2V_DUMP: /logs/eng_vit.bin
+      NINFER_VIT_STAGES: /logs/eng_vit_stages.bin
+      NINFER_V2V_HIDDEN_DUMP: /logs/eng_hidden.bin
+      NINFER_V2V_QK_DUMP: /logs/eng_qk.bin
+      NINFER_V2V_XN_DUMP: /logs/eng_xn.bin
+      NINFER_V2V_EMB_DUMP: /logs/eng_emb.bin
+      NINFER_V2V_LAYER_DUMP: /logs/eng_layer
+      NINFER_V2V_ATTN_DUMP: /logs/eng_attn1.bin
+      NINFER_V2V_MLP_DUMP: /logs/eng_mlp1.bin
+      NINFER_V2V_V_DUMP: /logs/eng_v1.bin
+      NINFER_V2V_XN1_DUMP: /logs/eng_xn1.bin
     shm_size: 1gb
     mem_limit: 24g
     memswap_limit: 24g

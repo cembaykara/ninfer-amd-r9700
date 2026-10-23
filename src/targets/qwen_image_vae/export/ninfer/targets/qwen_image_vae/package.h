@@ -77,6 +77,8 @@ public:
 
     // latent: [1, 64, H/16, W/16]; writes the decoded image [1, 4, H, W] to out_image.
     void decode(const Tensor& latent, Tensor& out_image, hipStream_t stream) const;
+    // image: [1, 4, H, W] in [-1,1]; writes the encoded latent [1, 64, H/16, W/16] to out_latent.
+    void encode(const Tensor& image, Tensor& out_latent, hipStream_t stream) const;
 
 private:
     class Impl;

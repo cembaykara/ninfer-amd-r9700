@@ -10,7 +10,7 @@
 
 namespace ninfer::targets::qwen3_vl::detail {
 
-// ids [1, seq] I32 -> hidden [1, seq, 4096] BF16.
+// ids {seq} I32 -> hidden {4096, seq} BF16 (token-major rows, pre-final-norm).
 // visual_embeds [visual_count, 4096] (the ViT merged tokens); the contiguous block
 // [visual_start, visual_start+visual_count) of the prompt is replaced by them.
 // deepstack[3] are [visual_count, 4096] (the ViT deepstack features), injected at text layers 0/1/2.

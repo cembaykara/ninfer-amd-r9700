@@ -57,6 +57,7 @@ private:
     void handle_vae_decode(const httplib::Request& req, httplib::Response& res);
     // DiT component route: text_emb (base64) + shape -> latent (base64).
     void handle_dit_denoise(const httplib::Request& req, httplib::Response& res);
+    void handle_vae_encode(const httplib::Request& req, httplib::Response& res);
     // Encoder component route (T2I): ids (base64) -> hidden (base64).
     void handle_encoder_encode(const httplib::Request& req, httplib::Response& res);
     // Replace the loaded .ninfer file. The listen socket stays open.

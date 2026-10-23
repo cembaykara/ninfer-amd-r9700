@@ -149,7 +149,7 @@ void forward(const DitWeights& w, const Tensor& latent, float sigma, int M, int 
 } // namespace
 
 void dit_denoise(const DitWeights& w, const Tensor& text_emb, int grid_h, int grid_w, Tensor& latent,
-                 DitWorkspace& ws, hipStream_t stream) {
+                 DitWorkspace& ws, hipStream_t stream, float strength) {
     const int M = (int)text_emb.ne[1];
     const int N = grid_h * grid_w;
 
@@ -167,10 +167,14 @@ void dit_denoise(const DitWeights& w, const Tensor& text_emb, int grid_h, int gr
     Tensor velocity(ws.velocity, DType::BF16, {C, N});
     const auto& sigmas = DitConfig::sample_sigmas;
     constexpr int steps = sizeof(DitConfig::sample_sigmas) / sizeof(float);
+    // img2img: scale the schedule by `strength` (1.0 = pure generation). The initial latent
+    // is x_strength = (1-strength)*x0 + strength*noise, set by the caller.
+    const float sc = (strength > 0.0F) ? strength : 1.0F;
     for (int i = 0; i < steps; i++) {
-        const float next = i + 1 < steps ? sigmas[i + 1] : 0.0F;
-        forward(w, latent, sigmas[i], M, N, ws, velocity, stream);
-        dit_euler(latent, velocity, next - sigmas[i], stream);
+        const float cur  = sigmas[i] * sc;
+        const float next = (i + 1 < steps ? sigmas[i + 1] : 0.0F) * sc;
+        forward(w, latent, cur, M, N, ws, velocity, stream);
+        dit_euler(latent, velocity, next - cur, stream);
     }
 }
 

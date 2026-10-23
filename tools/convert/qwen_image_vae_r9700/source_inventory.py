@@ -98,18 +98,120 @@ def _build_io_specs() -> tuple[TensorSpec, ...]:
     )
 
 
+
+# --- Encoder specs (2D, for img2img). Generated from the checkpoint; time_conv dropped. ---
+ENC_SPECS = (
+    _tensor('vae/enc_conv_in.bias', (96,), BF16),
+    _tensor('vae/enc_conv_in.weight', (96, 4, 3, 3), BF16),
+    _tensor('vae/enc_conv_out.bias', (128,), BF16),
+    _tensor('vae/enc_conv_out.weight', (128, 768, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.0.downsampler.resample.1.bias', (96,), BF16),
+    _tensor('vae/enc_down_blocks.0.downsampler.resample.1.weight', (96, 96, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.0.conv1_b', (96,), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.0.conv1', (96, 96, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.0.conv2_b', (96,), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.0.conv2', (96, 96, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.0.norm1', (96, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.0.norm2', (96, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.1.conv1_b', (96,), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.1.conv1', (96, 96, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.1.conv2_b', (96,), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.1.conv2', (96, 96, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.1.norm1', (96, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.0.resnets.1.norm2', (96, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.1.downsampler.resample.1.bias', (192,), BF16),
+    _tensor('vae/enc_down_blocks.1.downsampler.resample.1.weight', (192, 192, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.0.conv1_b', (192,), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.0.conv1', (192, 96, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.0.conv2_b', (192,), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.0.conv2', (192, 192, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.0.shortcut_b', (192,), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.0.shortcut', (192, 96, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.0.norm1', (96, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.0.norm2', (192, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.1.conv1_b', (192,), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.1.conv1', (192, 192, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.1.conv2_b', (192,), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.1.conv2', (192, 192, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.1.norm1', (192, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.1.resnets.1.norm2', (192, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.2.downsampler.resample.1.bias', (384,), BF16),
+    _tensor('vae/enc_down_blocks.2.downsampler.resample.1.weight', (384, 384, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.0.conv1_b', (384,), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.0.conv1', (384, 192, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.0.conv2_b', (384,), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.0.conv2', (384, 384, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.0.shortcut_b', (384,), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.0.shortcut', (384, 192, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.0.norm1', (192, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.0.norm2', (384, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.1.conv1_b', (384,), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.1.conv1', (384, 384, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.1.conv2_b', (384,), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.1.conv2', (384, 384, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.1.norm1', (384, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.2.resnets.1.norm2', (384, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.3.downsampler.resample.1.bias', (768,), BF16),
+    _tensor('vae/enc_down_blocks.3.downsampler.resample.1.weight', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.0.conv1_b', (768,), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.0.conv1', (768, 384, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.0.conv2_b', (768,), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.0.conv2', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.0.shortcut_b', (768,), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.0.shortcut', (768, 384, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.0.norm1', (384, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.0.norm2', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.1.conv1_b', (768,), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.1.conv1', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.1.conv2_b', (768,), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.1.conv2', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.1.norm1', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.3.resnets.1.norm2', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.0.conv1_b', (768,), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.0.conv1', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.0.conv2_b', (768,), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.0.conv2', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.0.norm1', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.0.norm2', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.1.conv1_b', (768,), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.1.conv1', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.1.conv2_b', (768,), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.1.conv2', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.1.norm1', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_down_blocks.4.resnets.1.norm2', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_mid_block.attentions.0.norm.gamma', (768, 1, 1), BF16),
+    _tensor('vae/enc_mid_block.attentions.0.proj.bias', (768,), BF16),
+    _tensor('vae/enc_mid_block.attentions.0.proj.weight', (768, 768, 1, 1), BF16),
+    _tensor('vae/enc_mid_block.attentions.0.to_qkv.bias', (2304,), BF16),
+    _tensor('vae/enc_mid_block.attentions.0.to_qkv.weight', (2304, 768, 1, 1), BF16),
+    _tensor('vae/enc_mid_block.resnets.0.conv1_b', (768,), BF16),
+    _tensor('vae/enc_mid_block.resnets.0.conv1', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_mid_block.resnets.0.conv2_b', (768,), BF16),
+    _tensor('vae/enc_mid_block.resnets.0.conv2', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_mid_block.resnets.0.norm1', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_mid_block.resnets.0.norm2', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_mid_block.resnets.1.conv1_b', (768,), BF16),
+    _tensor('vae/enc_mid_block.resnets.1.conv1', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_mid_block.resnets.1.conv2_b', (768,), BF16),
+    _tensor('vae/enc_mid_block.resnets.1.conv2', (768, 768, 3, 3), BF16),
+    _tensor('vae/enc_mid_block.resnets.1.norm1', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_mid_block.resnets.1.norm2', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_norm_out.gamma', (768, 1, 1, 1), BF16),
+    _tensor('vae/enc_quant_conv_b', (128,), BF16),
+    _tensor('vae/enc_quant_conv', (128, 128, 1, 1), BF16),
+)
 IO_SPECS = _build_io_specs()
 UP_SPECS = _build_up_block_specs()
 MID_SPECS = _build_mid_specs()
-TENSOR_SPECS = IO_SPECS + UP_SPECS + MID_SPECS
+TENSOR_SPECS = IO_SPECS + UP_SPECS + MID_SPECS + ENC_SPECS
 
 FORMAT_COUNTS = {fmt: sum(s.format == fmt for s in TENSOR_SPECS) for fmt in FORMAT_NAMES}
 
 
 def validate_inventory() -> None:
-    if len(TENSOR_SPECS) != 134:
-        raise ValueError(f"VAE decoder inventory count is not 134, got {len(TENSOR_SPECS)}")
-    if FORMAT_COUNTS.get(BF16) != 134:
+    if len(TENSOR_SPECS) != 134 + len(ENC_SPECS):
+        raise ValueError(f"VAE inventory count is not {134 + len(ENC_SPECS)}, got {len(TENSOR_SPECS)}")
+    if FORMAT_COUNTS.get(BF16) != len(TENSOR_SPECS):
         raise ValueError(f"VAE decoder inventory must be all-BF16, got {FORMAT_COUNTS}")
 
 

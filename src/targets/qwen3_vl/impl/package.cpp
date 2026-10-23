@@ -11,6 +11,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -65,7 +67,6 @@ struct EncoderProgram::Impl {
     const LoadedModel* model = nullptr;
     DeviceContext* device    = nullptr;
     EncoderWorkspace workspace;
-    bool workspace_ready = false;
     // v2v: ViT workspace + output buffers (sized for the first request's patch count)
     VisionWorkspace vision_ws;
     hip_bfloat16* visual_out = nullptr;   // [4096, V]
@@ -118,91 +119,90 @@ const qwen3::frontend_internal::Tokenizer& LoadedModel::tokenizer() const { retu
 EncoderProgram::EncoderProgram(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 EncoderProgram::~EncoderProgram() = default;
 
+// Grow the text-stack workspace to  tokens. Both embed and embed_v2v size it this way,
+// so a T2I and a v2v call can alternate without one leaving the other undersized.
+void ensure_text_workspace(EncoderWorkspace& ws, int seq) {
+    if (ws.capacity >= seq) { return; }
+    const int H        = EncoderConfig::hidden;
+    const int heads    = EncoderConfig::heads;
+    const int kv_heads = EncoderConfig::kv_heads;
+    const int head_dim = EncoderConfig::head_dim;
+    const int inter    = EncoderConfig::intermediate;
+    auto grow = [&](auto*& p, std::size_t bytes) {
+        if (p != nullptr) {
+            HIP_CHECK(hipFree(p));
+            p = nullptr;
+        }
+        void* raw = nullptr;
+        HIP_CHECK(hipMalloc(&raw, bytes));
+        p = static_cast<std::remove_reference_t<decltype(p)>>(raw);
+    };
+    const std::size_t n = (std::size_t)seq * 2;
+    grow(ws.x, n * H);
+    grow(ws.xn, n * H);
+    grow(ws.q, n * heads * head_dim);
+    grow(ws.k, n * kv_heads * head_dim);
+    grow(ws.v, n * kv_heads * head_dim);
+    grow(ws.qn, n * heads * head_dim);
+    grow(ws.kn, n * kv_heads * head_dim);
+    grow(ws.attn, n * heads * head_dim);
+    grow(ws.gate, n * inter);
+    grow(ws.up, n * inter);
+    grow(ws.mlp, n * inter);
+    grow(ws.positions, (std::size_t)seq * 3 * 4);
+    std::vector<int> hpos((std::size_t)seq * 3);
+    for (int axis = 0; axis < 3; axis++) {
+        for (int i = 0; i < seq; i++) { hpos[static_cast<std::size_t>(axis) * seq + i] = i; }
+    }
+    HIP_CHECK(hipMemcpy(ws.positions, hpos.data(), (std::size_t)seq * 3 * 4,
+                        hipMemcpyHostToDevice));
+    ws.capacity = seq;
+}
+
 void EncoderProgram::embed(const Tensor& ids, Tensor& out_hidden, hipStream_t stream) const {
     const int seq = ids.ne[0];
-    auto& ws      = impl_->workspace;
-    if (ws.capacity < seq) {
-        const int H        = EncoderConfig::hidden;
-        const int heads    = EncoderConfig::heads;
-        const int kv_heads = EncoderConfig::kv_heads;
-        const int head_dim = EncoderConfig::head_dim;
-        const int inter    = EncoderConfig::intermediate;
-        auto grow = [&](auto*& p, std::size_t bytes) {
-            if (p != nullptr) {
-                HIP_CHECK(hipFree(p));
-                p = nullptr;
-            }
-            void* raw = nullptr;
-            HIP_CHECK(hipMalloc(&raw, bytes));
-            p = static_cast<std::remove_reference_t<decltype(p)>>(raw);
-        };
-        const std::size_t n = (std::size_t)seq * 2;
-        grow(ws.x, n * H);
-        grow(ws.xn, n * H);
-        grow(ws.q, n * heads * head_dim);
-        grow(ws.k, n * kv_heads * head_dim);
-        grow(ws.v, n * kv_heads * head_dim);
-        grow(ws.qn, n * heads * head_dim);
-        grow(ws.kn, n * kv_heads * head_dim);
-        grow(ws.attn, n * heads * head_dim);
-        grow(ws.gate, n * inter);
-        grow(ws.up, n * inter);
-        grow(ws.mlp, n * inter);
-        grow(ws.positions, (std::size_t)seq * 4);
-        std::vector<int> hpos(seq);
-        for (int i = 0; i < seq; i++) { hpos[i] = i; }
-        HIP_CHECK(hipMemcpy(ws.positions, hpos.data(), (std::size_t)seq * 4, hipMemcpyHostToDevice));
-        ws.capacity            = seq;
-        impl_->workspace_ready = true;
-    }
-    encoder_forward(impl_->model->weights(), ids, out_hidden, ws, seq, stream);
+    ensure_text_workspace(impl_->workspace, seq);
+    encoder_forward(impl_->model->weights(), ids, out_hidden, impl_->workspace, seq, stream);
 }
 
 void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patches_count,
-                               const int* position_ids, const int* pos_indices,
-                               const float* pos_weights, int visual_start, Tensor& out_hidden,
-                               hipStream_t stream) const {
-    const int seq = ids.ne[1];
+                               int grid_h, int grid_w, const int* position_ids,
+                               const int* pos_indices, const float* pos_weights,
+                               int visual_start, Tensor& out_hidden, hipStream_t stream) const {
+    const int seq = ids.ne[0];
     const int P = patches_count;
     const int V = P / VisionConfig::merge_unit;
     const int H = EncoderConfig::hidden;
     const int VH = VisionConfig::hidden;
 
-    // text stack workspace (shared with embed)
-    if (!impl_->workspace_ready) {
-        // minimal: call embed once to allocate (seq-sized); reuse for v2v
-        Tensor dummy(ids.data, DType::I32, {1, seq});
-        Tensor dummy_out(out_hidden.data, DType::BF16, {1, seq, H});
-        (void)dummy;
-        // allocate directly (mirror embed)
-        auto& ws = impl_->workspace;
-        const int heads = EncoderConfig::heads;
-        const int kv_heads = EncoderConfig::kv_heads;
-        const int head_dim = EncoderConfig::head_dim;
-        const int inter = EncoderConfig::intermediate;
-        auto alloc = [&](std::size_t bytes) {
-            void* p = nullptr;
-            HIP_CHECK(hipMalloc(&p, bytes));
-            return p;
-        };
-        ws.x    = (hip_bfloat16*)alloc((std::size_t)seq * H * 2);
-        ws.xn   = (hip_bfloat16*)alloc((std::size_t)seq * H * 2);
-        ws.q    = (hip_bfloat16*)alloc((std::size_t)seq * heads * head_dim * 2);
-        ws.k    = (hip_bfloat16*)alloc((std::size_t)seq * kv_heads * head_dim * 2);
-        ws.v    = (hip_bfloat16*)alloc((std::size_t)seq * kv_heads * head_dim * 2);
-        ws.attn = (hip_bfloat16*)alloc((std::size_t)seq * heads * head_dim * 2);
-        ws.gate = (hip_bfloat16*)alloc((std::size_t)seq * inter * 2);
-        ws.up   = (hip_bfloat16*)alloc((std::size_t)seq * inter * 2);
-        ws.mlp  = (hip_bfloat16*)alloc((std::size_t)seq * inter * 2);
-        ws.positions = (int*)alloc((std::size_t)seq * 4);
-        int* hpos = new int[seq];
-        for (int i = 0; i < seq; i++) hpos[i] = i;
-        HIP_CHECK(hipMemcpy(ws.positions, hpos, (std::size_t)seq * 4, hipMemcpyHostToDevice));
-        delete[] hpos;
-        impl_->workspace_ready = true;
+    // text stack workspace (shared with embed; grown to fit the longer of the two)
+    ensure_text_workspace(impl_->workspace, seq);
+
+    // M-RoPE position table [3][seq] (axis-major): text tokens (i,i,i); visual tokens
+    // (start, start+h_m, start+w_m) over the merged grid (grid_h/2 x grid_w/2), row-major.
+    {
+        if (grid_h % 2 != 0 || grid_w % 2 != 0 || (grid_h / 2) * (grid_w / 2) != V) {
+            throw std::runtime_error("v2v: merged grid does not match the patch count");
+        }
+        const int gw_m = grid_w / 2;
+        std::vector<int> hpos((std::size_t)seq * 3);
+        for (int i = 0; i < seq; i++) {
+            int t = i, h = i, w = i;
+            if (i >= visual_start && i < visual_start + V) {
+                const int v  = i - visual_start;
+                t = visual_start;  // still image: one frame
+                h = visual_start + v / gw_m;
+                w = visual_start + v % gw_m;
+            }
+            hpos[static_cast<std::size_t>(0) * seq + i] = t;
+            hpos[static_cast<std::size_t>(1) * seq + i] = h;
+            hpos[static_cast<std::size_t>(2) * seq + i] = w;
+        }
+        HIP_CHECK(hipMemcpy(impl_->workspace.positions, hpos.data(), (std::size_t)seq * 3 * 4,
+                            hipMemcpyHostToDevice));
     }
 
-    // ViT workspace (sized for P patches)
+    // ViT workspace (sized for P patches; freed before regrowing so mixed sizes do not leak)
     if (impl_->vision_p != P) {
         auto alloc = [&](std::size_t bytes) {
             void* p = nullptr;
@@ -210,6 +210,23 @@ void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patc
             return p;
         };
         auto& ws = impl_->vision_ws;
+        release_device(ws.x);
+        release_device(ws.patch_in);
+        release_device(ws.h);
+        release_device(ws.qkv);
+        release_device(ws.attended);
+        release_device(ws.projected);
+        release_device(ws.up);
+        release_device(ws.down);
+        release_device(ws.merged);
+        release_device(ws.mhidden);
+        release_device(ws.position_ids);
+        release_device(ws.cu_seqlens);
+        release_device(ws.pos_indices);
+        release_device(ws.pos_weights);
+        release_device(impl_->visual_out);
+        release_device(impl_->deepstack_out);
+        ws.patch_in  = (hip_bfloat16*)alloc((std::size_t)P * 1536 * 2);
         ws.x         = (hip_bfloat16*)alloc((std::size_t)P * VH * 2);
         ws.h         = (hip_bfloat16*)alloc((std::size_t)P * VH * 2);
         ws.qkv       = (hip_bfloat16*)alloc((std::size_t)P * 3 * VH * 2);
@@ -229,18 +246,27 @@ void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patc
     }
 
     // 1. ViT: patches -> merged [4096, V] + 3 deepstack [4096, V]
+    const int cu_seqlens[2] = {0, P};  // one image is one attention segment
     vision_forward(impl_->model->vision_weights(), patches, P, 1,
-                   position_ids, nullptr, pos_indices, pos_weights,
+                   position_ids, cu_seqlens, pos_indices, pos_weights,
                    impl_->visual_out, impl_->deepstack_out, impl_->vision_ws, stream);
 
+    // Debug: dump the ViT outputs for numerical comparison (NINFER_V2V_DUMP=path).
+    // Layout: int32 V, then merged [4096, V] bf16, then deepstack [4096, 3V] bf16.
+    if (const char* dump = std::getenv("NINFER_V2V_DUMP")) {
+        std::vector<char> buf((std::size_t)(4 + 4 * V * H * 2));
+        std::memcpy(buf.data(), &V, 4);
+        std::memcpy(buf.data() + 4, impl_->visual_out, (std::size_t)V * H * 2);
+        std::memcpy(buf.data() + 4 + (std::size_t)V * H * 2, impl_->deepstack_out,
+                    (std::size_t)3 * V * H * 2);
+        std::ofstream f(dump, std::ios::binary);
+        f.write(buf.data(), (std::streamsize)buf.size());
+    }
+
     // 2. text stack with deepstack injection
-    const hip_bfloat16* ds[3] = {
-        impl_->deepstack_out,
-        impl_->deepstack_out + (std::size_t)V * H,
-        impl_->deepstack_out + (std::size_t)2 * V * H,
-    };
+    (void)impl_->deepstack_out; // disabled for testing
     encoder_forward_v2v(impl_->model->weights(), ids, out_hidden, impl_->workspace, seq,
-                        impl_->visual_out, visual_start, V, ds, stream);
+                        impl_->visual_out, visual_start, V, nullptr, stream);
 }
 
 } // namespace detail

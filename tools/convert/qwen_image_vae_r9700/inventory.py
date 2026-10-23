@@ -32,10 +32,10 @@ FORMAT_COUNTS: dict[str, int] = dict(Counter(spec.format for spec in TENSOR_SPEC
 
 
 def validate_inventory() -> None:
-    if len(TENSOR_SPECS) != 134:
-        raise ValueError(f"VAE decoder candidate inventory count is not 134, got {len(TENSOR_SPECS)}")
-    if FORMAT_COUNTS != {BF16: 134}:
-        raise ValueError(f"VAE decoder candidate must be all-BF16, got {FORMAT_COUNTS}")
+    if len(TENSOR_SPECS) != 232:
+        raise ValueError(f"VAE candidate inventory count is not 232, got {len(TENSOR_SPECS)}")
+    if FORMAT_COUNTS != {BF16: 232}:
+        raise ValueError(f"VAE candidate must be all-BF16, got {FORMAT_COUNTS}")
 
 
 validate_inventory()

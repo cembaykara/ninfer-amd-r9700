@@ -7,8 +7,9 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rope.h"
 #include "ninfer/ops/silu_mul.h"
+
+#include <fstream>
 
 #include <hip/hip_bfloat16.h>
 
@@ -27,49 +28,113 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
     const float eps    = EncoderConfig::eps;
 
     // 1. Embed the prompt into xn (text embeddings).
-    Tensor xn(ws.xn, DType::BF16, {1, seq, H});
+    Tensor xn(ws.xn, DType::BF16, {H, seq});
     embedding(ids, w.embed_tokens, xn, stream);
 
     // 2. Interleave the visual tokens into x (the residual stream).
-    Tensor x(ws.x, DType::BF16, {1, seq, H});
-    visual_merge(reinterpret_cast<const hip_bfloat16*>(xn.data), visual_embeds,
-                 visual_start, visual_count, seq, H,
-                 reinterpret_cast<hip_bfloat16*>(x.data), stream);
+    Tensor x(ws.x, DType::BF16, {H, seq});
+    visual_merge(static_cast<const hip_bfloat16*>(xn.data), visual_embeds, visual_start,
+                 visual_count, seq, H, static_cast<hip_bfloat16*>(x.data), stream);
 
     // 3. The 36-layer stack (with deepstack injection at layers 0/1/2).
     for (int l = 0; l < EncoderConfig::layers; l++) {
-        Tensor xn_t(ws.xn, DType::BF16, {1, seq, H});
-        rmsnorm(x, w.input_layernorm[l], eps, false, xn_t, stream);
+        if (l == 0 && std::getenv("NINFER_V2V_EMB_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream ef(std::getenv("NINFER_V2V_EMB_DUMP"), std::ios::binary);
+            ef.write(reinterpret_cast<const char*>(x.data),
+                     (std::streamsize)(std::size_t)H * seq * 2);
+        }
+        rmsnorm(x, w.input_layernorm[l], eps, false, xn, stream);
+        if (l == 1 && std::getenv("NINFER_V2V_XN1_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream xf(std::getenv("NINFER_V2V_XN1_DUMP"), std::ios::binary);
+            xf.write(reinterpret_cast<const char*>(xn.data),
+                     (std::streamsize)(std::size_t)H * seq * 2);
+        }
+        if (l == 0 && std::getenv("NINFER_V2V_XN_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream xf(std::getenv("NINFER_V2V_XN_DUMP"), std::ios::binary);
+            xf.write(reinterpret_cast<const char*>(xn.data),
+                     (std::streamsize)(std::size_t)H * seq * 2);
+        }
 
-        Tensor q(ws.q, DType::BF16, {1, seq, heads, head_dim});
-        Tensor k(ws.k, DType::BF16, {1, seq, kv_heads, head_dim});
-        Tensor v(ws.v, DType::BF16, {1, seq, kv_heads, head_dim});
-        linear(xn_t, w.q_proj[l], q, stream);
-        linear(xn_t, w.k_proj[l], k, stream);
-        linear(xn_t, w.v_proj[l], v, stream);
+        Tensor q(ws.q, DType::BF16, {heads * head_dim, seq});
+        Tensor k(ws.k, DType::BF16, {kv_heads * head_dim, seq});
+        Tensor v(ws.v, DType::BF16, {kv_heads * head_dim, seq});
+        linear(xn, w.q_proj[l], q, stream);
+        linear(xn, w.k_proj[l], k, stream);
+        linear(xn, w.v_proj[l], v, stream);
+        if (l == 1 && std::getenv("NINFER_V2V_V_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream vf(std::getenv("NINFER_V2V_V_DUMP"), std::ios::binary);
+            vf.write(reinterpret_cast<const char*>(v.data),
+                     (std::streamsize)(std::size_t)(kv_heads * head_dim) * seq * 2);
+        }
 
-        rmsnorm(q, w.q_norm[l], eps, false, q, stream);
-        rmsnorm(k, w.k_norm[l], eps, false, k, stream);
+        Tensor qn(ws.qn, DType::BF16, {head_dim, heads, seq});
+        Tensor kn(ws.kn, DType::BF16, {head_dim, kv_heads, seq});
+        rmsnorm(q.view({head_dim, heads, seq}), w.q_norm[l], eps, false, qn, stream);
+        rmsnorm(k.view({head_dim, kv_heads, seq}), w.k_norm[l], eps, false, kn, stream);
 
-        rope(Tensor(ws.positions, DType::I32, {seq}), head_dim,
-             (float)EncoderConfig::rope_theta, q, k, stream);
+        if (l == 0 && std::getenv("NINFER_V2V_QK_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream qf(std::getenv("NINFER_V2V_QK_DUMP"), std::ios::binary);
+            // before M-RoPE: qn [128,32,seq], kn [128,8,seq]
+            qf.write(reinterpret_cast<const char*>(qn.data),
+                     (std::streamsize)(std::size_t)head_dim * heads * seq * 2);
+            qf.write(reinterpret_cast<const char*>(kn.data),
+                     (std::streamsize)(std::size_t)head_dim * kv_heads * seq * 2);
+        }
+        rope_mrope(qn, ws.positions, seq, (float)EncoderConfig::rope_theta, stream);
+        rope_mrope(kn, ws.positions, seq, (float)EncoderConfig::rope_theta, stream);
+        if (l == 0 && std::getenv("NINFER_V2V_QK_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream qf(std::getenv("NINFER_V2V_QK_DUMP"), std::ios::app | std::ios::binary);
+            // after M-RoPE
+            qf.write(reinterpret_cast<const char*>(qn.data),
+                     (std::streamsize)(std::size_t)head_dim * heads * seq * 2);
+            qf.write(reinterpret_cast<const char*>(kn.data),
+                     (std::streamsize)(std::size_t)head_dim * kv_heads * seq * 2);
+        }
 
-        Tensor attn(ws.attn, DType::BF16, {1, seq, heads, head_dim});
-        causal_gqa(q, k, v, attn, stream);
+        Tensor attn(ws.attn, DType::BF16, {head_dim, heads, seq});
+        causal_gqa(qn, kn, v.view({head_dim, kv_heads, seq}), attn, stream);
 
-        linear(attn, w.o_proj[l], xn_t, stream);
-        residual_add(xn_t, x, stream);
+        Tensor attn_flat = attn.view({heads * head_dim, seq});
+        linear(attn_flat, w.o_proj[l], xn, stream);
+        if (l == 1 && std::getenv("NINFER_V2V_ATTN_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream af(std::getenv("NINFER_V2V_ATTN_DUMP"), std::ios::binary);
+            af.write(reinterpret_cast<const char*>(xn.data),
+                     (std::streamsize)(std::size_t)H * seq * 2);
+        }
+        residual_add(xn, x, stream);
 
-        rmsnorm(x, w.post_attention_layernorm[l], eps, false, xn_t, stream);
+        rmsnorm(x, w.post_attention_layernorm[l], eps, false, xn, stream);
 
-        Tensor gate(ws.gate, DType::BF16, {1, seq, inter});
-        Tensor up(ws.up, DType::BF16, {1, seq, inter});
-        Tensor mlp(ws.mlp, DType::BF16, {1, seq, inter});
-        linear(xn_t, w.gate_proj[l], gate, stream);
-        linear(xn_t, w.up_proj[l], up, stream);
+        Tensor gate(ws.gate, DType::BF16, {inter, seq});
+        Tensor up(ws.up, DType::BF16, {inter, seq});
+        Tensor mlp(ws.mlp, DType::BF16, {inter, seq});
+        linear(xn, w.gate_proj[l], gate, stream);
+        linear(xn, w.up_proj[l], up, stream);
         silu_mul(gate, up, mlp, stream);
-        linear(mlp, w.down_proj[l], xn_t, stream);
-        residual_add(xn_t, x, stream);
+        linear(mlp, w.down_proj[l], xn, stream);
+        if (l == 1 && std::getenv("NINFER_V2V_MLP_DUMP") != nullptr) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            std::ofstream mf(std::getenv("NINFER_V2V_MLP_DUMP"), std::ios::binary);
+            mf.write(reinterpret_cast<const char*>(xn.data),
+                     (std::streamsize)(std::size_t)H * seq * 2);
+        }
+        residual_add(xn, x, stream);
+        if (std::getenv("NINFER_V2V_LAYER_DUMP") != nullptr &&
+            (l == 0 || l == 1 || l == 2 || l == 5 || l == 10 || l == 20 || l == 35)) {
+            HIP_CHECK(hipStreamSynchronize(stream));
+            char path[512];
+            snprintf(path, sizeof(path), "%s_%d.bin", std::getenv("NINFER_V2V_LAYER_DUMP"), l);
+            std::ofstream lf(path, std::ios::binary);
+            lf.write(reinterpret_cast<const char*>(x.data),
+                     (std::streamsize)(std::size_t)H * seq * 2);
+        }
 
         // deepstack injection at text layers 0/1/2
         if (l < 3 && deepstack != nullptr) {
@@ -78,8 +143,11 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
         }
     }
 
-    // 4. Final RMSNorm -> hidden [1, seq, H].
-    rmsnorm(x, w.final_norm, eps, false, hidden, stream);
+    // 4. The DiT consumes the last layer's output before the final RMSNorm (diffusers hooks
+    // the norm out for both T2I and image-conditioned prompts), so w.final_norm is bound
+    // but not applied, as in encoder_forward.
+    HIP_CHECK(hipMemcpyAsync(hidden.data, x.data, (std::size_t)seq * H * sizeof(hip_bfloat16),
+                             hipMemcpyDeviceToDevice, stream));
 }
 
 } // namespace ninfer::targets::qwen3_vl::detail
