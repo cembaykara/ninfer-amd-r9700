@@ -169,9 +169,14 @@ public:
     [[nodiscard]] std::vector<std::uint8_t>
     image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                   int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
-                  const std::vector<ninfer::LoraRef>& loras = {}) const {
+                  const std::vector<ninfer::LoraRef>& loras = {}, float strength = 1.0f) const {
         return engine_->image_denoise(emb_bytes, emb_bytes_count, M, image_h, image_w, noise, seed,
-                                     loras);
+                                     loras, strength);
+    }
+    // VAE encode (img2img): image [1,4,H,W] -> latent [1,64,H/16,W/16].
+    [[nodiscard]] std::vector<std::uint8_t>
+    image_vae_encode(const std::uint8_t* image_bytes, std::size_t image_bytes_count, int H, int W) const {
+        return engine_->image_vae_encode(image_bytes, image_bytes_count, H, W);
     }
     // Encoder (T2I): prompt -> hidden. The active target must be the encoder.
     [[nodiscard]] std::vector<std::uint8_t>

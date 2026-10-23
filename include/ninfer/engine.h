@@ -119,6 +119,10 @@ public:
     // VAE: latent (host bytes, [1,64,H/16,W/16] BF16) -> image (host bytes, [1,4,H,W] BF16).
     [[nodiscard]] std::vector<std::uint8_t>
     image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_count, int H, int W) const;
+    // VAE encode (img2img): image (host bytes, [1,4,H,W] BF16 in [-1,1]) -> latent
+    // (host bytes, [1,64,H/16,W/16] BF16, the posterior mode).
+    [[nodiscard]] std::vector<std::uint8_t>
+    image_vae_encode(const std::uint8_t* image_bytes, std::size_t image_bytes_count, int H, int W) const;
     // DiT: text_emb (host bytes, [1,M,4096] BF16) -> latent (host bytes, [1,N,64] BF16), where
     // image_h x image_w are pixels and N = (image_h/16)*(image_w/16). `noise` is the initial
     // latent in the same layout; when empty it is drawn from `seed`.
@@ -127,7 +131,7 @@ public:
     [[nodiscard]] std::vector<std::uint8_t>
     image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                   int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
-                  const std::vector<LoraRef>& loras = {}) const;
+                  const std::vector<LoraRef>& loras = {}, float strength = 1.0f) const;
     // Encoder (T2I): prompt text -> hidden (host bytes, [1,seq,4096] BF16).
     // The engine tokenizes the prompt using the Qwen3-VL tokenizer.
     [[nodiscard]] std::vector<std::uint8_t>

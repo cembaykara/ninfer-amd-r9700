@@ -493,9 +493,31 @@ Engine::image_decode(const std::uint8_t* latent_bytes, std::size_t latent_bytes_
 }
 
 std::vector<std::uint8_t>
+Engine::image_vae_encode(const std::uint8_t* image_bytes, std::size_t image_bytes_count, int H, int W) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::lock_guard<std::mutex> lock(impl_->model_mu);
+    const auto& target = vae_target(impl_->active);
+    void* d_image = nullptr;
+    HIP_CHECK(hipMalloc(&d_image, image_bytes_count));
+    HIP_CHECK(hipMemcpy(d_image, image_bytes, image_bytes_count, hipMemcpyHostToDevice));
+    Tensor image(d_image, DType::BF16, {1, 4, H, W});
+    const std::size_t out_bytes = (std::size_t)64 * (H / 16) * (W / 16) * 2;  // [1,64,H/16,W/16] BF16
+    void* d_out = nullptr;
+    HIP_CHECK(hipMalloc(&d_out, out_bytes));
+    Tensor out(d_out, DType::BF16, {1, 64, H / 16, W / 16});
+    target.loaded->program->encode(image, out, impl_->device.stream);
+    impl_->device.synchronize();
+    std::vector<std::uint8_t> out_host(out_bytes);
+    HIP_CHECK(hipMemcpy(out_host.data(), d_out, out_bytes, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipFree(d_image));
+    HIP_CHECK(hipFree(d_out));
+    return out_host;
+}
+
+std::vector<std::uint8_t>
 Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                       int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
-                      const std::vector<LoraRef>& loras) const {
+                      const std::vector<LoraRef>& loras, float strength) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     std::lock_guard<std::mutex> lock(impl_->model_mu);
     const auto& target = dit_target(impl_->active);
@@ -540,7 +562,7 @@ Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count
     // No LoRA: the weights loaded from the DiT file stay as they are. Each LoRA adds
     // scale * (B @ A) for this call (scale defaults to 1) and the weights are restored after.
     const auto run_denoise = [&]() {
-        target.loaded->program->denoise(emb, grid_h, grid_w, out_latent, impl_->device.stream);
+        target.loaded->program->denoise(emb, grid_h, grid_w, out_latent, impl_->device.stream, strength);
     };
     if (loras.empty()) {
         run_denoise();

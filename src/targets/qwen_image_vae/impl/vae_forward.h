@@ -50,6 +50,34 @@ struct VaeWeights {
     // 1x1 applied to the scaled latent before conv_in. [64, 64, 1, 1] + bias [64].
     const hip_bfloat16* post_quant = nullptr;
     const hip_bfloat16* post_quant_b = nullptr;
+
+    // --- Encoder (2D, for img2img): image [4,H,W] -> latent [64,H/16,W/16] ---
+    // conv_in: [96, 4, 3, 3] + bias [96]
+    const hip_bfloat16* enc_conv_in      = nullptr;
+    const hip_bfloat16* enc_conv_in_b    = nullptr;
+    // down_blocks (5 blocks, channels [96,96,192,384,768,768]); blocks 0-3 downsample 2x
+    struct DownBlock {
+        Resnet resnets[2];
+        const hip_bfloat16* resample = nullptr;     // [cout, cout, 3, 3] (zero-pad + stride 2)
+        const hip_bfloat16* resample_b = nullptr;   // [cout]
+        bool has_down = false;
+    };
+    DownBlock enc_down_blocks[5];
+    // mid_block: 2 resnets + 1 attention (768)
+    Resnet enc_mid_resnets[2];
+    const hip_bfloat16* enc_mid_attn_to_qkv = nullptr;
+    const hip_bfloat16* enc_mid_attn_to_qkv_b = nullptr;
+    const hip_bfloat16* enc_mid_attn_proj = nullptr;
+    const hip_bfloat16* enc_mid_attn_proj_b = nullptr;
+    const hip_bfloat16* enc_mid_attn_norm = nullptr;
+    // conv_out: [128, 768, 3, 3] + bias [128]
+    const hip_bfloat16* enc_conv_out = nullptr;
+    const hip_bfloat16* enc_conv_out_b = nullptr;
+    // quant_conv: [128, 128, 1, 1] + bias [128]
+    const hip_bfloat16* enc_quant_conv = nullptr;
+    const hip_bfloat16* enc_quant_conv_b = nullptr;
+    // norm_out: [768, 1, 1, 1]
+    const hip_bfloat16* enc_norm_out = nullptr;
 };
 
 struct VaeWorkspace {
@@ -84,6 +112,11 @@ struct VaeWorkspace {
 
 // VAE decode: latent [1, 64, H/16, W/16] -> image [1, 4, H, W]
 void vae_decode(const VaeWeights& weights, const Tensor& latent, Tensor& out_image,
+                VaeWorkspace& ws, hipStream_t stream);
+
+// VAE encode (2D, for img2img): image [4, H, W] in [-1,1] -> latent [64, H/16, W/16]
+// (the mode of the posterior; the logvar half is dropped).
+void vae_encode(const VaeWeights& weights, const Tensor& image, Tensor& out_latent,
                 VaeWorkspace& ws, hipStream_t stream);
 
 } // namespace detail

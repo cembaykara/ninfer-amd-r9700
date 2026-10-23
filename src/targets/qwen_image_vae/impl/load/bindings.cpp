@@ -97,6 +97,40 @@ VaeWeightHandles plan_vae_weights(artifact::Binder& b) {
     h.norm_out = reqnorm4(b, "vae/norm_out", kUpOut[4]);
     h.post_quant = req4d(b, "vae/post_quant", 64, 64, 1, 1);
     h.post_quant_b = req1d(b, "vae/post_quant_b", 64);
+
+    // --- Encoder (2D, for img2img) ---
+    h.enc_conv_in = req4d(b, "vae/enc_conv_in.weight", 96, 4, 3, 3);
+    h.enc_conv_in_b = req1d(b, "vae/enc_conv_in.bias", 96);
+    {
+        const int enc_out[5] = {96, 192, 384, 768, 768};
+        const int enc_in[5]  = {96, 96, 192, 384, 768};
+        for (int i = 0; i < 5; ++i) {
+            const int cin = enc_in[i], cout = enc_out[i];
+            const std::string base = "vae/enc_down_blocks." + std::to_string(i) + ".";
+            for (int j = 0; j < 2; ++j) {
+                const int rcin = (j == 0) ? cin : cout;
+                req_resnet(b, h.enc_down_blocks[i].resnets[j], base + "resnets." + std::to_string(j) + ".",
+                           rcin, cout, /*shortcut=*/(j == 0 && cin != cout));
+            }
+            if (i < 4) {
+                h.enc_down_blocks[i].resample = req4d(b, base + "downsampler.resample.1.weight", cout, cout, 3, 3);
+                h.enc_down_blocks[i].resample_b = req1d(b, base + "downsampler.resample.1.bias", cout);
+                h.enc_down_blocks[i].has_down = true;
+            }
+        }
+    }
+    for (int j = 0; j < 2; ++j)
+        req_resnet(b, h.enc_mid_resnets[j], "vae/enc_mid_block.resnets." + std::to_string(j) + ".", 768, 768, false);
+    h.enc_mid_attn_to_qkv = req4d(b, "vae/enc_mid_block.attentions.0.to_qkv.weight", 3 * 768, 768, 1, 1);
+    h.enc_mid_attn_to_qkv_b = req1d(b, "vae/enc_mid_block.attentions.0.to_qkv.bias", 3 * 768);
+    h.enc_mid_attn_proj = req4d(b, "vae/enc_mid_block.attentions.0.proj.weight", 768, 768, 1, 1);
+    h.enc_mid_attn_proj_b = req1d(b, "vae/enc_mid_block.attentions.0.proj.bias", 768);
+    h.enc_mid_attn_norm = reqnorm3(b, "vae/enc_mid_block.attentions.0.norm.gamma", 768);
+    h.enc_conv_out = req4d(b, "vae/enc_conv_out.weight", 128, 768, 3, 3);
+    h.enc_conv_out_b = req1d(b, "vae/enc_conv_out.bias", 128);
+    h.enc_quant_conv = req4d(b, "vae/enc_quant_conv", 128, 128, 1, 1);
+    h.enc_quant_conv_b = req1d(b, "vae/enc_quant_conv_b", 128);
+    h.enc_norm_out = reqnorm4(b, "vae/enc_norm_out.gamma", 768);
     return h;
 }
 
@@ -146,6 +180,42 @@ void bind_vae_weights(detail::VaeWeights& w, const VaeWeightHandles& h, const ar
     w.norm_out = pd(h.norm_out);
     w.post_quant = pd(h.post_quant);
     w.post_quant_b = pd(h.post_quant_b);
+
+    // --- Encoder (2D, for img2img) ---
+    w.enc_conv_in = pd(h.enc_conv_in);
+    w.enc_conv_in_b = pd(h.enc_conv_in_b);
+    for (int i = 0; i < 5; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            auto& r = w.enc_down_blocks[i].resnets[j];
+            auto& rh = h.enc_down_blocks[i].resnets[j];
+            r.conv1 = pd(rh.conv1); r.conv1_b = pd(rh.conv1_b);
+            r.conv2 = pd(rh.conv2); r.conv2_b = pd(rh.conv2_b);
+            r.norm1 = pd(rh.norm1); r.norm2 = pd(rh.norm2);
+            r.shortcut = nullptr; r.shortcut_b = nullptr;
+            if (rh.has_shortcut) { r.shortcut = pd(rh.shortcut); r.shortcut_b = pd(rh.shortcut_b); }
+        }
+        w.enc_down_blocks[i].resample = pd(h.enc_down_blocks[i].resample);
+        w.enc_down_blocks[i].resample_b = pd(h.enc_down_blocks[i].resample_b);
+        w.enc_down_blocks[i].has_down = h.enc_down_blocks[i].has_down;
+    }
+    for (int j = 0; j < 2; ++j) {
+        auto& r = w.enc_mid_resnets[j];
+        auto& rh = h.enc_mid_resnets[j];
+        r.conv1 = pd(rh.conv1); r.conv1_b = pd(rh.conv1_b);
+        r.conv2 = pd(rh.conv2); r.conv2_b = pd(rh.conv2_b);
+        r.norm1 = pd(rh.norm1); r.norm2 = pd(rh.norm2);
+        r.shortcut = nullptr; r.shortcut_b = nullptr;
+    }
+    w.enc_mid_attn_to_qkv = pd(h.enc_mid_attn_to_qkv);
+    w.enc_mid_attn_to_qkv_b = pd(h.enc_mid_attn_to_qkv_b);
+    w.enc_mid_attn_proj = pd(h.enc_mid_attn_proj);
+    w.enc_mid_attn_proj_b = pd(h.enc_mid_attn_proj_b);
+    w.enc_mid_attn_norm = pd(h.enc_mid_attn_norm);
+    w.enc_conv_out = pd(h.enc_conv_out);
+    w.enc_conv_out_b = pd(h.enc_conv_out_b);
+    w.enc_quant_conv = pd(h.enc_quant_conv);
+    w.enc_quant_conv_b = pd(h.enc_quant_conv_b);
+    w.enc_norm_out = pd(h.enc_norm_out);
 }
 
 } // namespace ninfer::targets::qwen_image_vae

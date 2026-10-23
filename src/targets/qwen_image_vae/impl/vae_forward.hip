@@ -347,5 +347,152 @@ void vae_decode(const VaeWeights& w, const Tensor& latent, Tensor& out_image,
         reinterpret_cast<hip_bfloat16*>(out_image.data), nimg);
 }
 
+
+// =========================================================================
+// 2D Encoder (for img2img): image [4, H, W] in [-1,1] -> latent [64, H/16, W/16]
+// =========================================================================
+
+// Downsampler: zero-pad (right=1, bottom=1) + 3x3 conv stride 2.
+// in: [C, H, W] -> out: [C, H/2, W/2].
+__global__ void downsample2d_kernel(const hip_bfloat16* __restrict__ in, const hip_bfloat16* __restrict__ w,
+                                    const hip_bfloat16* __restrict__ b, int c, int h, int w_in,
+                                    hip_bfloat16* __restrict__ out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int co = blockIdx.z;
+    const int w_out = w_in / 2, h_out = h / 2;
+    if (x >= w_out || y >= h_out || co >= c) return;
+    float acc = float(b[co]);
+    for (int ci = 0; ci < c; ++ci) {
+        for (int ky = 0; ky < 3; ++ky) {
+            for (int kx = 0; kx < 3; ++kx) {
+                const int iy = y * 2 + ky, ix = x * 2 + kx;
+                if (iy >= h || ix >= w_in) continue;  // zero-pad on right/bottom
+                acc += float(w[(std::int64_t)co * c * 9 + (std::int64_t)ci * 9 + ky * 3 + kx]) *
+                       float(in[(std::int64_t)ci * h * w_in + (std::int64_t)iy * w_in + ix]);
+            }
+        }
+    }
+    out[(std::int64_t)co * h_out * w_out + (std::int64_t)y * w_out + x] = hip_bfloat16(acc);
+}
+void downsample2d(const hip_bfloat16* in, const hip_bfloat16* w, const hip_bfloat16* b,
+                  int c, int h, int w_in, hip_bfloat16* out, hipStream_t s) {
+    dim3 blk(8, 8, 1);
+    dim3 grd((w_in / 2 + 7) / 8, (h / 2 + 7) / 8, c);
+    downsample2d_kernel<<<grd, blk, 0, s>>>(in, w, b, c, h, w_in, out);
+}
+
+// AvgDown shortcut: 2x spatial avg-pool + channel grouping.
+// in: [C, H, W] -> out: [cout, H/2, W/2]. group = C*4 / cout.
+// out[oc,y,x] = (1/group) * sum_g in_pooled[oc*group+g, y, x]
+//   where in_pooled[ch,y,x] = in[ch/4, 2y+(ch%4)/2, 2x+(ch%4)%2]
+__global__ void avg_down_kernel(const hip_bfloat16* __restrict__ in, int h, int w, int cout, int group,
+                                hip_bfloat16* __restrict__ out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int oc = blockIdx.z;
+    const int w_out = w / 2, h_out = h / 2;
+    if (x >= w_out || y >= h_out || oc >= cout) return;
+    float acc = 0.0f;
+    for (int g = 0; g < group; ++g) {
+        const int ch = oc * group + g;      // index in [C*4] space
+        const int ci = ch / 4;
+        const int fy = (ch % 4) / 2;
+        const int fx = (ch % 4) % 2;
+        acc += float(in[(std::int64_t)ci * h * w + (std::int64_t)(y * 2 + fy) * w + (x * 2 + fx)]);
+    }
+    out[(std::int64_t)oc * h_out * w_out + (std::int64_t)y * w_out + x] = hip_bfloat16(acc / (float)group);
+}
+void avg_down(const hip_bfloat16* in, int c, int h, int w, int cout, hip_bfloat16* out, hipStream_t s) {
+    const int group = c * 4 / cout;
+    dim3 blk(8, 8, 1);
+    dim3 grd((w / 2 + 7) / 8, (h / 2 + 7) / 8, cout);
+    avg_down_kernel<<<grd, blk, 0, s>>>(in, h, w, cout, group, out);
+}
+
+
+// [debug] dump mean/std of a [c,h,w] bf16 map to /tmp/enc_act.log
+
+// Identity channel-group (block 4: factor_s=1, group=1). Just a copy.
+void vae_encode(const VaeWeights& w, const Tensor& image, Tensor& out_latent,
+                VaeWorkspace& ws, hipStream_t s) {
+    const int H = image.ne[2], W = image.ne[3];
+    const int C0 = 4;
+    // dims: [96, 96, 192, 384, 768, 768]; blocks 0-3 downsample, block 4 does not.
+    const int dims[6] = {96, 96, 192, 384, 768, 768};
+
+    // conv_in: 4 -> 96
+    {
+        Tensor in_t = t3(reinterpret_cast<const hip_bfloat16*>(image.data), C0, H, W);
+        Tensor win = t4(reinterpret_cast<void*>(const_cast<hip_bfloat16*>(w.enc_conv_in)), 96, C0, 3, 3);
+        Tensor bin = t1(reinterpret_cast<void*>(const_cast<hip_bfloat16*>(w.enc_conv_in_b)), 96);
+        Tensor a0 = t3(ws.a, 96, H, W);
+        ops::conv2d_3x3(in_t, win, bin, a0, s);
+    }
+    hip_bfloat16* cur = ws.a; int ch = 96; int hh = H, ww = W;
+    for (int i = 0; i < 5; ++i) {
+        const int cin = dims[i], cout = dims[i + 1];
+        // avg_shortcut input (clone of cur before resnets)
+        copy_bf16(cur, (std::int64_t)cin * hh * ww, ws.h, s);
+        resnet(w.enc_down_blocks[i].resnets[0], cur, cin, cout, hh, ww, ws.a, ws, s);
+        resnet(w.enc_down_blocks[i].resnets[1], ws.a, cout, cout, hh, ww, ws.b, ws, s);
+        cur = ws.b;
+        if (w.enc_down_blocks[i].has_down) {
+            downsample2d(cur, w.enc_down_blocks[i].resample, w.enc_down_blocks[i].resample_b,
+                         cout, hh, ww, ws.c, s);
+            cur = ws.c; hh /= 2; ww /= 2;
+        }
+        // add avg_shortcut(ws.h)
+        if (i < 4) {
+            avg_down(ws.h, cin, hh * 2, ww * 2, cout, ws.d, s);
+            add(cur, ws.d, (std::int64_t)cout * hh * ww, cur, s);
+        } else {
+            // block 4: identity shortcut (group=1, no spatial change)
+            add(cur, ws.h, (std::int64_t)cout * hh * ww, cur, s);
+        }
+            }
+    ch = dims[5];  // 768: output of the last down_block
+    // mid_block: resnet, attention, resnet
+    resnet(w.enc_mid_resnets[0], cur, ch, ch, hh, ww, ws.a, ws, s);
+    // Encoder-specific attention (reads w.enc_mid_attn_*). Input ws.a, output ws.b.
+    {
+        const int dim = ch, hw = hh * ww;
+        const std::int64_t n = (std::int64_t)dim * hw;
+        copy_bf16(ws.a, n, ws.c, s);  // preserve input for the residual
+        rms_channels(ws.c, w.enc_mid_attn_norm, dim, hh, ww, ws.a, s);
+        conv1x1(ws.a, w.enc_mid_attn_to_qkv, w.enc_mid_attn_to_qkv_b, dim, 3 * dim, hw, ws.e, s);
+        const hip_bfloat16* q = ws.e;
+        const hip_bfloat16* k = ws.e + n;
+        const hip_bfloat16* v = ws.e + 2 * n;
+        dim3 blk(256);
+        attn_row_kernel<<<hw, blk, 0, s>>>(q, k, dim, hw, ws.f);
+        dim3 grd((n + 255) / 256);
+        attn_out_kernel<<<grd, blk, 0, s>>>(ws.f, v, dim, hw, ws.g);
+        conv1x1(ws.g, w.enc_mid_attn_proj, w.enc_mid_attn_proj_b, dim, dim, hw, ws.a, s);
+        add(ws.a, ws.c, n, ws.b, s);  // attention out + input residual
+    }
+    resnet(w.enc_mid_resnets[1], ws.b, ch, ch, hh, ww, ws.c, ws, s);
+    cur = ws.c;
+    // norm_out + silu + conv_out (768 -> 128)
+    rms_channels(cur, w.enc_norm_out, ch, hh, ww, ws.c, s);
+    silu(ws.c, (std::int64_t)ch * hh * ww, ws.d, s);
+    {
+        Tensor in_t = t3(ws.d, ch, hh, ww);
+        Tensor win = t4(reinterpret_cast<void*>(const_cast<hip_bfloat16*>(w.enc_conv_out)), 128, ch, 3, 3);
+        Tensor bin = t1(reinterpret_cast<void*>(const_cast<hip_bfloat16*>(w.enc_conv_out_b)), 128);
+        Tensor a0 = t3(ws.e, 128, hh, ww);
+        ops::conv2d_3x3(in_t, win, bin, a0, s);
+    }
+    // quant_conv (1x1, 128 -> 128)
+    conv1x1(ws.e, w.enc_quant_conv, w.enc_quant_conv_b, 128, 128, hh * ww, ws.f, s);
+    // mode: take first 64 channels -> out_latent [64, hh, ww]
+    {
+        const int out_h = hh, out_w = ww;
+        // ws.f is [128, hh, ww] NCHW. Take channels 0..63 (the first 64*hw*2 bytes).
+        (void)hipMemcpyAsync(out_latent.data, ws.f, (std::int64_t)64 * out_h * out_w * 2,
+                             hipMemcpyDeviceToDevice, s);
+    }
+}
+
 } // namespace detail
 } // namespace ninfer::targets::qwen_image_vae

@@ -74,7 +74,7 @@ ImageProgram::ImageProgram(std::unique_ptr<Impl> impl) noexcept : impl_(std::mov
 ImageProgram::~ImageProgram() = default;
 
 void ImageProgram::denoise(const Tensor& text_emb, int grid_h, int grid_w, Tensor& latent,
-                           hipStream_t stream) const {
+                           hipStream_t stream, float strength) const {
     auto& ws    = impl_->workspace;
     const int S = static_cast<int>(text_emb.ne[1]) + grid_h * grid_w;
     if (ws.capacity < S) {
@@ -104,7 +104,7 @@ void ImageProgram::denoise(const Tensor& text_emb, int grid_h, int grid_w, Tenso
         }
         ws.capacity = S;
     }
-    dit_denoise(impl_->model->weights(), text_emb, grid_h, grid_w, latent, ws, stream);
+    dit_denoise(impl_->model->weights(), text_emb, grid_h, grid_w, latent, ws, stream, strength);
 }
 
 } // namespace detail
