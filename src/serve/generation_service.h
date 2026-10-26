@@ -169,9 +169,10 @@ public:
     [[nodiscard]] std::vector<std::uint8_t>
     image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                   int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
-                  const std::vector<ninfer::LoraRef>& loras = {}, float strength = 1.0f) const {
+                  const std::vector<ninfer::LoraRef>& loras = {}, float strength = 1.0f,
+                  const std::vector<std::uint8_t>& cond_bytes = {}, int cond_h = 0, int cond_w = 0) const {
         return engine_->image_denoise(emb_bytes, emb_bytes_count, M, image_h, image_w, noise, seed,
-                                     loras, strength);
+                                     loras, strength, cond_bytes, cond_h, cond_w);
     }
     // VAE encode (img2img): image [1,4,H,W] -> latent [1,64,H/16,W/16].
     [[nodiscard]] std::vector<std::uint8_t>

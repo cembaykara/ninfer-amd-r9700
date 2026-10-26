@@ -13,6 +13,7 @@
 #include <hip/hip_bfloat16.h>
 
 #include <cmath>
+#include <fstream>
 #include <vector>
 
 namespace ninfer::targets::qwen_image_21::detail {
@@ -26,16 +27,29 @@ constexpr int C = DitConfig::in_channels;
 
 float bf16_round(float v) { return static_cast<float>(hip_bfloat16(v)); }
 
-// [S][64] (cos, sin). Text advances one position on all three axes; the image freezes the frame
-// axis at M and lays its tokens on a height/width grid centred on zero.
-void upload_rope(float* dst, int M, int grid_h, int grid_w, hipStream_t stream) {
-    const int S = M + grid_h * grid_w;
+// [S][64] (cos, sin). Text advances one position on all three axes. Each image block freezes the
+// frame axis at the position reached by the preceding text and lays its tokens on a height/width
+// grid centred on zero. The condition block freezes at M; the target block freezes at
+// M + max(cond_h, cond_w) (the reference advances the frame by max(h, w) per block).
+void upload_rope(float* dst, int M, int cond_h, int cond_w, int grid_h, int grid_w, hipStream_t stream) {
+    const int Nc = cond_h * cond_w;
+    const int Nt = grid_h * grid_w;
+    const int S = M + Nc + Nt;
     std::vector<int> frame(S), height(S), width(S);
     for (int t = 0; t < M; t++) frame[t] = height[t] = width[t] = t;
+    for (int y = 0; y < cond_h; y++) {
+        for (int x = 0; x < cond_w; x++) {
+            const int t = M + y * cond_w + x;
+            frame[t]  = M;
+            height[t] = y - (cond_h - cond_h / 2);
+            width[t]  = x - (cond_w - cond_w / 2);
+        }
+    }
+    const int target_frame = M + std::max(cond_h, cond_w);
     for (int y = 0; y < grid_h; y++) {
         for (int x = 0; x < grid_w; x++) {
-            const int t = M + y * grid_w + x;
-            frame[t]  = M;
+            const int t = M + Nc + y * grid_w + x;
+            frame[t]  = target_frame;
             height[t] = y - (grid_h - grid_h / 2);
             width[t]  = x - (grid_w - grid_w / 2);
         }
@@ -74,13 +88,42 @@ void upload_timestep(hip_bfloat16* dst, float sigma, hipStream_t stream) {
     HIP_CHECK(hipStreamSynchronize(stream));
 }
 
-void forward(const DitWeights& w, const Tensor& latent, float sigma, int M, int N, DitWorkspace& ws,
-             Tensor& velocity, hipStream_t stream) {
-    const int S = M + N;
+void forward(const DitWeights& w, const Tensor& latent, const Tensor& cond_latent, float sigma, int M,
+             int Nc, int Nt, DitWorkspace& ws, Tensor& velocity, hipStream_t stream) {
+    const int S = M + Nc + Nt;
+    const int cond_end = M + Nc; // end of the condition block (text + condition boundary)
+    if (std::getenv("NINFER_DIT_TXT_DUMP") != nullptr) {
+        HIP_CHECK(hipStreamSynchronize(stream));
+        std::ofstream tf(std::getenv("NINFER_DIT_TXT_DUMP"), std::ios::binary);
+        tf.write(reinterpret_cast<const char*>(ws.txt),
+                 (std::streamsize)(std::size_t)H * M * 2);
+    }
+    if (std::getenv("NINFER_DIT_TARGET_DUMP") != nullptr) {
+        HIP_CHECK(hipStreamSynchronize(stream));
+        std::ofstream df(std::getenv("NINFER_DIT_TARGET_DUMP"), std::ios::binary);
+        df.write(reinterpret_cast<const char*>(latent.data),
+                 (std::streamsize)(std::size_t)64 * Nt * 2);
+    }
+    if (Nc > 0 && std::getenv("NINFER_DIT_PACK_DUMP") != nullptr) {
+        HIP_CHECK(hipStreamSynchronize(stream));
+        std::ofstream pf(std::getenv("NINFER_DIT_PACK_DUMP"), std::ios::binary);
+        pf.write(reinterpret_cast<const char*>(cond_latent.data),
+                 (std::streamsize)(std::size_t)64 * Nc * 2);
+    }
 
     Tensor hs(ws.hs, DType::BF16, {H, S});
     HIP_CHECK(hipMemcpyAsync(ws.hs, ws.txt, (std::size_t)M * H * 2, hipMemcpyDeviceToDevice, stream));
-    Tensor img(ws.hs + (std::size_t)M * H, DType::BF16, {H, N});
+    if (Nc > 0) {
+        Tensor cond(ws.hs + (std::size_t)M * H, DType::BF16, {H, Nc});
+        dit_linear(cond_latent, w.img_in, cond, stream);
+        if (std::getenv("NINFER_DIT_EMB_DUMP") != nullptr) {
+        HIP_CHECK(hipStreamSynchronize(stream));
+        std::ofstream ef(std::getenv("NINFER_DIT_EMB_DUMP"), std::ios::binary);
+        ef.write(reinterpret_cast<const char*>(cond.data),
+                 (std::streamsize)(std::size_t)H * Nc * 2);
+    }
+    }
+    Tensor img(ws.hs + (std::size_t)cond_end * H, DType::BF16, {H, Nt});
     dit_linear(latent, w.img_in, img, stream);
 
     upload_timestep(ws.t_sin, sigma, stream);
@@ -112,8 +155,14 @@ void forward(const DitWeights& w, const Tensor& latent, float sigma, int M, int 
     Tensor act(ws.act, DType::BF16, {I, S});
 
     for (int l = 0; l < DitConfig::layers; l++) {
+        if (l == 0 && std::getenv("NINFER_DIT_PRE0_DUMP") != nullptr) {
+        HIP_CHECK(hipStreamSynchronize(stream));
+        std::ofstream hf(std::getenv("NINFER_DIT_PRE0_DUMP"), std::ios::binary);
+        hf.write(reinterpret_cast<const char*>(ws.hs),
+                 (std::streamsize)(std::size_t)H * S * 2);
+    }
         dit_layer_norm(hs, DitConfig::eps, x1, stream);
-        dit_modulate(x1, mod_img + DitConfig::modulation_scale1, mod_txt + DitConfig::modulation_scale1, M,
+        dit_modulate(x1, mod_img + DitConfig::modulation_scale1, mod_txt + DitConfig::modulation_scale1, cond_end,
                      stream);
         dit_linear(x1, w.to_q[l], q, stream);
         dit_linear(x1, w.to_k[l], k, stream);
@@ -124,34 +173,35 @@ void forward(const DitWeights& w, const Tensor& latent, float sigma, int M, int 
                 stream);
         dit_rope(ws.freqs, qn, kn, stream);
         Tensor attn_heads = attn.view({DitConfig::head_dim, DitConfig::heads, S});
-        dit_mha(qn, kn, v.view({DitConfig::head_dim, DitConfig::heads, S}), M, attn_heads, stream);
+        dit_mha(qn, kn, v.view({DitConfig::head_dim, DitConfig::heads, S}), M, cond_end, attn_heads, stream);
         dit_linear(attn, w.to_out[l], x2, stream);
-        dit_residual_gate(hs, mod_img + DitConfig::modulation_gate1, mod_txt + DitConfig::modulation_gate1, M,
+        dit_residual_gate(hs, mod_img + DitConfig::modulation_gate1, mod_txt + DitConfig::modulation_gate1, cond_end,
                           x2, stream);
 
         dit_layer_norm(hs, DitConfig::eps, x1, stream);
-        dit_modulate(x1, mod_img + DitConfig::modulation_scale2, mod_txt + DitConfig::modulation_scale2, M,
+        dit_modulate(x1, mod_img + DitConfig::modulation_scale2, mod_txt + DitConfig::modulation_scale2, cond_end,
                      stream);
         dit_linear(x1, w.mlp_gate[l], gate, stream);
         dit_linear(x1, w.mlp_up[l], up, stream);
         silu_mul(gate, up, act, stream);
         dit_linear(act, w.mlp_down[l], x2, stream);
-        dit_residual_gate(hs, mod_img + DitConfig::modulation_gate2, mod_txt + DitConfig::modulation_gate2, M,
+        dit_residual_gate(hs, mod_img + DitConfig::modulation_gate2, mod_txt + DitConfig::modulation_gate2, cond_end,
                           x2, stream);
     }
 
     dit_layer_norm(hs, DitConfig::eps, x1, stream);
-    dit_modulate(x1, ws.out_scale, ws.out_scale + H, M, stream);
-    const Tensor x1_img(ws.x1 + (std::size_t)M * H, DType::BF16, {H, N});
+    dit_modulate(x1, ws.out_scale, ws.out_scale + H, cond_end, stream);
+    const Tensor x1_img(ws.x1 + (std::size_t)cond_end * H, DType::BF16, {H, Nt});
     dit_linear(x1_img, w.proj_out, velocity, stream);
 }
 
 } // namespace
 
-void dit_denoise(const DitWeights& w, const Tensor& text_emb, int grid_h, int grid_w, Tensor& latent,
-                 DitWorkspace& ws, hipStream_t stream, float strength) {
+void dit_denoise(const DitWeights& w, const Tensor& text_emb, int cond_h, int cond_w, int grid_h, int grid_w,
+                 const Tensor& cond_latent, Tensor& latent, DitWorkspace& ws, hipStream_t stream) {
     const int M = (int)text_emb.ne[1];
-    const int N = grid_h * grid_w;
+    const int Nc = cond_h * cond_w;
+    const int Nt = grid_h * grid_w;
 
     // The text stream does not depend on the timestep: project it once.
     Tensor x1(ws.x1, DType::BF16, {H, M});
@@ -162,18 +212,17 @@ void dit_denoise(const DitWeights& w, const Tensor& text_emb, int grid_h, int gr
     gelu(x2, GeluMode::Tanh, stream);
     dit_linear(x2, w.txt_in_out_layer, txt, stream);
 
-    upload_rope(ws.freqs, M, grid_h, grid_w, stream);
+    upload_rope(ws.freqs, M, cond_h, cond_w, grid_h, grid_w, stream);
 
-    Tensor velocity(ws.velocity, DType::BF16, {C, N});
+    Tensor velocity(ws.velocity, DType::BF16, {C, Nt});
     const auto& sigmas = DitConfig::sample_sigmas;
     constexpr int steps = sizeof(DitConfig::sample_sigmas) / sizeof(float);
-    // img2img: scale the schedule by `strength` (1.0 = pure generation). The initial latent
-    // is x_strength = (1-strength)*x0 + strength*noise, set by the caller.
-    const float sc = (strength > 0.0F) ? strength : 1.0F;
+    // Causal conditioning: FULL sigmas (1.0 -> 0) for both T2I and image-conditioned generation.
+    // The condition latent is a fixed prefix (not updated); only the target latent is denoised.
     for (int i = 0; i < steps; i++) {
-        const float cur  = sigmas[i] * sc;
-        const float next = (i + 1 < steps ? sigmas[i + 1] : 0.0F) * sc;
-        forward(w, latent, cur, M, N, ws, velocity, stream);
+        const float cur  = sigmas[i];
+        const float next = (i + 1 < steps ? sigmas[i + 1] : 0.0F);
+        forward(w, latent, cond_latent, cur, M, Nc, Nt, ws, velocity, stream);
         dit_euler(latent, velocity, next - cur, stream);
     }
 }

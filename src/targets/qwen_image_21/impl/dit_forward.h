@@ -62,9 +62,10 @@ struct DitWorkspace {
     hip_bfloat16* out_scale = nullptr;  // {H, 2}
 };
 
-// Denoise `latent` {64, N} in place. text_emb is {4096, M}; the image is grid_h x grid_w tokens
-// (N = grid_h * grid_w). `latent` holds the initial noise on entry.
-void dit_denoise(const DitWeights& w, const Tensor& text_emb, int grid_h, int grid_w, Tensor& latent,
-                 DitWorkspace& ws, hipStream_t stream, float strength = 1.0f);
+// Denoise the target latent {64, Nt} in place. text_emb is {4096, M}; the target is grid_h x grid_w
+// tokens (Nt = grid_h * grid_w). cond_latent is the condition {64, Nc} (Nc = cond_h * cond_w);
+// pass a zero-sized tensor for text-to-image. `latent` holds the initial noise on entry.
+void dit_denoise(const DitWeights& w, const Tensor& text_emb, int cond_h, int cond_w, int grid_h, int grid_w,
+                 const Tensor& cond_latent, Tensor& latent, DitWorkspace& ws, hipStream_t stream);
 
 } // namespace ninfer::targets::qwen_image_21::detail

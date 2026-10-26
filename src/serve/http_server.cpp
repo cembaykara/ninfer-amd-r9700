@@ -474,6 +474,10 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_vae_encode(req, res);
                  });
+    server_.Post("/v1/ninfer/vae/debug",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_vae_debug(req, res);
+                 });
     server_.Post("/v1/ninfer/dit/denoise",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_dit_denoise(req, res);
@@ -673,6 +677,74 @@ void HttpServer::handle_vae_encode(const httplib::Request& req, httplib::Respons
     res.set_content(response.dump(), "application/json");
 }
 
+
+void HttpServer::handle_vae_debug(const httplib::Request& req, httplib::Response& res) {
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(req.body);
+    } catch (const std::exception& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_json";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    }
+    const int H = body.value("height", 0);
+    const int W = body.value("width", 0);
+    if (H <= 0 || W <= 0 || H % 16 != 0 || W % 16 != 0) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_dimensions";
+        error.message = "height and width must be positive multiples of 16";
+        emit_openai_error(res, error);
+        return;
+    }
+    const std::vector<std::uint8_t> image_bytes = b64_decode(body.value("image", ""));
+    const std::size_t expected = (std::size_t)4 * H * W * 2;
+    if (image_bytes.size() != expected) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_image";
+        error.message = "image byte count does not match height/width";
+        emit_openai_error(res, error);
+        return;
+    }
+    std::vector<std::uint8_t> latent;
+    try {
+        latent = service_->image_vae_encode(image_bytes.data(), image_bytes.size(), H, W);
+    } catch (const std::logic_error& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "wrong_component";
+        error.code    = "invalid";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    }
+    std::vector<std::uint8_t> decoded;
+    try {
+        decoded = service_->image_decode(latent.data(), latent.size(), H, W);
+    } catch (const std::logic_error& e) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "wrong_component";
+        error.code    = "invalid";
+        error.message = e.what();
+        emit_openai_error(res, error);
+        return;
+    }
+    nlohmann::json response;
+    response["latent"] = b64_encode(latent.data(), latent.size());
+    response["image"]  = b64_encode(decoded.data(), decoded.size());
+    response["height"] = H;
+    response["width"]  = W;
+    res.set_content(response.dump(), "application/json");
+}
+
 void HttpServer::handle_dit_denoise(const httplib::Request& req, httplib::Response& res) {
     nlohmann::json body;
     try {
@@ -710,6 +782,10 @@ void HttpServer::handle_dit_denoise(const httplib::Request& req, httplib::Respon
         return;
     }
     const std::vector<std::uint8_t> noise = b64_decode(body.value("noise", ""));
+    // Causal conditioning: the normalized condition latent (base64) + its grid. Empty for T2I.
+    const std::vector<std::uint8_t> cond_latent = b64_decode(body.value("cond_latent", ""));
+    const int cond_h = body.value("cond_h", 0);
+    const int cond_w = body.value("cond_w", 0);
     const std::uint64_t seed = body.value("seed", std::uint64_t{0});
     std::vector<ninfer::LoraRef> loras;
     if (body.contains("loras") && !body["loras"].is_null()) {
@@ -781,7 +857,7 @@ void HttpServer::handle_dit_denoise(const httplib::Request& req, httplib::Respon
     try {
         const float strength = body.value("strength", 1.0f);
         latent = service_->image_denoise(emb_bytes.data(), emb_bytes.size(), M, image_h, image_w, noise,
-                                         seed, loras, strength);
+                                         seed, loras, strength, cond_latent, cond_h, cond_w);
     } catch (const std::invalid_argument& e) {
         ApiError error;
         error.status  = 400;

@@ -517,7 +517,10 @@ Engine::image_vae_encode(const std::uint8_t* image_bytes, std::size_t image_byte
 std::vector<std::uint8_t>
 Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                       int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
-                      const std::vector<LoraRef>& loras, float strength) const {
+                      const std::vector<LoraRef>& loras, float strength,
+                      const std::vector<std::uint8_t>& cond_bytes, int cond_h, int cond_w) const {
+    // Causal conditioning runs FULL sigmas; strength is kept for API compatibility.
+    (void)strength;
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     std::lock_guard<std::mutex> lock(impl_->model_mu);
     const auto& target = dit_target(impl_->active);
@@ -559,10 +562,23 @@ Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count
     HIP_CHECK(hipMalloc(&d_latent.p, latent_bytes));
     HIP_CHECK(hipMemcpy(d_latent.p, latent_host.data(), latent_bytes, hipMemcpyHostToDevice));
     Tensor out_latent(d_latent.p, DType::BF16, {64, grid_h * grid_w});
+    // Condition latent (the normalized input image); empty for text-to-image.
+    DeviceBuf d_cond;
+    Tensor cond_latent;
+    if (cond_h > 0 && cond_w > 0) {
+        const std::size_t cond_bytes_expected = (std::size_t)cond_h * cond_w * 64 * 2;
+        if (cond_bytes.size() != cond_bytes_expected) {
+            throw std::invalid_argument("image_denoise: condition byte count does not match the grid");
+        }
+        HIP_CHECK(hipMalloc(&d_cond.p, cond_bytes_expected));
+        HIP_CHECK(hipMemcpy(d_cond.p, cond_bytes.data(), cond_bytes_expected, hipMemcpyHostToDevice));
+        cond_latent = Tensor(d_cond.p, DType::BF16, {64, cond_h * cond_w});
+    }
+    // T2I: cond_latent stays default-constructed (the forward skips it when Nc == 0).
     // No LoRA: the weights loaded from the DiT file stay as they are. Each LoRA adds
     // scale * (B @ A) for this call (scale defaults to 1) and the weights are restored after.
     const auto run_denoise = [&]() {
-        target.loaded->program->denoise(emb, grid_h, grid_w, out_latent, impl_->device.stream, strength);
+        target.loaded->program->denoise(emb, cond_h, cond_w, grid_h, grid_w, cond_latent, out_latent, impl_->device.stream);
     };
     if (loras.empty()) {
         run_denoise();

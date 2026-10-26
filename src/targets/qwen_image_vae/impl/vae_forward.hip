@@ -247,6 +247,28 @@ void dup_up(const hip_bfloat16* in, int cin, int cout, int h, int w, int factor_
 
 namespace detail {
 
+// Shared per-channel latent scale tables (DiT-space <-> raw-space). Lazily
+// uploaded once; both encode and decode use them. Function-local statics keep
+// the host arrays out of device symbol space.
+inline void ensure_scale_tables(hipStream_t s, float** mean, float** stdv) {
+    static float* d_mean = nullptr;
+    static float* d_std = nullptr;
+    if (d_mean == nullptr) {
+        const float mean_host[64] = {0.51260000f, 0.77210000f, -0.06310000f, 1.35060000f, -0.78550000f, -2.10250000f, -0.34580000f, 1.37220000f, 1.88730000f, -1.71770000f, -0.65100000f, 0.27320000f, 0.75620000f, -0.61630000f, -1.02770000f, 3.83630000f, 2.02100000f, 0.04720000f, 0.93200000f, 2.00870000f, 2.49540000f, -0.13910000f, -1.42490000f, 1.84640000f, -0.52360000f, 1.28260000f, 3.70460000f, -1.30350000f, 2.72860000f, -1.45180000f, -1.90360000f, -1.99550000f, -0.03420000f, -1.02650000f, -0.76360000f, 3.05550000f, 0.07460000f, -3.07510000f, -0.10760000f, 1.73760000f, -1.09140000f, -1.94350000f, -0.27840000f, -1.36800000f, 0.48090000f, -0.44330000f, 0.37640000f, 0.57290000f, -2.05950000f, 1.09600000f, -1.32600000f, -2.02110000f, -5.01790000f, 0.52750000f, 4.01620000f, 1.85050000f, 0.30260000f, 1.93730000f, 1.49370000f, 0.26320000f, 0.55470000f, -1.71210000f, -0.15620000f, 0.03040000f};
+        const float std_host[64] = {3.20010000f, 3.29360000f, 3.43210000f, 3.00910000f, 3.10610000f, 4.03790000f, 4.07050000f, 3.79100000f, 3.07850000f, 3.65000000f, 3.93080000f, 3.09040000f, 2.87780000f, 3.76750000f, 3.73200000f, 5.07560000f, 3.28640000f, 4.03970000f, 3.13170000f, 4.04430000f, 2.92490000f, 3.94540000f, 3.09880000f, 4.24890000f, 3.48960000f, 3.85130000f, 3.93230000f, 3.47190000f, 3.74980000f, 4.28300000f, 3.56940000f, 4.24670000f, 3.90370000f, 3.29470000f, 5.07700000f, 3.50750000f, 3.27000000f, 3.47670000f, 2.80630000f, 5.11250000f, 3.53270000f, 4.78330000f, 3.12860000f, 4.18190000f, 3.85270000f, 3.83120000f, 3.56050000f, 4.38750000f, 3.96240000f, 4.01680000f, 3.56430000f, 4.05500000f, 5.56140000f, 4.29630000f, 4.40800000f, 3.49590000f, 3.87470000f, 3.76080000f, 3.57350000f, 3.14900000f, 3.76620000f, 3.67460000f, 3.45630000f, 3.81610000f};
+        HIP_CHECK(hipMalloc(&d_mean, sizeof(mean_host)));
+        HIP_CHECK(hipMalloc(&d_std, sizeof(std_host)));
+        HIP_CHECK(hipMemcpyAsync(d_mean, mean_host, sizeof(mean_host), hipMemcpyHostToDevice, s));
+        HIP_CHECK(hipMemcpyAsync(d_std, std_host, sizeof(std_host), hipMemcpyHostToDevice, s));
+        float uploaded = 0.0f;
+        HIP_CHECK(hipMemcpyAsync(&uploaded, d_std, sizeof(float), hipMemcpyDeviceToHost, s));
+        HIP_CHECK(hipStreamSynchronize(s));
+        if (!(uploaded > 1.0f)) throw std::runtime_error("vae latent scale was not uploaded");
+    }
+    *mean = d_mean;
+    *stdv = d_std;
+}
+
 // Packed DiT latent [H*W, 64] -> NCHW [64, H, W], then z * std + mean.
 // The tables live in the host function below. A file-scope array in this .hip
 // file is a device symbol, and copying it with hipMemcpyHostToDevice uploads zeros.
@@ -278,28 +300,9 @@ void vae_decode(const VaeWeights& w, const Tensor& latent, Tensor& out_image,
                 VaeWorkspace& ws, hipStream_t s) {
     const int h0 = latent.ne[2], w0 = latent.ne[3];
 
-    static float* d_mean = nullptr;
-    static float* d_std = nullptr;
-    if (d_mean == nullptr) {
-        // Function-local, so hipcc keeps these in host memory.
-        const float mean_host[64] = {0.51260000f, 0.77210000f, -0.06310000f, 1.35060000f, -0.78550000f, -2.10250000f, -0.34580000f, 1.37220000f, 1.88730000f, -1.71770000f, -0.65100000f, 0.27320000f, 0.75620000f, -0.61630000f, -1.02770000f, 3.83630000f, 2.02100000f, 0.04720000f, 0.93200000f, 2.00870000f, 2.49540000f, -0.13910000f, -1.42490000f, 1.84640000f, -0.52360000f, 1.28260000f, 3.70460000f, -1.30350000f, 2.72860000f, -1.45180000f, -1.90360000f, -1.99550000f, -0.03420000f, -1.02650000f, -0.76360000f, 3.05550000f, 0.07460000f, -3.07510000f, -0.10760000f, 1.73760000f, -1.09140000f, -1.94350000f, -0.27840000f, -1.36800000f, 0.48090000f, -0.44330000f, 0.37640000f, 0.57290000f, -2.05950000f, 1.09600000f, -1.32600000f, -2.02110000f, -5.01790000f, 0.52750000f, 4.01620000f, 1.85050000f, 0.30260000f, 1.93730000f, 1.49370000f, 0.26320000f, 0.55470000f, -1.71210000f, -0.15620000f, 0.03040000f};
-        const float std_host[64] = {3.20010000f, 3.29360000f, 3.43210000f, 3.00910000f, 3.10610000f, 4.03790000f, 4.07050000f, 3.79100000f, 3.07850000f, 3.65000000f, 3.93080000f, 3.09040000f, 2.87780000f, 3.76750000f, 3.73200000f, 5.07560000f, 3.28640000f, 4.03970000f, 3.13170000f, 4.04430000f, 2.92490000f, 3.94540000f, 3.09880000f, 4.24890000f, 3.48960000f, 3.85130000f, 3.93230000f, 3.47190000f, 3.74980000f, 4.28300000f, 3.56940000f, 4.24670000f, 3.90370000f, 3.29470000f, 5.07700000f, 3.50750000f, 3.27000000f, 3.47670000f, 2.80630000f, 5.11250000f, 3.53270000f, 4.78330000f, 3.12860000f, 4.18190000f, 3.85270000f, 3.83120000f, 3.56050000f, 4.38750000f, 3.96240000f, 4.01680000f, 3.56430000f, 4.05500000f, 5.56140000f, 4.29630000f, 4.40800000f, 3.49590000f, 3.87470000f, 3.76080000f, 3.57350000f, 3.14900000f, 3.76620000f, 3.67460000f, 3.45630000f, 3.81610000f};
-        float* mean = nullptr;
-        float* stdv = nullptr;
-        HIP_CHECK(hipMalloc(&mean, sizeof(mean_host)));
-        HIP_CHECK(hipMalloc(&stdv, sizeof(std_host)));
-        HIP_CHECK(hipMemcpyAsync(mean, mean_host, sizeof(mean_host), hipMemcpyHostToDevice, s));
-        HIP_CHECK(hipMemcpyAsync(stdv, std_host, sizeof(std_host), hipMemcpyHostToDevice, s));
-        float uploaded = 0.0f;
-        HIP_CHECK(hipMemcpyAsync(&uploaded, stdv, sizeof(float), hipMemcpyDeviceToHost, s));
-        HIP_CHECK(hipStreamSynchronize(s));
-        // A zero table decodes every latent as the VAE's average color.
-        if (!(uploaded > 1.0f)) {
-            throw std::runtime_error("vae latent scale was not uploaded");
-        }
-        d_mean = mean;
-        d_std = stdv;
-    }
+    float* d_mean = nullptr;
+    float* d_std = nullptr;
+    ensure_scale_tables(s, &d_mean, &d_std);
     scale_latent_kernel<<<dim3((w0 + 7) / 8, (h0 + 7) / 8, 64), dim3(8, 8, 1), 0, s>>>(
         reinterpret_cast<const hip_bfloat16*>(latent.data), h0, w0, d_mean, d_std, ws.b);
     conv1x1(ws.b, w.post_quant, w.post_quant_b, kLatentCh, kLatentCh, h0 * w0, ws.c, s);
@@ -414,6 +417,19 @@ void avg_down(const hip_bfloat16* in, int c, int h, int w, int cout, hip_bfloat1
 // [debug] dump mean/std of a [c,h,w] bf16 map to /tmp/enc_act.log
 
 // Identity channel-group (block 4: factor_s=1, group=1). Just a copy.
+// NCHW [64,h,w] (raw latent) -> packed [h*w, 64] in DiT-space: (z - mean)/std.
+// Inverse of the decode's scale_latent_kernel (z*std+mean); matches the DiT latent.
+__global__ void pack_scale_kernel(const hip_bfloat16* __restrict__ nchw, int h, int w,
+                                  const float* __restrict__ mean, const float* __restrict__ stdv,
+                                  hip_bfloat16* __restrict__ packed) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int c = blockIdx.z;
+    if (x >= w || y >= h || c >= 64) return;
+    const float z = float(nchw[(std::int64_t)c * h * w + (std::int64_t)y * w + x]);
+    packed[((std::int64_t)y * w + x) * 64 + c] = hip_bfloat16((z - mean[c]) / stdv[c]);
+}
+
 void vae_encode(const VaeWeights& w, const Tensor& image, Tensor& out_latent,
                 VaeWorkspace& ws, hipStream_t s) {
     const int H = image.ne[2], W = image.ne[3];
@@ -485,12 +501,15 @@ void vae_encode(const VaeWeights& w, const Tensor& image, Tensor& out_latent,
     }
     // quant_conv (1x1, 128 -> 128)
     conv1x1(ws.e, w.enc_quant_conv, w.enc_quant_conv_b, 128, 128, hh * ww, ws.f, s);
-    // mode: take first 64 channels -> out_latent [64, hh, ww]
+    // mode: take first 64 channels, scale to DiT-space (z-mean)/std, pack [h*w, 64]
     {
         const int out_h = hh, out_w = ww;
-        // ws.f is [128, hh, ww] NCHW. Take channels 0..63 (the first 64*hw*2 bytes).
-        (void)hipMemcpyAsync(out_latent.data, ws.f, (std::int64_t)64 * out_h * out_w * 2,
-                             hipMemcpyDeviceToDevice, s);
+        float* d_mean = nullptr;
+        float* d_std = nullptr;
+        ensure_scale_tables(s, &d_mean, &d_std);
+        pack_scale_kernel<<<dim3((out_w + 7) / 8, (out_h + 7) / 8, 64), dim3(8, 8, 1), 0, s>>>(
+            reinterpret_cast<const hip_bfloat16*>(ws.f), out_h, out_w, d_mean, d_std,
+            reinterpret_cast<hip_bfloat16*>(out_latent.data));
     }
 }
 

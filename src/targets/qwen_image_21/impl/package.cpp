@@ -73,10 +73,10 @@ const DitWeights& LoadedModel::weights() const { return impl_->weights; }
 ImageProgram::ImageProgram(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 ImageProgram::~ImageProgram() = default;
 
-void ImageProgram::denoise(const Tensor& text_emb, int grid_h, int grid_w, Tensor& latent,
-                           hipStream_t stream, float strength) const {
+void ImageProgram::denoise(const Tensor& text_emb, int cond_h, int cond_w, int grid_h, int grid_w,
+                           const Tensor& cond_latent, Tensor& latent, hipStream_t stream) const {
     auto& ws    = impl_->workspace;
-    const int S = static_cast<int>(text_emb.ne[1]) + grid_h * grid_w;
+    const int S = static_cast<int>(text_emb.ne[1]) + cond_h * cond_w + grid_h * grid_w;
     if (ws.capacity < S) {
         HIP_CHECK(hipStreamSynchronize(stream));
         constexpr std::size_t H = DitConfig::hidden;
@@ -104,7 +104,7 @@ void ImageProgram::denoise(const Tensor& text_emb, int grid_h, int grid_w, Tenso
         }
         ws.capacity = S;
     }
-    dit_denoise(impl_->model->weights(), text_emb, grid_h, grid_w, latent, ws, stream, strength);
+    dit_denoise(impl_->model->weights(), text_emb, cond_h, cond_w, grid_h, grid_w, cond_latent, latent, ws, stream);
 }
 
 } // namespace detail

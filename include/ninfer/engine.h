@@ -131,7 +131,8 @@ public:
     [[nodiscard]] std::vector<std::uint8_t>
     image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                   int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
-                  const std::vector<LoraRef>& loras = {}, float strength = 1.0f) const;
+                  const std::vector<LoraRef>& loras = {}, float strength = 1.0f,
+                  const std::vector<std::uint8_t>& cond_bytes = {}, int cond_h = 0, int cond_w = 0) const;
     // Encoder (T2I): prompt text -> hidden (host bytes, [1,seq,4096] BF16).
     // The engine tokenizes the prompt using the Qwen3-VL tokenizer.
     [[nodiscard]] std::vector<std::uint8_t>

@@ -340,6 +340,10 @@ Expect expect_for(const std::string& mid) {
     if (mid == "attn.to_v") { return {LoraSlot::Value, h, h, false}; }
     if (mid == "attn.to_out.0") { return {LoraSlot::Output, h, h, false}; }
     if (mid == "img_mlp.gate_up") { return {LoraSlot::Gate, m, h, true}; }
+    // Separate gate/up (the Qwen-Image-2.1-Turbo DiT stores mlp/gate and mlp/up
+    // as distinct tensors; ComfyUI LoRAs name them gate_layer / proj).
+    if (mid == "img_mlp.gate_layer") { return {LoraSlot::Gate, m, h, false}; }
+    if (mid == "img_mlp.proj") { return {LoraSlot::Up, m, h, false}; }
     if (mid == "img_mlp.out") { return {LoraSlot::Down, h, m, false}; }
     fail("unexpected tensor " + mid);
 }
