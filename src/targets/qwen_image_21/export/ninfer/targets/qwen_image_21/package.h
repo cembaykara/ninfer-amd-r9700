@@ -78,8 +78,8 @@ public:
     // text_emb: {4096, M} (from the text encoder); the target is grid_h x grid_w latent tokens.
     // cond_latent {64, cond_h*cond_w} is the (normalized) condition; pass a zero-sized tensor for
     // text-to-image. latent {64, grid_h*grid_w} holds the initial noise and is denoised in place.
-    void denoise(const Tensor& text_emb, int cond_h, int cond_w, int grid_h, int grid_w,
-                 const Tensor& cond_latent, Tensor& latent, hipStream_t stream) const;
+    void denoise(const Tensor& text_emb, int text_split, int vlm_img_tokens, int cond_h, int cond_w,
+                 int grid_h, int grid_w, const Tensor& cond_latent, Tensor& latent, hipStream_t stream) const;
 
 private:
     class Impl;

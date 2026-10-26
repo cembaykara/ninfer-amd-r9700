@@ -786,6 +786,10 @@ void HttpServer::handle_dit_denoise(const httplib::Request& req, httplib::Respon
     const std::vector<std::uint8_t> cond_latent = b64_decode(body.value("cond_latent", ""));
     const int cond_h = body.value("cond_h", 0);
     const int cond_w = body.value("cond_w", 0);
+    // v2v layout: where the VLM image slot sits in text_emb and how many image-pad tokens it
+    // spans (both 0 for T2I). The DiT interleaves [text_before][cond][text_after][target].
+    const int text_split     = body.value("text_split", 0);
+    const int vlm_img_tokens = body.value("vlm_img_tokens", 0);
     const std::uint64_t seed = body.value("seed", std::uint64_t{0});
     std::vector<ninfer::LoraRef> loras;
     if (body.contains("loras") && !body["loras"].is_null()) {
@@ -857,7 +861,8 @@ void HttpServer::handle_dit_denoise(const httplib::Request& req, httplib::Respon
     try {
         const float strength = body.value("strength", 1.0f);
         latent = service_->image_denoise(emb_bytes.data(), emb_bytes.size(), M, image_h, image_w, noise,
-                                         seed, loras, strength, cond_latent, cond_h, cond_w);
+                                         seed, loras, strength, cond_latent, cond_h, cond_w, text_split,
+                                         vlm_img_tokens);
     } catch (const std::invalid_argument& e) {
         ApiError error;
         error.status  = 400;
@@ -961,10 +966,13 @@ void HttpServer::handle_encoder_encode(const httplib::Request& req, httplib::Res
         }
     }
     std::vector<std::uint8_t> hidden;
+    int text_split = 0;
+    int vlm_img_tokens = 0;
     try {
         hidden = image_bytes.empty()
                      ? service_->image_encode(prompt)
-                     : service_->image_encode_v2v(prompt, image_bytes.data(), image_bytes.size());
+                     : service_->image_encode_v2v(prompt, image_bytes.data(), image_bytes.size(), &text_split,
+                                                  &vlm_img_tokens);
     } catch (const std::invalid_argument& e) {
         ApiError error;
         error.status  = 400;
@@ -994,6 +1002,8 @@ void HttpServer::handle_encoder_encode(const httplib::Request& req, httplib::Res
     nlohmann::json response;
     response["hidden"] = b64_encode(hidden.data(), hidden.size());
     response["seq"]    = seq;
+    response["text_split"]     = text_split;
+    response["vlm_img_tokens"] = vlm_img_tokens;
     res.set_content(response.dump(), "application/json");
 }
 

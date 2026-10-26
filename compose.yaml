@@ -4,7 +4,7 @@ name: ninfer-image
 
 services:
   server:
-    image: local/ninfer-r9700:image
+    image: local/ninfer-r9700:compose
     build:
       context: .
       target: runtime

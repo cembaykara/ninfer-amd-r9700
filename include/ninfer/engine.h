@@ -132,14 +132,16 @@ public:
     image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                   int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
                   const std::vector<LoraRef>& loras = {}, float strength = 1.0f,
-                  const std::vector<std::uint8_t>& cond_bytes = {}, int cond_h = 0, int cond_w = 0) const;
+                  const std::vector<std::uint8_t>& cond_bytes = {}, int cond_h = 0, int cond_w = 0,
+                  int text_split = 0, int vlm_img_tokens = 0) const;
     // Encoder (T2I): prompt text -> hidden (host bytes, [1,seq,4096] BF16).
     // The engine tokenizes the prompt using the Qwen3-VL tokenizer.
     [[nodiscard]] std::vector<std::uint8_t>
     image_encode(const std::string& prompt) const;
     std::vector<std::uint8_t>
     image_encode_v2v(const std::string& prompt, const std::uint8_t* image_bytes,
-                     std::size_t image_bytes_count) const;
+                     std::size_t image_bytes_count, int* text_split_out = nullptr,
+                     int* vlm_img_tokens_out = nullptr) const;
 
     // Frees the active target, including its GPU weights, then loads `path`. Encode, denoise,
     // and decode afterwards use that file, and only when it is the matching component. A path

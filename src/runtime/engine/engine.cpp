@@ -518,7 +518,8 @@ std::vector<std::uint8_t>
 Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count, int M, int image_h,
                       int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
                       const std::vector<LoraRef>& loras, float strength,
-                      const std::vector<std::uint8_t>& cond_bytes, int cond_h, int cond_w) const {
+                      const std::vector<std::uint8_t>& cond_bytes, int cond_h, int cond_w,
+                      int text_split, int vlm_img_tokens) const {
     // Causal conditioning runs FULL sigmas; strength is kept for API compatibility.
     (void)strength;
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -578,7 +579,8 @@ Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count
     // No LoRA: the weights loaded from the DiT file stay as they are. Each LoRA adds
     // scale * (B @ A) for this call (scale defaults to 1) and the weights are restored after.
     const auto run_denoise = [&]() {
-        target.loaded->program->denoise(emb, cond_h, cond_w, grid_h, grid_w, cond_latent, out_latent, impl_->device.stream);
+        target.loaded->program->denoise(emb, text_split, vlm_img_tokens, cond_h, cond_w, grid_h, grid_w,
+                                        cond_latent, out_latent, impl_->device.stream);
     };
     if (loras.empty()) {
         run_denoise();
@@ -644,7 +646,8 @@ Engine::image_encode(const std::string& prompt) const {
 // the hidden states.
 std::vector<std::uint8_t>
 Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_bytes,
-                         std::size_t image_bytes_count) const {
+                         std::size_t image_bytes_count, int* text_split_out,
+                         int* vlm_img_tokens_out) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     std::lock_guard<std::mutex> lock(impl_->model_mu);
     const auto& target = encoder_target(impl_->active);
@@ -710,6 +713,8 @@ Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_by
         hf.write(reinterpret_cast<const char*>(hidden_host.data()),
                  (std::streamsize)hidden_host.size());
     }
+    if (text_split_out != nullptr) { *text_split_out = visual_start - kDropTokens; }
+    if (vlm_img_tokens_out != nullptr) { *vlm_img_tokens_out = V; }
     return hidden_host;
 }
 

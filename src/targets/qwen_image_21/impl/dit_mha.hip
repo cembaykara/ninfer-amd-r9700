@@ -45,8 +45,8 @@ __device__ __forceinline__ short bf16_bits(float value) {
 __global__ __launch_bounds__(kThreads) void dit_mha_kernel(const hip_bfloat16* __restrict__ q,
                                                            const hip_bfloat16* __restrict__ k,
                                                            const hip_bfloat16* __restrict__ v,
-                                                           hip_bfloat16* __restrict__ out, int seq,
-                                                           int text_len, int cond_end,
+                                                           hip_bfloat16* __restrict__ out, int seq, int cond_len,
+                                                           int text_before, int text_after,
                                                            std::int64_t stride) {
     __shared__ __attribute__((aligned(16))) short keys[kKeyTile * kKeyPitch];
     __shared__ __attribute__((aligned(16))) short values_t[kHeadDim * kValuePitch];
@@ -76,11 +76,12 @@ __global__ __launch_bounds__(kThreads) void dit_mha_kernel(const hip_bfloat16* _
         }
     }
 
-    // A text tile stops at its last query; a tile that contains any image query runs to the end.
     const int q_last = min(q0 + kQueryTile, seq) - 1;
-    // Text tile stops at its last query; a condition tile stops at the end of the condition
-    // block (text + condition); a tile with any target query runs to the end.
-    const int kv_end = q_last >= cond_end ? seq : (q_last >= text_len ? cond_end : q_last + 1);
+    // Per-segment key range: text_before is causal; cond sees text_before + cond; text_after sees
+    // text_before + cond plus its own causal triangle; target sees every key.
+    const int cond_start   = text_before;
+    const int target_start = text_before + cond_len + text_after;
+    const int kv_end = q_last >= target_start ? seq : (q_last >= cond_start ? target_start : q_last + 1);
 
     float maximum     = -INFINITY;
     float denominator = 0.0F;
@@ -134,7 +135,11 @@ __global__ __launch_bounds__(kThreads) void dit_mha_kernel(const hip_bfloat16* _
 #pragma unroll
             for (int item = 0; item < 8; ++item) {
                 const int key = key_base + key_tile * kMatrixTile + half * kChunk + item;
-                const bool allowed = key < seq && (query >= cond_end || (query >= text_len && key < cond_end) || key <= query);
+                const int cond_end = text_before + cond_len;
+                const bool allowed = key < seq && ((query < text_before && key <= query) ||
+                                                   (query >= text_before && query < cond_end && key < cond_end) ||
+                                                   (query >= cond_end && query < target_start && (key < cond_end || key <= query)) ||
+                                                   (query >= target_start));
                 const float scaled = allowed ? score[key_tile][item] * kLog2Scale : -INFINITY;
                 score[key_tile][item] = scaled;
                 tile_maximum          = fmaxf(tile_maximum, scaled);
@@ -208,8 +213,8 @@ __global__ __launch_bounds__(kThreads) void dit_mha_kernel(const hip_bfloat16* _
 
 } // namespace
 
-void dit_mha(const Tensor& q, const Tensor& k, const Tensor& v, int text_len, int cond_end, Tensor& out,
-             hipStream_t stream) {
+void dit_mha(const Tensor& q, const Tensor& k, const Tensor& v, int text_before, int cond_len, int text_after,
+             Tensor& out, hipStream_t stream) {
     if (q.ne[0] != kHeadDim || k.ne[0] != kHeadDim || v.ne[0] != kHeadDim || out.ne[0] != kHeadDim) {
         throw std::runtime_error("dit_mha: head_dim must be 128");
     }
@@ -220,8 +225,8 @@ void dit_mha(const Tensor& q, const Tensor& k, const Tensor& v, int text_len, in
     dim3 grid((seq + kQueryTile - 1) / kQueryTile, heads);
     dit_mha_kernel<<<grid, kThreads, 0, stream>>>(
         static_cast<const hip_bfloat16*>(q.data), static_cast<const hip_bfloat16*>(k.data),
-        static_cast<const hip_bfloat16*>(v.data), static_cast<hip_bfloat16*>(out.data), seq, text_len, cond_end,
-        stride);
+        static_cast<const hip_bfloat16*>(v.data), static_cast<hip_bfloat16*>(out.data), seq, cond_len,
+        text_before, text_after, stride);
     HIP_CHECK(hipGetLastError());
 }
 

@@ -11,6 +11,7 @@
 
 namespace ninfer::targets::qwen_image_21::detail {
 
-void dit_mha(const Tensor& q, const Tensor& k, const Tensor& v, int M, int cond_end, Tensor& out, hipStream_t stream);
+void dit_mha(const Tensor& q, const Tensor& k, const Tensor& v, int text_before, int cond_len, int text_after,
+             Tensor& out, hipStream_t stream);
 
 } // namespace ninfer::targets::qwen_image_21::detail

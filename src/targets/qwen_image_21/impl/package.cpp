@@ -73,8 +73,9 @@ const DitWeights& LoadedModel::weights() const { return impl_->weights; }
 ImageProgram::ImageProgram(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 ImageProgram::~ImageProgram() = default;
 
-void ImageProgram::denoise(const Tensor& text_emb, int cond_h, int cond_w, int grid_h, int grid_w,
-                           const Tensor& cond_latent, Tensor& latent, hipStream_t stream) const {
+void ImageProgram::denoise(const Tensor& text_emb, int text_split, int vlm_img_tokens, int cond_h, int cond_w,
+                           int grid_h, int grid_w, const Tensor& cond_latent, Tensor& latent,
+                           hipStream_t stream) const {
     auto& ws    = impl_->workspace;
     const int S = static_cast<int>(text_emb.ne[1]) + cond_h * cond_w + grid_h * grid_w;
     if (ws.capacity < S) {
@@ -104,7 +105,8 @@ void ImageProgram::denoise(const Tensor& text_emb, int cond_h, int cond_w, int g
         }
         ws.capacity = S;
     }
-    dit_denoise(impl_->model->weights(), text_emb, cond_h, cond_w, grid_h, grid_w, cond_latent, latent, ws, stream);
+    dit_denoise(impl_->model->weights(), text_emb, text_split, vlm_img_tokens, cond_h, cond_w, grid_h, grid_w,
+                cond_latent, latent, ws, stream);
 }
 
 } // namespace detail
