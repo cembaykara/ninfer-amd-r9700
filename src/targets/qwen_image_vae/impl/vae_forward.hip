@@ -10,7 +10,9 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
+#include <cstdio>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::targets::qwen_image_vae {
 namespace detail {
@@ -205,8 +207,10 @@ void mid_attention(const VaeWeights& wts, const hip_bfloat16* in, int dim, int h
     const hip_bfloat16* q = ws.e;
     const hip_bfloat16* k = ws.e + n;
     const hip_bfloat16* v = ws.e + 2 * n;
+    // One thread owns the row. The kernel ignores threadIdx and writes attn[qpos, :]
+    // from every thread, so a wide block races the softmax against itself.
+    attn_row_kernel<<<hw, 1, 0, s>>>(q, k, dim, hw, ws.f);
     dim3 blk(256);
-    attn_row_kernel<<<hw, blk, 0, s>>>(q, k, dim, hw, ws.f);
     dim3 grd((n + 255) / 256);
     attn_out_kernel<<<grd, blk, 0, s>>>(ws.f, v, dim, hw, ws.g);
     conv1x1(ws.g, wts.mid_attn_proj, wts.mid_attn_proj_b, dim, dim, hw, ws.a, s);
@@ -480,8 +484,8 @@ void vae_encode(const VaeWeights& w, const Tensor& image, Tensor& out_latent,
         const hip_bfloat16* q = ws.e;
         const hip_bfloat16* k = ws.e + n;
         const hip_bfloat16* v = ws.e + 2 * n;
+        attn_row_kernel<<<hw, 1, 0, s>>>(q, k, dim, hw, ws.f);
         dim3 blk(256);
-        attn_row_kernel<<<hw, blk, 0, s>>>(q, k, dim, hw, ws.f);
         dim3 grd((n + 255) / 256);
         attn_out_kernel<<<grd, blk, 0, s>>>(ws.f, v, dim, hw, ws.g);
         conv1x1(ws.g, w.enc_mid_attn_proj, w.enc_mid_attn_proj_b, dim, dim, hw, ws.a, s);
