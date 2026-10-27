@@ -10,6 +10,7 @@
 #include "ninfer/ops/silu_mul.h"
 
 #include <fstream>
+#include <stdexcept>
 
 #include <hip/hip_bfloat16.h>
 
@@ -146,6 +147,80 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
     // 4. The DiT consumes the last layer's output before the final RMSNorm (diffusers hooks
     // the norm out for both T2I and image-conditioned prompts), so w.final_norm is bound
     // but not applied, as in encoder_forward.
+    HIP_CHECK(hipMemcpyAsync(hidden.data, x.data, (std::size_t)seq * H * sizeof(hip_bfloat16),
+                             hipMemcpyDeviceToDevice, stream));
+}
+
+
+void encoder_forward_v2v_multi(const EncoderWeights& w, const Tensor& ids, Tensor& hidden,
+                               EncoderWorkspace& ws, int seq,
+                               const hip_bfloat16* visual_embeds, const int* visual_starts,
+                               const int* visual_counts, int n_visual,
+                               const hip_bfloat16* const deepstack[3], hipStream_t stream) {
+    if (n_visual <= 0) {
+        throw std::invalid_argument("v2v multi: need at least one visual region");
+    }
+    if (n_visual == 1) {
+        encoder_forward_v2v(w, ids, hidden, ws, seq, visual_embeds, visual_starts[0],
+                            visual_counts[0], deepstack, stream);
+        return;
+    }
+    const int H        = EncoderConfig::hidden;
+    const int heads    = EncoderConfig::heads;
+    const int kv_heads = EncoderConfig::kv_heads;
+    const int head_dim = EncoderConfig::head_dim;
+    const int inter    = EncoderConfig::intermediate;
+    const float eps    = EncoderConfig::eps;
+
+    Tensor xn(ws.xn, DType::BF16, {H, seq});
+    embedding(ids, w.embed_tokens, xn, stream);
+    Tensor x(ws.x, DType::BF16, {H, seq});
+    HIP_CHECK(hipMemcpyAsync(x.data, xn.data, (std::size_t)seq * H * sizeof(hip_bfloat16),
+                             hipMemcpyDeviceToDevice, stream));
+    int off = 0;
+    for (int i = 0; i < n_visual; ++i) {
+        const int start = visual_starts[i];
+        const int count = visual_counts[i];
+        if (start < 0 || count <= 0 || start + count > seq) {
+            throw std::invalid_argument("v2v multi: visual region out of range");
+        }
+        HIP_CHECK(hipMemcpyAsync(
+            static_cast<hip_bfloat16*>(x.data) + (std::size_t)start * H,
+            visual_embeds + (std::size_t)off * H,
+            (std::size_t)count * H * sizeof(hip_bfloat16), hipMemcpyDeviceToDevice, stream));
+        off += count;
+    }
+    (void)deepstack;
+
+    for (int l = 0; l < EncoderConfig::layers; l++) {
+        rmsnorm(x, w.input_layernorm[l], eps, false, xn, stream);
+        Tensor q(ws.q, DType::BF16, {heads * head_dim, seq});
+        Tensor k(ws.k, DType::BF16, {kv_heads * head_dim, seq});
+        Tensor v(ws.v, DType::BF16, {kv_heads * head_dim, seq});
+        linear(xn, w.q_proj[l], q, stream);
+        linear(xn, w.k_proj[l], k, stream);
+        linear(xn, w.v_proj[l], v, stream);
+        Tensor qn(ws.qn, DType::BF16, {head_dim, heads, seq});
+        Tensor kn(ws.kn, DType::BF16, {head_dim, kv_heads, seq});
+        rmsnorm(q.view({head_dim, heads, seq}), w.q_norm[l], eps, false, qn, stream);
+        rmsnorm(k.view({head_dim, kv_heads, seq}), w.k_norm[l], eps, false, kn, stream);
+        rope_mrope(qn, ws.positions, seq, (float)EncoderConfig::rope_theta, stream);
+        rope_mrope(kn, ws.positions, seq, (float)EncoderConfig::rope_theta, stream);
+        Tensor attn(ws.attn, DType::BF16, {head_dim, heads, seq});
+        causal_gqa(qn, kn, v.view({head_dim, kv_heads, seq}), attn, stream);
+        Tensor attn_flat = attn.view({heads * head_dim, seq});
+        linear(attn_flat, w.o_proj[l], xn, stream);
+        residual_add(xn, x, stream);
+        rmsnorm(x, w.post_attention_layernorm[l], eps, false, xn, stream);
+        Tensor gate(ws.gate, DType::BF16, {inter, seq});
+        Tensor up(ws.up, DType::BF16, {inter, seq});
+        Tensor mlp(ws.mlp, DType::BF16, {inter, seq});
+        linear(xn, w.gate_proj[l], gate, stream);
+        linear(xn, w.up_proj[l], up, stream);
+        silu_mul(gate, up, mlp, stream);
+        linear(mlp, w.down_proj[l], xn, stream);
+        residual_add(xn, x, stream);
+    }
     HIP_CHECK(hipMemcpyAsync(hidden.data, x.data, (std::size_t)seq * H * sizeof(hip_bfloat16),
                              hipMemcpyDeviceToDevice, stream));
 }

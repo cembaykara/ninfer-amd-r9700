@@ -35,8 +35,8 @@ struct DitConfig {
 
     // model_index.json `sample_sigmas`; the scheduler appends a terminal 0. The scheduler's
     // shift is 1.0 with dynamic shifting off, so these are used unchanged.
-    static constexpr float sample_sigmas[8] = {1.0F,     0.857286F, 0.714571F, 0.571857F,
-                                               0.429143F, 0.286429F, 0.143714F, 0.001F};
+    static constexpr float sample_sigmas[8] = {1.0F,     0.978453F, 0.95418F,  0.926626F,
+                                               0.89508F, 0.845148F, 0.704534F, 0.414568F};
 };
 
 } // namespace ninfer::targets::qwen_image_21::detail

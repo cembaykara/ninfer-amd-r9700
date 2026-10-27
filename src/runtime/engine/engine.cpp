@@ -6,6 +6,7 @@
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/qwen3/impl/frontend/encoded_history_cache.h"
 #include "targets/qwen_image_21/impl/lora_apply.h"
+#include "targets/qwen_image_21/impl/config.h"
 #include "targets/qwen3_vl/impl/vision_preprocess.h"
 #include "targets/registry.h"
 
@@ -13,6 +14,7 @@
 
 #include <hip/hip_bfloat16.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -519,9 +521,9 @@ Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count
                       int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
                       const std::vector<LoraRef>& loras, float strength,
                       const std::vector<std::uint8_t>& cond_bytes, int cond_h, int cond_w,
-                      int text_split, int vlm_img_tokens) const {
-    // Causal conditioning runs FULL sigmas; strength is kept for API compatibility.
-    (void)strength;
+                      int text_split, int vlm_img_tokens,
+                      const std::vector<std::pair<int, int>>& cond_shapes,
+                      const std::vector<std::pair<int, int>>& vlm_pads) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     std::lock_guard<std::mutex> lock(impl_->model_mu);
     const auto& target = dit_target(impl_->active);
@@ -549,6 +551,10 @@ Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count
     } else if (latent_host.size() != latent_bytes) {
         throw std::invalid_argument("image_denoise: noise byte count does not match the image size");
     }
+    // Causal edit (model way): pure-noise target + full sigmas. Strength/img2img
+    // mix is voided — it fights the fixed cond prefix the DiT was trained with.
+    int step_begin = 0;
+    (void)strength;
     struct DeviceBuf {
         void* p = nullptr;
         ~DeviceBuf() {
@@ -563,24 +569,73 @@ Engine::image_denoise(const std::uint8_t* emb_bytes, std::size_t emb_bytes_count
     HIP_CHECK(hipMalloc(&d_latent.p, latent_bytes));
     HIP_CHECK(hipMemcpy(d_latent.p, latent_host.data(), latent_bytes, hipMemcpyHostToDevice));
     Tensor out_latent(d_latent.p, DType::BF16, {64, grid_h * grid_w});
-    // Condition latent (the normalized input image); empty for text-to-image.
+    // Condition latent(s); empty for text-to-image. cond_shapes lists each pack grid; when empty,
+    // a single (cond_h, cond_w) is used.
+    std::vector<int> shape_hs;
+    std::vector<int> shape_ws;
+    if (!cond_shapes.empty()) {
+        for (const auto& hw : cond_shapes) {
+            shape_hs.push_back(hw.first);
+            shape_ws.push_back(hw.second);
+        }
+    } else if (cond_h > 0 && cond_w > 0) {
+        shape_hs.push_back(cond_h);
+        shape_ws.push_back(cond_w);
+    }
+    int Nc = 0;
+    for (std::size_t i = 0; i < shape_hs.size(); ++i) { Nc += shape_hs[i] * shape_ws[i]; }
     DeviceBuf d_cond;
     Tensor cond_latent;
-    if (cond_h > 0 && cond_w > 0) {
-        const std::size_t cond_bytes_expected = (std::size_t)cond_h * cond_w * 64 * 2;
+    if (Nc > 0) {
+        const std::size_t cond_bytes_expected = (std::size_t)Nc * 64 * 2;
         if (cond_bytes.size() != cond_bytes_expected) {
             throw std::invalid_argument("image_denoise: condition byte count does not match the grid");
         }
         HIP_CHECK(hipMalloc(&d_cond.p, cond_bytes_expected));
         HIP_CHECK(hipMemcpy(d_cond.p, cond_bytes.data(), cond_bytes_expected, hipMemcpyHostToDevice));
-        cond_latent = Tensor(d_cond.p, DType::BF16, {64, cond_h * cond_w});
+        cond_latent = Tensor(d_cond.p, DType::BF16, {64, Nc});
     }
     // T2I: cond_latent stays default-constructed (the forward skips it when Nc == 0).
     // No LoRA: the weights loaded from the DiT file stay as they are. Each LoRA adds
     // scale * (B @ A) for this call (scale defaults to 1) and the weights are restored after.
+    std::vector<int> pad_starts;
+    std::vector<int> pad_counts;
+    if (!vlm_pads.empty()) {
+        pad_starts.reserve(vlm_pads.size());
+        pad_counts.reserve(vlm_pads.size());
+        for (const auto& hw : vlm_pads) {
+            pad_starts.push_back(hw.first);
+            pad_counts.push_back(hw.second);
+        }
+    } else if (!shape_hs.empty()) {
+        // Legacy single-span: one pad run covering text_split..+vlm_img_tokens.
+        pad_starts.push_back(text_split);
+        pad_counts.push_back(vlm_img_tokens > 0 ? vlm_img_tokens : 0);
+        if (pad_counts[0] <= 0 && !shape_hs.empty()) {
+            throw std::invalid_argument("image_denoise: vlm_img_tokens required without vlm_pads");
+        }
+    }
+    if (!shape_hs.empty() && pad_starts.size() != shape_hs.size()) {
+        // Multi-ref without per-image pads: synthesize contiguous fake runs (old glued behaviour)
+        // only when a single pad span was provided for multiple shapes — reject.
+        if (vlm_pads.empty() && shape_hs.size() > 1) {
+            throw std::invalid_argument(
+                "image_denoise: multi-ref requires vlm_pads from encoder (one pad run per image)");
+        }
+    }
     const auto run_denoise = [&]() {
-        target.loaded->program->denoise(emb, text_split, vlm_img_tokens, cond_h, cond_w, grid_h, grid_w,
-                                        cond_latent, out_latent, impl_->device.stream);
+        if (shape_hs.empty()) {
+            target.loaded->program->denoise(emb, text_split, vlm_img_tokens, 0, 0, grid_h, grid_w,
+                                            cond_latent, out_latent, impl_->device.stream, step_begin);
+            return;
+        }
+        if (pad_starts.size() != shape_hs.size()) {
+            throw std::invalid_argument("image_denoise: vlm_pads size must match cond_shapes");
+        }
+        target.loaded->program->denoise(emb, pad_starts.data(), pad_counts.data(), shape_hs.data(),
+                                        shape_ws.data(), static_cast<int>(shape_hs.size()), grid_h,
+                                        grid_w, cond_latent, out_latent, impl_->device.stream,
+                                        step_begin);
     };
     if (loras.empty()) {
         run_denoise();
@@ -640,39 +695,104 @@ Engine::image_encode(const std::string& prompt) const {
     return hidden_host;
 }
 
-// v2v: encode a prompt + a condition image. Preprocesses the image to ViT patches,
-// builds the ids with the contiguous <|image_pad|> block at visual_start, runs embed_v2v
-// (ViT + text stack with deepstack injection), drops the 14 system tokens, and returns
-// the hidden states.
 std::vector<std::uint8_t>
 Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_bytes,
                          std::size_t image_bytes_count, int* text_split_out,
                          int* vlm_img_tokens_out) const {
+    std::vector<std::vector<std::uint8_t>> images(1);
+    images[0].assign(image_bytes, image_bytes + image_bytes_count);
+    return image_encode_v2v(prompt, images, text_split_out, vlm_img_tokens_out);
+}
+
+// v2v multi-ref: preprocess each image, build HF-style <imageN> pad blocks, ViT with
+// per-image cu_seqlens, inject at each pad run, drop 14 system tokens.
+std::vector<std::uint8_t>
+Engine::image_encode_v2v(const std::string& prompt,
+                         const std::vector<std::vector<std::uint8_t>>& images,
+                         int* text_split_out, int* vlm_img_tokens_out,
+                         std::vector<std::pair<int, int>>* vlm_pads_out) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (images.empty() || images.size() > 10) {
+        throw std::invalid_argument("v2v: need 1..10 condition images");
+    }
     std::lock_guard<std::mutex> lock(impl_->model_mu);
     const auto& target = encoder_target(impl_->active);
     const auto& tokenizer = target.loaded->model->tokenizer();
     constexpr int kDropTokens = 14;
+    constexpr int kPatchFeatures = 1536;
 
-    const auto prep = targets::qwen3_vl::detail::preprocess_v2v_image(image_bytes, image_bytes_count);
-    const int P = prep.patches_count;
-    const int V = prep.tokens;  // P / 4 (2x2 spatial merge)
+    const int n = static_cast<int>(images.size());
+    std::vector<targets::qwen3_vl::detail::V2VImagePrep> preps;
+    preps.reserve(static_cast<std::size_t>(n));
+    std::vector<int> grid_hs(n), grid_ws(n), visual_counts(n), cu_seqlens(n + 1);
+    cu_seqlens[0] = 0;
+    int P_total = 0;
+    int V_total = 0;
+    std::vector<float> patches_all;
+    std::vector<int> position_ids_all;
+    std::vector<int> pos_indices_all;
+    std::vector<float> pos_weights_all;
+    for (int i = 0; i < n; ++i) {
+        if (images[static_cast<std::size_t>(i)].empty()) {
+            throw std::invalid_argument("v2v: empty condition image");
+        }
+        auto prep = targets::qwen3_vl::detail::preprocess_v2v_image(
+            images[static_cast<std::size_t>(i)].data(), images[static_cast<std::size_t>(i)].size());
+        grid_hs[i] = prep.grid_h;
+        grid_ws[i] = prep.grid_w;
+        visual_counts[i] = prep.tokens;
+        P_total += prep.patches_count;
+        V_total += prep.tokens;
+        cu_seqlens[i + 1] = P_total;
+        patches_all.insert(patches_all.end(), prep.patches.begin(), prep.patches.end());
+        position_ids_all.insert(position_ids_all.end(), prep.position_ids.begin(),
+                                prep.position_ids.end());
+        pos_indices_all.insert(pos_indices_all.end(), prep.pos_indices.begin(),
+                               prep.pos_indices.end());
+        pos_weights_all.insert(pos_weights_all.end(), prep.pos_weights.begin(),
+                               prep.pos_weights.end());
+        preps.push_back(std::move(prep));
+    }
 
     const int image_pad_id = tokenizer.encode("<|image_pad|>")[0];
     std::string text =
         "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
-        "<|im_start|>user\n<image1><|vision_start|>";
-    for (int i = 0; i < V; ++i) { text += "<|image_pad|>"; }
-    text += "<|vision_end|>" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+        "<|im_start|>user\n";
+    for (int i = 0; i < n; ++i) {
+        if (i > 0) { text += " "; }
+        text += "<image" + std::to_string(i + 1) + "><|vision_start|>";
+        for (int t = 0; t < visual_counts[static_cast<std::size_t>(i)]; ++t) {
+            text += "<|image_pad|>";
+        }
+        text += "<|vision_end|>";
+    }
+    text += prompt + "<|im_end|>\n<|im_start|>assistant\n";
     std::vector<int> ids = tokenizer.encode(text);
     const int seq = static_cast<int>(ids.size());
     if (seq <= kDropTokens) { throw std::runtime_error("v2v prompt tokenized to too few tokens"); }
 
-    int visual_start = -1;
-    for (int i = 0; i < seq; ++i) {
-        if (ids[static_cast<std::size_t>(i)] == image_pad_id) { visual_start = i; break; }
+    std::vector<int> visual_starts(n, -1);
+    {
+        int img = 0;
+        int run = 0;
+        for (int i = 0; i < seq && img < n; ++i) {
+            if (ids[static_cast<std::size_t>(i)] == image_pad_id) {
+                if (run == 0) { visual_starts[static_cast<std::size_t>(img)] = i; }
+                ++run;
+                if (run == visual_counts[static_cast<std::size_t>(img)]) {
+                    ++img;
+                    run = 0;
+                }
+            } else if (run != 0) {
+                throw std::runtime_error("v2v: broken <|image_pad|> run");
+            }
+        }
+        if (img != n) { throw std::runtime_error("v2v: expected image_pad runs not found"); }
     }
-    if (visual_start < 0) { throw std::runtime_error("v2v: <|image_pad|> token not found in ids"); }
+    const int first_pad = visual_starts[0];
+    const int last_pad_end =
+        visual_starts[static_cast<std::size_t>(n - 1)] + visual_counts[static_cast<std::size_t>(n - 1)];
+    const int vlm_span = last_pad_end - first_pad;
 
     const std::size_t ids_bytes = (std::size_t)seq * 4;
     void* d_ids = nullptr;
@@ -680,13 +800,10 @@ Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_by
     HIP_CHECK(hipMemcpy(d_ids, ids.data(), ids_bytes, hipMemcpyHostToDevice));
     Tensor ids_tensor(d_ids, DType::I32, {seq});
 
-    // ViT patches are computed on the host patch-major [P][1536]; the linear op stores
-    // dim zero (features) fastest, which is exactly this layout, so copy as-is.
-    constexpr int kPatchFeatures = 1536;  // 3 channels * 2 temporal * 16 * 16
-    const std::size_t patches_bytes = (std::size_t)P * kPatchFeatures * sizeof(float);
+    const std::size_t patches_bytes = (std::size_t)P_total * kPatchFeatures * sizeof(float);
     void* d_patches = nullptr;
     HIP_CHECK(hipMalloc(&d_patches, patches_bytes));
-    HIP_CHECK(hipMemcpy(d_patches, prep.patches.data(), patches_bytes, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_patches, patches_all.data(), patches_bytes, hipMemcpyHostToDevice));
 
     const std::size_t row_bytes    = (std::size_t)4096 * 2;
     const std::size_t hidden_bytes = (std::size_t)seq * row_bytes;
@@ -694,10 +811,11 @@ Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_by
     HIP_CHECK(hipMalloc(&d_hidden, hidden_bytes));
     Tensor out_hidden(d_hidden, DType::BF16, {4096, seq});
 
-    target.loaded->program->embed_v2v(ids_tensor, static_cast<const float*>(d_patches), P,
-                                      prep.grid_h, prep.grid_w, prep.position_ids.data(),
-                                      prep.pos_indices.data(), prep.pos_weights.data(),
-                                      visual_start, out_hidden, impl_->device.stream);
+    target.loaded->program->embed_v2v_multi(
+        ids_tensor, static_cast<const float*>(d_patches), P_total, grid_hs.data(), grid_ws.data(),
+        cu_seqlens.data(), n, position_ids_all.data(), pos_indices_all.data(),
+        pos_weights_all.data(), visual_starts.data(), visual_counts.data(), out_hidden,
+        impl_->device.stream);
     impl_->device.synchronize();
 
     const std::size_t kept_bytes = (std::size_t)(seq - kDropTokens) * row_bytes;
@@ -708,13 +826,18 @@ Engine::image_encode_v2v(const std::string& prompt, const std::uint8_t* image_by
     HIP_CHECK(hipFree(d_ids));
     HIP_CHECK(hipFree(d_patches));
     HIP_CHECK(hipFree(d_hidden));
-    if (const char* hd = std::getenv("NINFER_V2V_HIDDEN_DUMP")) {
-        std::ofstream hf(hd, std::ios::binary);
-        hf.write(reinterpret_cast<const char*>(hidden_host.data()),
-                 (std::streamsize)hidden_host.size());
+    if (text_split_out != nullptr) { *text_split_out = first_pad - kDropTokens; }
+    if (vlm_img_tokens_out != nullptr) { *vlm_img_tokens_out = vlm_span; }
+    if (vlm_pads_out != nullptr) {
+        vlm_pads_out->clear();
+        vlm_pads_out->reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            vlm_pads_out->emplace_back(visual_starts[static_cast<std::size_t>(i)] - kDropTokens,
+                                       visual_counts[static_cast<std::size_t>(i)]);
+        }
     }
-    if (text_split_out != nullptr) { *text_split_out = visual_start - kDropTokens; }
-    if (vlm_img_tokens_out != nullptr) { *vlm_img_tokens_out = V; }
+    (void)V_total;
+    (void)preps;
     return hidden_host;
 }
 

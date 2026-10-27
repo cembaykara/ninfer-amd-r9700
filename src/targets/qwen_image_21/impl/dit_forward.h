@@ -62,11 +62,23 @@ struct DitWorkspace {
     hip_bfloat16* out_scale = nullptr;  // {H, 2}
 };
 
-// Denoise the target latent {64, Nt} in place. text_emb is {4096, M}; the target is grid_h x grid_w
-// tokens (Nt = grid_h * grid_w). cond_latent is the condition {64, Nc} (Nc = cond_h * cond_w);
-// pass a zero-sized tensor for text-to-image. `latent` holds the initial noise on entry.
-void dit_denoise(const DitWeights& w, const Tensor& text_emb, int text_split, int vlm_img_tokens,
-                 int cond_h, int cond_w, int grid_h, int grid_w,
-                 const Tensor& cond_latent, Tensor& latent, DitWorkspace& ws, hipStream_t stream);
+// Denoise the target latent {64, Nt} in place.
+//
+// `pad_starts`/`pad_counts` (length n_cond) are post-drop indexes into text_emb of each
+// <|image_pad|> run. Each run is replaced by the matching packed cond (cond_hs[i]*cond_ws[i]
+// tokens); text between runs is kept — HF multi-ref interleaving. For a single image,
+// pad_starts[0]=text_split and pad_counts[0]=vlm_img_tokens recovers the old path.
+void dit_denoise(const DitWeights& w, const Tensor& text_emb, const int* pad_starts,
+                 const int* pad_counts, const int* cond_hs, const int* cond_ws, int n_cond,
+                 int grid_h, int grid_w, const Tensor& cond_latent, Tensor& latent,
+                 DitWorkspace& ws, hipStream_t stream, int step_begin = 0);
+
+inline void dit_denoise(const DitWeights& w, const Tensor& text_emb, int text_split, int vlm_img_tokens,
+                        int cond_h, int cond_w, int grid_h, int grid_w, const Tensor& cond_latent,
+                        Tensor& latent, DitWorkspace& ws, hipStream_t stream, int step_begin = 0) {
+    const int n = (cond_h > 0 && cond_w > 0) ? 1 : 0;
+    dit_denoise(w, text_emb, &text_split, &vlm_img_tokens, &cond_h, &cond_w, n, grid_h, grid_w,
+                cond_latent, latent, ws, stream, step_begin);
+}
 
 } // namespace ninfer::targets::qwen_image_21::detail

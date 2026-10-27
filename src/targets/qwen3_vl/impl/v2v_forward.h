@@ -19,4 +19,12 @@ void encoder_forward_v2v(const EncoderWeights& w, const Tensor& ids, Tensor& hid
                          const hip_bfloat16* visual_embeds, int visual_start, int visual_count,
                          const hip_bfloat16* const deepstack[3], hipStream_t stream);
 
+// Multi-ref: visual_embeds is the concat of each image's V tokens; visual_starts/counts
+// locate each pad block in `ids`. deepstack stays unused (pass nullptr) today.
+void encoder_forward_v2v_multi(const EncoderWeights& w, const Tensor& ids, Tensor& hidden,
+                               EncoderWorkspace& ws, int seq,
+                               const hip_bfloat16* visual_embeds, const int* visual_starts,
+                               const int* visual_counts, int n_visual,
+                               const hip_bfloat16* const deepstack[3], hipStream_t stream);
+
 } // namespace ninfer::targets::qwen3_vl::detail

@@ -860,9 +860,35 @@ void HttpServer::handle_dit_denoise(const httplib::Request& req, httplib::Respon
     std::vector<std::uint8_t> latent;
     try {
         const float strength = body.value("strength", 1.0f);
+        std::vector<std::pair<int, int>> cond_shapes;
+        if (body.contains("cond_shapes") && body["cond_shapes"].is_array()) {
+            for (const auto& hw : body["cond_shapes"]) {
+                if (!hw.is_array() || hw.size() != 2 || !hw[0].is_number_integer() || !hw[1].is_number_integer()) {
+                    ApiError error;
+                    error.status = 400; error.type = "invalid_request_error"; error.code = "invalid_cond";
+                    error.message = "cond_shapes must be an array of [h, w] integer pairs";
+                    emit_openai_error(res, error);
+                    return;
+                }
+                cond_shapes.emplace_back(hw[0].get<int>(), hw[1].get<int>());
+            }
+        }
+        std::vector<std::pair<int, int>> vlm_pads;
+        if (body.contains("vlm_pads") && body["vlm_pads"].is_array()) {
+            for (const auto& hw : body["vlm_pads"]) {
+                if (!hw.is_array() || hw.size() != 2 || !hw[0].is_number_integer() || !hw[1].is_number_integer()) {
+                    ApiError error;
+                    error.status = 400; error.type = "invalid_request_error"; error.code = "invalid_cond";
+                    error.message = "vlm_pads must be an array of [start, count] integer pairs";
+                    emit_openai_error(res, error);
+                    return;
+                }
+                vlm_pads.emplace_back(hw[0].get<int>(), hw[1].get<int>());
+            }
+        }
         latent = service_->image_denoise(emb_bytes.data(), emb_bytes.size(), M, image_h, image_w, noise,
                                          seed, loras, strength, cond_latent, cond_h, cond_w, text_split,
-                                         vlm_img_tokens);
+                                         vlm_img_tokens, cond_shapes, vlm_pads);
     } catch (const std::invalid_argument& e) {
         ApiError error;
         error.status  = 400;
@@ -919,60 +945,76 @@ void HttpServer::handle_encoder_encode(const httplib::Request& req, httplib::Res
         emit_openai_error(res, error);
         return;
     }
-    // Optional condition image (v2v): a base64 data URI ("data:<media>;base64,<data>") or a
-    // file path readable inside the container. Omitted -> text-only (unchanged behavior).
-    std::string image_field;
-    if (body.contains("image") && body["image"].is_string()) {
-        image_field = body["image"].get<std::string>();
-    }
-    std::vector<std::uint8_t> image_bytes;
-    if (!image_field.empty()) {
+    // Optional condition image(s) (v2v): `images` (array of data URIs/paths, 1..10) or legacy
+    // single `image` string. Omitted -> text-only.
+    auto load_image_field = [&](const std::string& image_field, std::vector<std::uint8_t>& out) -> bool {
         if (image_field.rfind("data:", 0) == 0) {
             const std::size_t pos = image_field.find("base64,");
             if (pos == std::string::npos) {
                 ApiError error;
-                error.status  = 400;
-                error.type    = "invalid_request_error";
-                error.code    = "invalid_image";
+                error.status = 400; error.type = "invalid_request_error"; error.code = "invalid_image";
                 error.message = "image data URI must be base64 (data:<media>;base64,<data>)";
                 emit_openai_error(res, error);
-                return;
+                return false;
             }
-            image_bytes = b64_decode(image_field.substr(pos + 7));
+            out = b64_decode(image_field.substr(pos + 7));
         } else {
             std::ifstream stream(image_field, std::ios::binary | std::ios::ate);
             if (!stream) {
                 ApiError error;
-                error.status  = 400;
-                error.type    = "invalid_request_error";
-                error.code    = "invalid_image";
+                error.status = 400; error.type = "invalid_request_error"; error.code = "invalid_image";
                 error.message = "image path is not readable: " + image_field;
                 emit_openai_error(res, error);
-                return;
+                return false;
             }
             const std::streamsize size = stream.tellg();
             stream.seekg(0, std::ios::beg);
-            image_bytes.resize(static_cast<std::size_t>(size));
-            stream.read(reinterpret_cast<char*>(image_bytes.data()), size);
+            out.resize(static_cast<std::size_t>(size));
+            stream.read(reinterpret_cast<char*>(out.data()), size);
         }
-        if (image_bytes.empty()) {
+        if (out.empty()) {
             ApiError error;
-            error.status  = 400;
-            error.type    = "invalid_request_error";
-            error.code    = "invalid_image";
+            error.status = 400; error.type = "invalid_request_error"; error.code = "invalid_image";
             error.message = "image decoded to zero bytes";
+            emit_openai_error(res, error);
+            return false;
+        }
+        return true;
+    };
+    std::vector<std::vector<std::uint8_t>> image_list;
+    if (body.contains("images") && body["images"].is_array()) {
+        if (body["images"].empty() || body["images"].size() > 10) {
+            ApiError error;
+            error.status = 400; error.type = "invalid_request_error"; error.code = "invalid_image";
+            error.message = "images must have 1..10 entries";
             emit_openai_error(res, error);
             return;
         }
+        for (const auto& entry : body["images"]) {
+            if (!entry.is_string()) {
+                ApiError error;
+                error.status = 400; error.type = "invalid_request_error"; error.code = "invalid_image";
+                error.message = "images entries must be data URIs or paths";
+                emit_openai_error(res, error);
+                return;
+            }
+            std::vector<std::uint8_t> one;
+            if (!load_image_field(entry.get<std::string>(), one)) { return; }
+            image_list.push_back(std::move(one));
+        }
+    } else if (body.contains("image") && body["image"].is_string()) {
+        std::vector<std::uint8_t> one;
+        if (!load_image_field(body["image"].get<std::string>(), one)) { return; }
+        image_list.push_back(std::move(one));
     }
     std::vector<std::uint8_t> hidden;
     int text_split = 0;
     int vlm_img_tokens = 0;
+    std::vector<std::pair<int, int>> vlm_pads;
     try {
-        hidden = image_bytes.empty()
+        hidden = image_list.empty()
                      ? service_->image_encode(prompt)
-                     : service_->image_encode_v2v(prompt, image_bytes.data(), image_bytes.size(), &text_split,
-                                                  &vlm_img_tokens);
+                     : service_->image_encode_v2v(prompt, image_list, &text_split, &vlm_img_tokens, &vlm_pads);
     } catch (const std::invalid_argument& e) {
         ApiError error;
         error.status  = 400;
@@ -1004,6 +1046,11 @@ void HttpServer::handle_encoder_encode(const httplib::Request& req, httplib::Res
     response["seq"]    = seq;
     response["text_split"]     = text_split;
     response["vlm_img_tokens"] = vlm_img_tokens;
+    if (!vlm_pads.empty()) {
+        nlohmann::json pads = nlohmann::json::array();
+        for (const auto& hw : vlm_pads) { pads.push_back({hw.first, hw.second}); }
+        response["vlm_pads"] = pads;
+    }
     res.set_content(response.dump(), "application/json");
 }
 

@@ -79,7 +79,14 @@ public:
     // cond_latent {64, cond_h*cond_w} is the (normalized) condition; pass a zero-sized tensor for
     // text-to-image. latent {64, grid_h*grid_w} holds the initial noise and is denoised in place.
     void denoise(const Tensor& text_emb, int text_split, int vlm_img_tokens, int cond_h, int cond_w,
-                 int grid_h, int grid_w, const Tensor& cond_latent, Tensor& latent, hipStream_t stream) const;
+                 int grid_h, int grid_w, const Tensor& cond_latent, Tensor& latent, hipStream_t stream,
+                 int step_begin = 0) const;
+    // Multi-ref: pad_starts/pad_counts (post-drop <|image_pad|> runs) interleave with cond packs.
+    // cond_hs/cond_ws length n_cond; Nc = sum(h*w).
+    void denoise(const Tensor& text_emb, const int* pad_starts, const int* pad_counts,
+                 const int* cond_hs, const int* cond_ws, int n_cond, int grid_h, int grid_w,
+                 const Tensor& cond_latent, Tensor& latent, hipStream_t stream,
+                 int step_begin = 0) const;
 
 private:
     class Impl;

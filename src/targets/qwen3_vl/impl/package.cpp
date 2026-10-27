@@ -15,6 +15,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -267,6 +268,115 @@ void EncoderProgram::embed_v2v(const Tensor& ids, const float* patches, int patc
     (void)impl_->deepstack_out; // disabled for testing
     encoder_forward_v2v(impl_->model->weights(), ids, out_hidden, impl_->workspace, seq,
                         impl_->visual_out, visual_start, V, nullptr, stream);
+}
+
+void EncoderProgram::embed_v2v_multi(const Tensor& ids, const float* patches, int patches_count,
+                                     const int* grid_hs, const int* grid_ws, const int* cu_seqlens,
+                                     int n_images, const int* position_ids, const int* pos_indices,
+                                     const float* pos_weights, const int* visual_starts,
+                                     const int* visual_counts, Tensor& out_hidden,
+                                     hipStream_t stream) const {
+    if (n_images <= 0) { throw std::invalid_argument("embed_v2v_multi: n_images < 1"); }
+    if (n_images == 1) {
+        embed_v2v(ids, patches, patches_count, grid_hs[0], grid_ws[0], position_ids, pos_indices,
+                  pos_weights, visual_starts[0], out_hidden, stream);
+        return;
+    }
+    const int seq = ids.ne[0];
+    const int P = patches_count;
+    int V = 0;
+    for (int i = 0; i < n_images; ++i) { V += visual_counts[i]; }
+    if (V * VisionConfig::merge_unit != P) {
+        throw std::runtime_error("embed_v2v_multi: patch count does not match visual tokens");
+    }
+    const int H = EncoderConfig::hidden;
+    const int VH = VisionConfig::hidden;
+    ensure_text_workspace(impl_->workspace, seq);
+
+    // M-RoPE: text (i,i,i); each visual block uses its own merged grid, frame frozen at start.
+    {
+        std::vector<int> hpos((std::size_t)seq * 3);
+        for (int i = 0; i < seq; i++) {
+            hpos[static_cast<std::size_t>(0) * seq + i] = i;
+            hpos[static_cast<std::size_t>(1) * seq + i] = i;
+            hpos[static_cast<std::size_t>(2) * seq + i] = i;
+        }
+        for (int img = 0; img < n_images; ++img) {
+            const int start = visual_starts[img];
+            const int count = visual_counts[img];
+            const int gh = grid_hs[img];
+            const int gw = grid_ws[img];
+            if (gh % 2 != 0 || gw % 2 != 0 || (gh / 2) * (gw / 2) != count) {
+                throw std::runtime_error("embed_v2v_multi: merged grid mismatch");
+            }
+            const int gw_m = gw / 2;
+            for (int v = 0; v < count; ++v) {
+                const int i = start + v;
+                hpos[static_cast<std::size_t>(0) * seq + i] = start;
+                hpos[static_cast<std::size_t>(1) * seq + i] = start + v / gw_m;
+                hpos[static_cast<std::size_t>(2) * seq + i] = start + v % gw_m;
+            }
+        }
+        HIP_CHECK(hipMemcpy(impl_->workspace.positions, hpos.data(), (std::size_t)seq * 3 * 4,
+                            hipMemcpyHostToDevice));
+    }
+
+    if (impl_->vision_p != P) {
+        auto alloc = [&](std::size_t bytes) {
+            void* p = nullptr;
+            HIP_CHECK(hipMalloc(&p, bytes));
+            return p;
+        };
+        auto& ws = impl_->vision_ws;
+        release_device(ws.x);
+        release_device(ws.patch_in);
+        release_device(ws.h);
+        release_device(ws.qkv);
+        release_device(ws.attended);
+        release_device(ws.projected);
+        release_device(ws.up);
+        release_device(ws.down);
+        release_device(ws.merged);
+        release_device(ws.mhidden);
+        release_device(ws.position_ids);
+        release_device(ws.cu_seqlens);
+        release_device(ws.pos_indices);
+        release_device(ws.pos_weights);
+        release_device(impl_->visual_out);
+        release_device(impl_->deepstack_out);
+        ws.patch_in  = (hip_bfloat16*)alloc((std::size_t)P * 1536 * 2);
+        ws.x         = (hip_bfloat16*)alloc((std::size_t)P * VH * 2);
+        ws.h         = (hip_bfloat16*)alloc((std::size_t)P * VH * 2);
+        ws.qkv       = (hip_bfloat16*)alloc((std::size_t)P * 3 * VH * 2);
+        ws.attended  = (hip_bfloat16*)alloc((std::size_t)P * VH * 2);
+        ws.projected = (hip_bfloat16*)alloc((std::size_t)P * VH * 2);
+        ws.up        = (hip_bfloat16*)alloc((std::size_t)P * VisionConfig::intermediate * 2);
+        ws.down      = (hip_bfloat16*)alloc((std::size_t)P * VH * 2);
+        ws.merged    = (hip_bfloat16*)alloc((std::size_t)V * VisionConfig::merger_hidden * 2);
+        ws.mhidden   = (hip_bfloat16*)alloc((std::size_t)V * VisionConfig::merger_hidden * 2);
+        ws.position_ids = (int*)alloc((std::size_t)P * 2 * 4);
+        ws.cu_seqlens   = (int*)alloc((std::size_t)(n_images + 1) * 4);
+        ws.pos_indices  = (int*)alloc((std::size_t)P * 4 * 4);
+        ws.pos_weights  = (float*)alloc((std::size_t)P * 4 * 4);
+        impl_->visual_out    = (hip_bfloat16*)alloc((std::size_t)V * H * 2);
+        impl_->deepstack_out = (hip_bfloat16*)alloc((std::size_t)3 * V * H * 2);
+        impl_->vision_p = P;
+    }
+    // cu_seqlens length depends on n_images; always size it for this call.
+    {
+        release_device(impl_->vision_ws.cu_seqlens);
+        void* p = nullptr;
+        HIP_CHECK(hipMalloc(&p, (std::size_t)(n_images + 1) * 4));
+        impl_->vision_ws.cu_seqlens = (int*)p;
+    }
+
+    vision_forward(impl_->model->vision_weights(), patches, P, n_images, position_ids, cu_seqlens,
+                   pos_indices, pos_weights, impl_->visual_out, impl_->deepstack_out,
+                   impl_->vision_ws, stream);
+    (void)impl_->deepstack_out;
+    encoder_forward_v2v_multi(impl_->model->weights(), ids, out_hidden, impl_->workspace, seq,
+                              impl_->visual_out, visual_starts, visual_counts, n_images, nullptr,
+                              stream);
 }
 
 } // namespace detail

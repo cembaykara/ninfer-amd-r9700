@@ -75,7 +75,7 @@ ImageProgram::~ImageProgram() = default;
 
 void ImageProgram::denoise(const Tensor& text_emb, int text_split, int vlm_img_tokens, int cond_h, int cond_w,
                            int grid_h, int grid_w, const Tensor& cond_latent, Tensor& latent,
-                           hipStream_t stream) const {
+                           hipStream_t stream, int step_begin) const {
     auto& ws    = impl_->workspace;
     const int S = static_cast<int>(text_emb.ne[1]) + cond_h * cond_w + grid_h * grid_w;
     if (ws.capacity < S) {
@@ -106,7 +106,47 @@ void ImageProgram::denoise(const Tensor& text_emb, int text_split, int vlm_img_t
         ws.capacity = S;
     }
     dit_denoise(impl_->model->weights(), text_emb, text_split, vlm_img_tokens, cond_h, cond_w, grid_h, grid_w,
-                cond_latent, latent, ws, stream);
+                cond_latent, latent, ws, stream, step_begin);
+}
+
+void ImageProgram::denoise(const Tensor& text_emb, const int* pad_starts, const int* pad_counts,
+                           const int* cond_hs, const int* cond_ws, int n_cond, int grid_h, int grid_w,
+                           const Tensor& cond_latent, Tensor& latent, hipStream_t stream,
+                           int step_begin) const {
+    int Nc = 0;
+    for (int i = 0; i < n_cond; ++i) { Nc += cond_hs[i] * cond_ws[i]; }
+    auto& ws    = impl_->workspace;
+    // Upper bound: interleaved keeps inter-image text, so S <= M + Nc + Nt.
+    const int S = static_cast<int>(text_emb.ne[1]) + Nc + grid_h * grid_w;
+    if (ws.capacity < S) {
+        HIP_CHECK(hipStreamSynchronize(stream));
+        constexpr std::size_t H = DitConfig::hidden;
+        constexpr std::size_t I = DitConfig::intermediate;
+        const std::size_t s     = static_cast<std::size_t>(S);
+        auto grow = [](auto*& p, std::size_t bytes) {
+            if (p != nullptr) {
+                HIP_CHECK(hipFree(p));
+                p = nullptr;
+            }
+            void* raw = nullptr;
+            HIP_CHECK(hipMalloc(&raw, bytes));
+            p = static_cast<std::remove_reference_t<decltype(p)>>(raw);
+        };
+        for (hip_bfloat16** p : {&ws.hs, &ws.x1, &ws.x2, &ws.q, &ws.k, &ws.v, &ws.qn, &ws.kn, &ws.attn, &ws.txt}) {
+            grow(*p, s * H * 2);
+        }
+        for (hip_bfloat16** p : {&ws.gate, &ws.up, &ws.act}) grow(*p, s * I * 2);
+        grow(ws.freqs, s * 128 * sizeof(float));
+        grow(ws.velocity, s * DitConfig::in_channels * 2);
+        if (ws.mod == nullptr) {
+            grow(ws.t_sin, 256 * 2 * 2);
+            for (hip_bfloat16** p : {&ws.t_mid, &ws.temb, &ws.temb_silu, &ws.out_scale}) grow(*p, H * 2 * 2);
+            grow(ws.mod, 4 * H * 2 * 2);
+        }
+        ws.capacity = S;
+    }
+    dit_denoise(impl_->model->weights(), text_emb, pad_starts, pad_counts, cond_hs, cond_ws, n_cond,
+                grid_h, grid_w, cond_latent, latent, ws, stream, step_begin);
 }
 
 } // namespace detail

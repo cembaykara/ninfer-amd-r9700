@@ -389,32 +389,44 @@ void downsample2d(const hip_bfloat16* in, const hip_bfloat16* w, const hip_bfloa
     downsample2d_kernel<<<grd, blk, 0, s>>>(in, w, b, c, h, w_in, out);
 }
 
-// AvgDown shortcut: 2x spatial avg-pool + channel grouping.
-// in: [C, H, W] -> out: [cout, H/2, W/2]. group = C*4 / cout.
-// out[oc,y,x] = (1/group) * sum_g in_pooled[oc*group+g, y, x]
-//   where in_pooled[ch,y,x] = in[ch/4, 2y+(ch%4)/2, 2x+(ch%4)%2]
-__global__ void avg_down_kernel(const hip_bfloat16* __restrict__ in, int h, int w, int cout, int group,
-                                hip_bfloat16* __restrict__ out) {
+// AvgDown shortcut matching QwenImage21AvgDown3D for a single image frame.
+// HF folds factor_t * factor_s * factor_s into channels (permute ft, fy, fx), then means
+// over group = C*factor/cout. For T=1 and factor_t=2 it front-pads a zero frame, so only
+// ft == factor_t-1 reads real pixels — the other temporal slots contribute 0.
+// in: [C, H, W] -> out: [cout, H/2, W/2] when factor_s=2.
+__global__ void avg_down_kernel(const hip_bfloat16* __restrict__ in, int h, int w, int cin, int cout,
+                                int factor_t, int group, hip_bfloat16* __restrict__ out) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     const int oc = blockIdx.z;
-    const int w_out = w / 2, h_out = h / 2;
+    constexpr int factor_s = 2;
+    const int w_out = w / factor_s, h_out = h / factor_s;
     if (x >= w_out || y >= h_out || oc >= cout) return;
+    const int factor = factor_t * factor_s * factor_s;
     float acc = 0.0f;
     for (int g = 0; g < group; ++g) {
-        const int ch = oc * group + g;      // index in [C*4] space
-        const int ci = ch / 4;
-        const int fy = (ch % 4) / 2;
-        const int fx = (ch % 4) % 2;
-        acc += float(in[(std::int64_t)ci * h * w + (std::int64_t)(y * 2 + fy) * w + (x * 2 + fx)]);
+        const int ch = oc * group + g;  // index in [C*factor] space
+        const int ci = ch / factor;
+        const int sub = ch - ci * factor;
+        const int ft = sub / (factor_s * factor_s);
+        const int rem = sub - ft * factor_s * factor_s;
+        const int fy = rem / factor_s;
+        const int fx = rem - fy * factor_s;
+        // Front-padded zero frame(s) occupy ft < factor_t-1; the last slot is the real image.
+        if (ft == factor_t - 1 && ci < cin) {
+            acc += float(in[(std::int64_t)ci * h * w +
+                            (std::int64_t)(y * factor_s + fy) * w + (x * factor_s + fx)]);
+        }
     }
     out[(std::int64_t)oc * h_out * w_out + (std::int64_t)y * w_out + x] = hip_bfloat16(acc / (float)group);
 }
-void avg_down(const hip_bfloat16* in, int c, int h, int w, int cout, hip_bfloat16* out, hipStream_t s) {
-    const int group = c * 4 / cout;
+void avg_down(const hip_bfloat16* in, int c, int h, int w, int cout, int factor_t, hip_bfloat16* out,
+              hipStream_t s) {
+    const int factor = factor_t * 2 * 2;
+    const int group = c * factor / cout;
     dim3 blk(8, 8, 1);
     dim3 grd((w / 2 + 7) / 8, (h / 2 + 7) / 8, cout);
-    avg_down_kernel<<<grd, blk, 0, s>>>(in, h, w, cout, group, out);
+    avg_down_kernel<<<grd, blk, 0, s>>>(in, h, w, c, cout, factor_t, group, out);
 }
 
 
@@ -462,9 +474,10 @@ void vae_encode(const VaeWeights& w, const Tensor& image, Tensor& out_latent,
                          cout, hh, ww, ws.c, s);
             cur = ws.c; hh /= 2; ww /= 2;
         }
-        // add avg_shortcut(ws.h)
+        // add avg_shortcut(ws.h). temperal_downsample config: [F, T, T, T] on blocks 0..3.
         if (i < 4) {
-            avg_down(ws.h, cin, hh * 2, ww * 2, cout, ws.d, s);
+            const int factor_t = (i == 0) ? 1 : 2;
+            avg_down(ws.h, cin, hh * 2, ww * 2, cout, factor_t, ws.d, s);
             add(cur, ws.d, (std::int64_t)cout * hh * ww, cur, s);
         } else {
             // block 4: identity shortcut (group=1, no spatial change)

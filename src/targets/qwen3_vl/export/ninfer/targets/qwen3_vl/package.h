@@ -92,6 +92,14 @@ public:
                    const float* pos_weights, int visual_start, Tensor& out_hidden,
                    hipStream_t stream) const;
 
+    // Multi-ref: patches/position tables are concatenations per image; n_images segments.
+    // visual_starts[i] / visual_counts[i] locate each <|image_pad|> run in ids.
+    void embed_v2v_multi(const Tensor& ids, const float* patches, int patches_count,
+                         const int* grid_hs, const int* grid_ws, const int* cu_seqlens,
+                         int n_images, const int* position_ids, const int* pos_indices,
+                         const float* pos_weights, const int* visual_starts,
+                         const int* visual_counts, Tensor& out_hidden, hipStream_t stream) const;
+
 private:
     class Impl;
     explicit EncoderProgram(std::unique_ptr<Impl> impl) noexcept;

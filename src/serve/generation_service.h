@@ -15,6 +15,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ninfer::serve {
@@ -171,10 +172,12 @@ public:
                   int image_w, const std::vector<std::uint8_t>& noise, std::uint64_t seed,
                   const std::vector<ninfer::LoraRef>& loras = {}, float strength = 1.0f,
                   const std::vector<std::uint8_t>& cond_bytes = {}, int cond_h = 0, int cond_w = 0,
-                  int text_split = 0, int vlm_img_tokens = 0) const {
+                  int text_split = 0, int vlm_img_tokens = 0,
+                  const std::vector<std::pair<int, int>>& cond_shapes = {},
+                  const std::vector<std::pair<int, int>>& vlm_pads = {}) const {
         return engine_->image_denoise(emb_bytes, emb_bytes_count, M, image_h, image_w, noise, seed,
                                      loras, strength, cond_bytes, cond_h, cond_w, text_split,
-                                     vlm_img_tokens);
+                                     vlm_img_tokens, cond_shapes, vlm_pads);
     }
     // VAE encode (img2img): image [1,4,H,W] -> latent [1,64,H/16,W/16].
     [[nodiscard]] std::vector<std::uint8_t>
@@ -187,13 +190,19 @@ public:
         return engine_->image_encode(prompt);
     }
 
-    // Encoder (v2v): prompt + condition image -> hidden. The active target must be the encoder.
+    // Encoder (v2v): prompt + condition image(s) -> hidden. The active target must be the encoder.
     [[nodiscard]] std::vector<std::uint8_t>
     image_encode_v2v(const std::string& prompt, const std::uint8_t* image_bytes,
                      std::size_t image_bytes_count, int* text_split_out = nullptr,
                      int* vlm_img_tokens_out = nullptr) const {
         return engine_->image_encode_v2v(prompt, image_bytes, image_bytes_count, text_split_out,
                                          vlm_img_tokens_out);
+    }
+    [[nodiscard]] std::vector<std::uint8_t>
+    image_encode_v2v(const std::string& prompt, const std::vector<std::vector<std::uint8_t>>& images,
+                     int* text_split_out = nullptr, int* vlm_img_tokens_out = nullptr,
+                     std::vector<std::pair<int, int>>* vlm_pads_out = nullptr) const {
+        return engine_->image_encode_v2v(prompt, images, text_split_out, vlm_img_tokens_out, vlm_pads_out);
     }
 
     void warmup();

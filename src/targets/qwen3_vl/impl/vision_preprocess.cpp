@@ -200,14 +200,37 @@ V2VImagePrep preprocess_v2v_image(const std::uint8_t* bytes, std::size_t byte_co
     const media::decode::Policy policy;
     media::decode::Image image =
         media::decode::decode_image({bytes, byte_count}, policy);
-    const Size size = smart_resize_image(image.height, image.width, kMinPixels, kMaxPixels);
+    // mergen-api / ninfer_generate already LANCZOS-resizes the condition to
+    // cond_resolution^2 with sides multiple of 32 (== kFactor). Trust that grid
+    // so VLM pixels match the VAE cond; do not re-budget via min_pixels.
+    // Fall back to chat-path smart_resize only when not factor-aligned, or when
+    // area exceeds kMaxPixels (safety ceiling).
+    Size size;
+    if (image.height > 0 && image.width > 0 && image.height % kFactor == 0 &&
+        image.width % kFactor == 0) {
+        if (static_cast<double>(std::max(image.height, image.width)) /
+                std::min(image.height, image.width) >
+            200.0) {
+            throw std::invalid_argument("image aspect ratio must be at most 200");
+        }
+        const std::uint64_t area = checked_mul(static_cast<std::uint64_t>(image.height),
+                                               static_cast<std::uint64_t>(image.width),
+                                               "image area");
+        if (area <= kMaxPixels) {
+            size = {image.height, image.width};
+        } else {
+            size = smart_resize_image(image.height, image.width, kMinPixels, kMaxPixels);
+        }
+    } else {
+        size = smart_resize_image(image.height, image.width, kMinPixels, kMaxPixels);
+    }
     const int gh = size.h / kPatch;
     const int gw = size.w / kPatch;
     const int P  = gh * gw;
     if (P <= 0 || P % (kMerge * kMerge) != 0) {
         throw std::invalid_argument("v2v image grid is not merge-aligned");
     }
-    image = resize_bicubic(image, size);
+    image = resize_bicubic(image, size);  // no-op when size matches decode
 
     V2VImagePrep out;
     out.grid_h        = gh;
