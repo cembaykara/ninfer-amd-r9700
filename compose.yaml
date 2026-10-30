@@ -1,6 +1,4 @@
-# Image targets (encoder / DiT / VAE). Separate compose project from heretic
-# (runtimes/ninfer, name: ninfer-r9700) so swaps do not clobber chat containers.
-name: ninfer-image
+name: ninfer-r9700
 
 services:
   server:
@@ -18,77 +16,71 @@ services:
       - ${NINFER_DRM_RENDER_NODE:-/dev/dri/renderD128}:${NINFER_DRM_RENDER_NODE:-/dev/dri/renderD128}
     ports:
       - "${NINFER_BIND_ADDRESS:-127.0.0.1}:${NINFER_PORT:-8001}:8080"
+      # NINFER_DIT_PACK_DUMP: /logs/dit_pack.bin
+      # NINFER_DIT_EMB_DUMP: /logs/dit_emb.bin
+      # NINFER_DIT_PRE0_DUMP: /logs/dit_pre0.bin
+      # NINFER_DIT_TXT_DUMP: /logs/dit_txt.bin
+      # NINFER_DIT_TARGET_DUMP: /logs/dit_target.bin
+      # NINFER_DIT_QN_DUMP: /logs/dit_qn.bin
+      # NINFER_DIT_LAYER_DUMP: /logs/dit_layer
     volumes:
+      # Diagnostic dumps (NINFER_DIT_*).
+      - type: bind
+        source: /home/tengri/mergen-api/logs
+        target: /logs
+        bind:
+          create_host_path: true
       - type: bind
         source: ${NINFER_MODELS_DIR:-../models}
         target: /models
         read_only: true
         bind:
           create_host_path: false
-      # LoRA safetensors, read by the engine as /loras/<name>.
+      # Image-gen support (single-compose): the generate script swaps encoder ->
+      # DiT -> VAE in this same container, so it needs the LoRA dir and the
+      # Qwen3-VL tokenizer (the encoder reads it from this absolute host path).
       - type: bind
-        source: ${NINFER_LORAS_DIR:-../models/loras}
+        source: /home/tengri/mergen-api/models/loras
         target: /loras
         read_only: true
         bind:
           create_host_path: false
-      # The encoder target reads the Qwen3-VL tokenizer from this absolute host path.
       - type: bind
         source: /home/tengri/mergen-api/models/hf
         target: /home/tengri/mergen-api/models/hf
         read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ${NINFER_DISK_CACHE_DIR:-/ssdpool2nvme/local_llm/cache_r9700}
         target: /cache
         bind:
           create_host_path: false
-      # Persistent engine log (survives compose down removing the container).
-      - type: bind
-        source: /home/tengri/mergen-api/logs
-        target: /logs
-    environment:
-      # Temporary: ViT numerical check (writes /logs/eng_vit.bin on each v2v encode).
-      NINFER_V2V_DUMP: /logs/eng_vit.bin
-      NINFER_VIT_STAGES: /logs/eng_vit_stages.bin
-      NINFER_V2V_HIDDEN_DUMP: /logs/eng_hidden.bin
-      NINFER_V2V_QK_DUMP: /logs/eng_qk.bin
-      NINFER_V2V_XN_DUMP: /logs/eng_xn.bin
-      NINFER_V2V_EMB_DUMP: /logs/eng_emb.bin
-      NINFER_V2V_LAYER_DUMP: /logs/eng_layer
-      NINFER_V2V_ATTN_DUMP: /logs/eng_attn1.bin
-      NINFER_V2V_MLP_DUMP: /logs/eng_mlp1.bin
-      NINFER_V2V_V_DUMP: /logs/eng_v1.bin
-      NINFER_V2V_XN1_DUMP: /logs/eng_xn1.bin
-      NINFER_DIT_PACK_DUMP: /logs/dit_pack.bin
-      NINFER_DIT_EMB_DUMP: /logs/dit_emb.bin
-      NINFER_DIT_PRE0_DUMP: /logs/dit_pre0.bin
-      NINFER_DIT_TXT_DUMP: /logs/dit_txt.bin
-      NINFER_DIT_TARGET_DUMP: /logs/dit_target.bin
     shm_size: 1gb
-    mem_limit: 24g
-    memswap_limit: 24g
+    mem_limit: 25769803776
+    memswap_limit: 30g
     ulimits:
       memlock: {soft: -1, hard: -1}
     init: true
-    # A failed image load must exit and free :8001, not crash-loop holding the port.
-    restart: "no"
-    # ninfer-serve treats SIGTERM as stop-listening and stays up during a GPU
-    # call, so this shell waits on the tee pipeline and down never returns.
-    # KILL the group. 10s stays inside the API down cap if the trap does not run.
-    stop_grace_period: 10s
-    command:
-      - sh
-      - -c
-      - >-
-        trap "kill -KILL 0" TERM;
-        ninfer-serve /models/${NINFER_MODEL} --host 0.0.0.0 --port 8080
-        --temperature 1.5 --max-context ${NINFER_MAX_CONTEXT:-32768}
-        --max-concurrency ${NINFER_CONCURRENCY:-1} --prefill-chunk 2048
-        --kv-capacity auto --kv-ram-capacity ${NINFER_RAM_CACHE_MIB:-off}
-        --kv-disk-capacity ${NINFER_DISK_CACHE_MIB:-off}
-        --model-id ${SERVED_MODEL_NAME} --pending-timeout-ms 900000
-        --default-max-tokens 32768 ${NINFER_EXTRA_FLAGS:-}
-        2>&1 | tee /logs/ninfer-image.log
+    restart: unless-stopped
+    stop_grace_period: 2m
+    command: >
+      ninfer-serve
+      /models/${NINFER_MODEL:-qwen3.8-27b-r9700-fp8lut4/qwen3.8-27b-r9700-fp8lut4.ninfer}
+      --host 0.0.0.0 --port 8080
+      --temperature 1.5
+      --max-context ${NINFER_MAX_CONTEXT:-32768}
+      --max-concurrency ${NINFER_CONCURRENCY:-1}
+      --prefill-chunk 2048
+      --kv-capacity auto
+      --kv-ram-capacity ${NINFER_RAM_CACHE_MIB:-off}
+      --kv-disk-capacity ${NINFER_DISK_CACHE_MIB:-off}
+      --kv-disk-location /cache
+      --model-id ${SERVED_MODEL_NAME:-qwen3.8-27b-ninfer}
+      --pending-timeout-ms 900000
+      --default-max-tokens 32768
+      ${NINFER_EXTRA_FLAGS:-}
+
     healthcheck:
       test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:8080/health]
       interval: 15s
